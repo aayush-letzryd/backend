@@ -1,15 +1,9 @@
-# Environments & Secrets
+# Environments & Virtual Envs
 .env
 .venv
 env/
 venv/
 ENV/
-
-# Project Specific Files / Documentation
-BACKEND_OPERATIONS_GUIDE.txt
-Raw_Platform_Data_Ingestion_Specification.docx
-!LetzRyd_Backend_Data_Populating_and_Source_Guide.docx
-
 
 # Python Bytecode & Cache
 __pycache__/
@@ -18,6 +12,9 @@ __pycache__/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Excluded Scripts
+generate_documentation_docx.py
 
 # Logs & Temporary Files
 *.log
