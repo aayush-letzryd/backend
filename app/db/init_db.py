@@ -37,8 +37,7 @@ def run_migrations():
         'app_support_tickets', 'app_sessions', 'app_notifications',
         'app_referral_leads', 'app_audit_logs',
         'raw_uber_data', 'raw_ola_data', 'raw_rapido_data',
-        'raw_uber_incentives', 'raw_ola_incentives', 'raw_rapido_incentives',
-        'raw_traffic_challans', 'raw_accidents_registry', 'raw_partner_adjustments', 'raw_gps_logs'
+        'raw_uber_incentives', 'raw_ola_incentives', 'raw_rapido_incentives'
     ]
 
     print("\n=== VERIFYING CREATED TABLES ===")

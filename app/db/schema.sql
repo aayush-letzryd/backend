@@ -126,7 +126,7 @@ CREATE TABLE IF NOT EXISTS app_drivers (
 CREATE TABLE IF NOT EXISTS app_operators (
     app_operator_id                  SERIAL                    PRIMARY KEY,
     operator_id                      INTEGER                   NULL,
-    app_driver_id                    INTEGER                   NOT NULL,
+    app_driver_id                    INTEGER                   NULL,
     operator_code                    VARCHAR(30)               NULL,
     operator_type                    VARCHAR(20)               NULL,
     phone                            VARCHAR(15)               NULL UNIQUE,
@@ -278,7 +278,7 @@ CREATE TABLE IF NOT EXISTS app_payments (
     payer_id                         INTEGER                   NULL,
     payee_type                       VARCHAR(10)               NULL,
     payee_id                         INTEGER                   NULL,
-    app_hisaab_id                    INTEGER                   NOT NULL,
+    app_hisaab_id                    INTEGER                   NULL,
     amount                           NUMERIC(12,2)             NULL,
     payment_mode                     VARCHAR(20)               NULL,
     status                           VARCHAR(20)               NULL,
@@ -460,52 +460,5 @@ CREATE TABLE IF NOT EXISTS raw_rapido_incentives (
     week_end            DATE,
     amount              NUMERIC(12,2) DEFAULT 0.00,
     trips_completed     INTEGER DEFAULT 0,
-    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS raw_traffic_challans (
-    id                  SERIAL PRIMARY KEY,
-    vehicle_number      VARCHAR(50),
-    challan_number      VARCHAR(100),
-    driver_name         VARCHAR(150),
-    violation_date      DATE,
-    violation_location  TEXT,
-    challan_amount      NUMERIC(12,2) DEFAULT 0.00,
-    recovery_status     VARCHAR(50) DEFAULT 'pending',
-    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS raw_accidents_registry (
-    id                  SERIAL PRIMARY KEY,
-    vehicle_number      VARCHAR(50),
-    driver_name         VARCHAR(150),
-    date_of_accident    DATE,
-    accident_reason     TEXT,
-    place_of_accident   TEXT,
-    repair_cost         NUMERIC(12,2) DEFAULT 0.00,
-    fine_amount         NUMERIC(12,2) DEFAULT 0.00,
-    approval_status     VARCHAR(50) DEFAULT 'Approved',
-    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS raw_partner_adjustments (
-    id                  SERIAL PRIMARY KEY,
-    vehicle_number      VARCHAR(50),
-    partner_name        VARCHAR(150),
-    partner_code        VARCHAR(50),
-    adjustment_date     DATE,
-    adjustment_type     VARCHAR(50),
-    amount              NUMERIC(12,2) DEFAULT 0.00,
-    remarks             TEXT,
-    status              VARCHAR(50) DEFAULT 'Approved',
-    imported_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS raw_gps_logs (
-    id                  SERIAL PRIMARY KEY,
-    vehicle_number      VARCHAR(50),
-    gps_date            DATE,
-    km_driven           NUMERIC(10,2) DEFAULT 0.00,
-    status              VARCHAR(50) DEFAULT 'Active',
     imported_at         TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
