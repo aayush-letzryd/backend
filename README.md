@@ -1,27 +1,42 @@
-# LetzRyd Core Platform Backend
+# LetzRyd Backend Knowledge Base & Pipelines
 
-Core platform database definitions, master schemas, audit logs, and migration scripts.
+Welcome to the central backend engineering and knowledge transfer repository for LetzRyd.
 
-## Module Structure
-
-- **[`city/`](./city/)**: City Master Module (`public.core_cities`)
-  - `01_create_core_cities.sql`: DDL, automatic `updated_at` trigger, physical deletion guardrails.
-  - `02_seed_core_cities.sql`: Seed data for initial operational hubs (BLR, HYD, MUM).
-  - `03_test_core_cities.sql`: Test suites for constraint checks, trigger verification, and deletion prevention.
-  - `README.md`: Knowledge transfer documentation, API contracts, portal UI workflows, and future schema references.
-
-- **[`city_log/`](./city_log/)**: City Audit Log Module (`public.core_city_logs`)
-  - `01_create_core_city_logs.sql`: DDL, foreign key, index, audit trigger function (`CREATE`, `UPDATE`, `DELETE`).
-  - `02_test_core_city_logs.sql`: End-to-end transactional testing for lifecycle audit tracking.
-  - `README.md`: Knowledge transfer documentation for immutable audit logs, JSONB schema, and portal timeline queries.
+This repository hosts production scripts, architecture specifications, database definitions, and knowledge transfer (KT) runbooks for LetzRyd core backend services and ingestion pipelines.
 
 ---
 
-## Migration Execution Order
+## Repository Directory Index
 
-When applying migrations to a database instance, run scripts in the following exact sequence:
+### 1. [Walkin Form Google Sheet](./Walkin%20Form%20Google%20Sheet/)
+- **Description**: Real-time production data pipeline synchronizing driver-partner walk-in records from Google Sheets into the centralized PostgreSQL database.
+- **Key Files**:
+  - [`walkin_pipeline_appscript.js`](./Walkin%20Form%20Google%20Sheet/walkin_pipeline_appscript.js): Google Apps Script production code featuring dual-trigger synchronization, JDBC batching, and multi-format data normalization.
+  - [`README.md`](./Walkin%20Form%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document detailing architecture, working processes, schema DDL, the 12 audit bug fixes, deployment runbook, and operational SQL queries.
+  - [`schema.sql`](./Walkin%20Form%20Google%20Sheet/schema.sql): PostgreSQL Data Definition Language (DDL) for `public.sheet_walkins`, composite unique constraints, B-Tree performance indexes, and sample operational queries.
+  - [`data_issues.md`](./Walkin%20Form%20Google%20Sheet/data_issues.md): Comprehensive data quality audit documenting all 24 identified anomalies (ISS-01 through ISS-24) and their exact standardization implementations.
+- **Target Table**: `public.sheet_walkins` (PostgreSQL)
+- **Primary Features**:
+  - Live On-Edit synchronization (1-2s latency)
+  - Time-driven 1-minute catch-up sync for `=IMPORTRANGE()` formula updates
+  - Immunity to spreadsheet sorting, filtering, and row deletions via composite event key
+  - Strict zero data loss data sanitization and phone/DL normalization
 
-1. **`city/01_create_core_cities.sql`**: Creates master table and updated_at / delete-prevention triggers.
-2. **`city_log/01_create_core_city_logs.sql`**: Creates audit log table, index, and attaches audit trigger to `core_cities`.
-3. **`city/02_seed_core_cities.sql`**: Populates initial cities (BLR, HYD, MUM). The attached trigger automatically logs `CREATE` audit records.
-4. **Verification**: Run `city/03_test_core_cities.sql` and `city_log/02_test_core_city_logs.sql`.
+---
+
+## Infrastructure Overview
+
+- **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
+- **Database Engine**: PostgreSQL 14+
+- **Default Database**: `postgres`
+- **Architecture**: Decoupled ingestion layers utilizing Google Apps Script JDBC, FastAPI microservices, and PostgreSQL persistence.
+
+---
+
+## Maintenance and Governance
+
+All code, configurations, and documentation in this repository adhere to standard production guidelines:
+- Zero data loss tolerance on partner onboarding records.
+- Standard SQL ANSI syntax compatible across relational database tools.
+- Leak-proof JDBC connection and statement resource management.
+- Comprehensive operational runbooks for seamless knowledge transfer.
