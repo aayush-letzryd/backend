@@ -30,6 +30,17 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 3. [Vehicle Onboarding Google Sheet](./Vehicle%20Onboarding%20Google%20Sheet/)
+- **Description**: Real-time production data pipeline synchronizing master vehicle fleet onboarding records (Asset List, Master Document Sheet, and PDI inspections) across 73 columns from Google Sheets into the centralized PostgreSQL database.
+- **Key Files**:
+  - [`vehicle_onboarding_pipeline_appscript.js`](./Vehicle%20Onboarding%20Google%20Sheet/vehicle_onboarding_pipeline_appscript.js): Production Google Apps Script engine featuring 73-column JDBC mapping, batch resilience (250-row chunks), regex sanitization, rollback protection, and dual real-time triggers.
+  - [`schema.sql`](./Vehicle%20Onboarding%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_onboarding` with 73 columns, Primary Key on `registration_no`, 7 B-Tree performance indexes, and verification queries.
+  - [`data_issues.md`](./Vehicle%20Onboarding%20Google%20Sheet/data_issues.md): Comprehensive data hygiene catalog documenting all 29 identified abnormalities (VEH-01 through VEH-29) and their automated standardization rules.
+  - [`README.md`](./Vehicle%20Onboarding%20Google%20Sheet/README.md): Architecture documentation, setup guide, trigger installation runbook, and verification queries.
+- **Target Table**: `public.sheet_vehicle_onboarding`
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `35.200.196.113:5432`
