@@ -41,6 +41,22 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 2. [Vehicle Allocation Google Sheet](./Vehicle%20Allocation%20Google%20Sheet/)
+- **Description**: Real-time production ingestion pipeline synchronizing vehicle fleet allocations directly from the Pan India Master Sheet into PostgreSQL.
+- **Key Files**:
+  - [`allocation_pipeline_appscript.js`](./Vehicle%20Allocation%20Google%20Sheet/allocation_pipeline_appscript.js): Production Google Apps Script engine featuring direct background Master Sheet reads (`openById`), Zero-Burn CTE Upsert, and 24 standardized data cleaning rules.
+  - [`README.md`](./Vehicle%20Allocation%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) documentation covering system architecture, table column dictionaries, deployment runbooks, and operational queries.
+  - [`schema.sql`](./Vehicle%20Allocation%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_allocations` with B-Tree indexes and composite unique constraint `(allocation_date, vehicle_number, driver_phone)`.
+  - [`data_issues.md`](./Vehicle%20Allocation%20Google%20Sheet/data_issues.md): Comprehensive issue catalog documenting all 24 standardized data quality anomalies (ISS-01 through ISS-24).
+- **Target Table**: `public.sheet_vehicle_allocations` (PostgreSQL)
+- **Primary Features**:
+  - Direct background memory reads bypassing `=IMPORTRANGE()` cell limits
+  - Zero-burn CTE sequence synchronization (0 ID gaps)
+  - 1-minute time-driven background synchronization (< 3s latency)
+  - Strict deduplication policy (Keep Latest by Timestamp)
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `35.200.196.113:5432`

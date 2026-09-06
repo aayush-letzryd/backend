@@ -4,7 +4,7 @@
  * ==============================================================================
  * 
  * Target Table : public.sheet_walkins
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * Features:
  *  - Real-time live updates on cell edit (handleOnEdit) and form submit (handleOnFormSubmit)
  *  - Multi-row paste resilience (processes all pasted rows in a single batch)
