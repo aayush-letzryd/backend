@@ -442,6 +442,13 @@ function upsertAccidentRecords(records) {
       Logger.log("Notice: sequence alignment: " + e.message);
     }
 
+    // Refresh core_accidents master table in a single high-speed pass
+    try {
+      stmt.executeUpdate("SELECT public.refresh_core_accidents();");
+    } catch(e) {
+      Logger.log("Notice: core accidents refresh: " + e.message);
+    }
+
     conn.commit();
     Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " records.");
     return totalCount;

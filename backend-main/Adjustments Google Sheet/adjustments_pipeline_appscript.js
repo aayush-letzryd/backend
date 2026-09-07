@@ -483,6 +483,13 @@ function upsertAdjustmentRecords(records) {
       Logger.log("Notice: sequence alignment: " + e.message);
     }
 
+    // Refresh core_adjustments master table in a single high-speed pass
+    try {
+      stmt.executeUpdate("SELECT public.refresh_core_adjustments();");
+    } catch(e) {
+      Logger.log("Notice: core adjustments refresh: " + e.message);
+    }
+
     conn.commit();
     Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " adjustment records.");
     return totalCount;
