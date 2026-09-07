@@ -74,6 +74,28 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 7. [Accidents Google Sheet](./Accidents%20Google%20Sheet/)
+- **Description**: Real-time and batch synchronization engine bridging vehicle accident reports from Google Sheets (`Accident vehicle report` in `WIP- Pan India.xlsx`) and web portal submissions (`public.july_accidents_registry`) into the centralized production PostgreSQL database (`public.core_accidents`).
+- **Key Files**:
+  - [`accidents_pipeline_appscript.js`](./Accidents%20Google%20Sheet/accidents_pipeline_appscript.js): Google Apps Script production engine featuring live form submission triggers (`handleOnFormSubmit`), 1-minute catch-up sync (`syncRecentAccidents`), full batch synchronization (`syncAllAccidents`), 10-issue standardization (ACC-01 to ACC-10), vehicle registration regex sanitization, canonical 3-letter city codes, Excel serial date parsing, police acknowledgement boolean consolidation, financial numeric sanitization, and CTE zero-burn upserts.
+  - [`schema.sql`](./Accidents%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_accidents` (21 columns), `public.core_accidents` (16 columns), composite unique constraints, B-Tree performance indexes, and the automated consolidation procedure `refresh_core_accidents()`.
+  - [`data_issues.md`](./Accidents%20Google%20Sheet/data_issues.md): Comprehensive data quality audit documenting all 10 identified operational anomalies (ACC-01 through ACC-10) and automated standardization rules.
+  - [`README.md`](./Accidents%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document covering architecture diagrams, standardizations catalog, database schema, and trigger setup instructions.
+- **Target Tables**: `public.sheet_accidents` + `public.july_accidents_registry` $\to$ `public.core_accidents`
+
+---
+
+### 8. [Adjustments Google Sheet](./Adjustments%20Google%20Sheet/)
+- **Description**: Real-time production ingestion pipeline bridging partner adjustment submissions from Google Sheets (`Adjustment-Form` in `Pan India Master Sheet.xlsx`) and portal entries (`public.july_partner_adjustment`) into the centralized production PostgreSQL database (`public.core_adjustments`).
+- **Key Files**:
+  - [`adjustments_pipeline_appscript.js`](./Adjustments%20Google%20Sheet/adjustments_pipeline_appscript.js): Google Apps Script production engine featuring live form submit triggers (`handleOnFormSubmit`), 1-minute catch-up sync (`syncRecentAdjustments`), full batch sync (`syncAllAdjustments`), 11-issue standardization (ADJ-01 to ADJ-11), deterministic Partner ID generation (`LETZ<CITY><PHONE>`), phone scientific notation/float sanitization, multi-level approval state hierarchy resolution (Final Level > Level 1 > Pending), Hisaab week parsing, and CTE zero-burn upserts.
+  - [`schema.sql`](./Adjustments%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_adjustments` (28 columns), `public.core_adjustments` (17 columns), composite unique constraints, B-Tree indexes, and the automated consolidation procedure `refresh_core_adjustments()`.
+  - [`data_issues.md`](./Adjustments%20Google%20Sheet/data_issues.md): Comprehensive data hygiene catalog documenting all 11 identified data quality anomalies (ADJ-01 through ADJ-11) and automated normalization specifications.
+  - [`README.md`](./Adjustments%20Google%20Sheet/README.md): Architecture documentation, multi-level approval hierarchy rules, table column dictionaries, and deployment runbooks.
+- **Target Tables**: `public.sheet_adjustments` + `public.july_partner_adjustment` $\to$ `public.core_adjustments`
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `35.200.196.113:5432`
