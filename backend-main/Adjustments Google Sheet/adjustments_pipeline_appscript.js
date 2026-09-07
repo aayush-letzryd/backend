@@ -368,7 +368,7 @@ function upsertAdjustmentRecords(records) {
   var conn = null;
   var stmt = null;
   var url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
-  var BATCH_SIZE = 25;
+  var BATCH_SIZE = 100;
   var totalCount = 0;
 
   try {
