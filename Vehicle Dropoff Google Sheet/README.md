@@ -19,11 +19,11 @@ The operations team logs vehicle returns (Attrition, Repair & Maintenance, and F
 
 ### Primary System Guarantees
 - **Zero Data Loss Rule**: 100% of the 6,405 clean historical dropoff events across 1,135 unique vehicles are preserved.
+- **Clean Standard Primary Key (`dropoff_id`)**: Sequential integer identifier (`1, 2, 3, 4, 5 ... 6410`) guaranteeing simple, readable relational integrity.
 - **Financial Balance Integrity**: Accurately tracks **-₹2,379,251.38** in driver negative wallet liabilities and **+₹782,467.59** in driver credit balances without numeric rounding errors.
 - **Sub-Second Live Synchronization**: Event-driven `handleOnEdit` trigger propagates single-cell edits on the master sheet to PostgreSQL in **< 1 second**.
 - **Batch Processing Resilience**: Processes weekly and historical cycles in **250-row chunks** with transaction rollbacks (`conn.rollback()`), bypassing execution timeouts.
 - **Connection Leak-Proof**: Exhaustive `try-catch-finally` resource management ensuring all JDBC connections and prepared statements close gracefully under all failure modes.
-- **Deterministic Primary Key (`dropoff_id`)**: Collision-proof key format `DROP-<Plate>-<YYYYMMDD>-<DriverHash>-<ReturnType>-<Row>` guarantees filter/sort immunity and idempotency.
 
 ---
 
@@ -48,7 +48,7 @@ flowchart TD
     end
 
     subgraph DatabaseLayer ["PostgreSQL Central Database (35.200.196.113:5432)"]
-        S -->|JDBC PreparedStatement Upserts| DB[("public.sheet_dropoffs<br>PK: dropoff_id<br>Indexed on vehicle, driver, date, city, type")]
+        S -->|JDBC PreparedStatement Upserts| DB[("public.sheet_dropoffs<br>PK: dropoff_id (1, 2, 3...)<br>Indexed on vehicle, driver, date, city, type")]
         DB --> F[("public.dropoff_final<br>(Driver Hisaab Settlement Engine)")]
     end
 ```
@@ -59,8 +59,8 @@ flowchart TD
 
 | File | Description |
 | :--- | :--- |
-| [`dropoff_pipeline_appscript.js`](./dropoff_pipeline_appscript.js) | Production Google Apps Script code featuring real-time `handleOnEdit` event streaming, 11-issue data hygiene engine, 250-row batch chunking, and automated trigger handlers. |
-| [`schema.sql`](./schema.sql) | PostgreSQL DDL definitions for `public.sheet_dropoffs`, primary key constraints, 6 performance B-Tree indexes, and operational verification queries. |
+| [`dropoff_pipeline_appscript.js`](./dropoff_pipeline_appscript.js) | Production Google Apps Script code featuring real-time `handleOnEdit` event streaming, 11-issue data hygiene engine, sequential integer `dropoff_id` assignment, 250-row batch chunking, and automated trigger handlers. |
+| [`schema.sql`](./schema.sql) | PostgreSQL DDL definitions for `public.sheet_dropoffs`, `dropoff_id BIGINT PRIMARY KEY` constraint, 6 performance B-Tree indexes, and operational verification queries. |
 | [`data_issues.md`](./data_issues.md) | Comprehensive 13-column audit catalog documenting all 11 operational anomalies (`ISS-01` through `ISS-11`) and their programmatic transformation rules. |
 | [`README.md`](./README.md) | Complete Knowledge Transfer (KT) document, system architecture, database schema, and operational runbook. |
 
@@ -77,9 +77,7 @@ flowchart TD
 
 CREATE TABLE IF NOT EXISTS public.sheet_dropoffs (
     -- Primary / Natural Key
-    dropoff_id VARCHAR(100) PRIMARY KEY,
-    
-    -- Source Traceability
+    dropoff_id BIGINT PRIMARY KEY,
     source_row INTEGER,
     
     -- Dropoff Core Attributes
@@ -101,10 +99,7 @@ CREATE TABLE IF NOT EXISTS public.sheet_dropoffs (
     -- Audit & System Timestamps
     sync_status VARCHAR(20) DEFAULT 'SYNCED',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Idempotency Composite Constraint
-    CONSTRAINT uq_sheet_dropoffs_composite UNIQUE (dropoff_id)
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Performance B-Tree Indexes
@@ -122,7 +117,7 @@ CREATE INDEX IF NOT EXISTS idx_sheet_dropoffs_driver_type ON public.sheet_dropof
 
 | Category | Issue Range | Key Standardizations Implemented |
 | :--- | :--- | :--- |
-| **Primary Key & Identity Engine** | `ISS-01`, `ISS-05`, `ISS-11` | Filters out embedded header rows (`Return Date = 'Return Date'`); sanitizes vehicle numbers via `UPPER(REGEXP_REPLACE(vehicle_number, r'[^A-Za-z0-9]', ''))`; generates collision-proof deterministic `dropoff_id` (`DROP-<Plate>-<YYYYMMDD>-<DriverHash>`). |
+| **Primary Key & Identity Engine** | `ISS-01`, `ISS-05`, `ISS-11` | Filters out embedded header rows (`Return Date = 'Return Date'`); sanitizes vehicle numbers via `UPPER(REGEXP_REPLACE(vehicle_number, r'[^A-Za-z0-9]', ''))`; formats clean sequential integer `dropoff_id` (`1, 2, 3... 6410`). |
 | **Driver & Operator Profiles** | `ISS-03`, `ISS-04`, `ISS-07`, `ISS-08` | Coalesces missing/null driver IDs to `'UNKNOWN_DRIVER'`; standardizes driver names to title case with `'Unknown Driver'` fallback; applies `INITCAP()` on driver types (`Operator`, `Individual`); infers missing types from `LETZ%IP%` operator prefix. |
 | **Dates & Timestamps** | `ISS-02` | Multi-format date engine normalizes `DD/MM/YYYY`, ISO `YYYY-MM-DD`, and 5-digit Excel serial integers (e.g. `46272` $\to$ `2026-09-07`) using the `1899-12-30` epoch offset. |
 | **Financial Balances & Liabilities** | `ISS-06` | Strips currency symbols (`₹`), commas, and hyphens; converts empty cells to `0.00`; preserves signed values (`-2379.00` for driver liability deduction). |
@@ -170,11 +165,18 @@ SELECT
     MAX(return_date) AS latest_dropoff_date
 FROM public.sheet_dropoffs;
 
--- 2. Duplicate Primary Key Verification (Should return 0 rows)
-SELECT dropoff_id, COUNT(*) AS dup_count
-FROM public.sheet_dropoffs
-GROUP BY dropoff_id
-HAVING COUNT(*) > 1;
+-- 2. Clean Sequential Primary Key Verification
+SELECT 
+    COUNT(*) AS total_rows,
+    COUNT(DISTINCT dropoff_id) AS unique_dropoff_ids,
+    MIN(dropoff_id) AS min_id,
+    MAX(dropoff_id) AS max_id,
+    CASE 
+        WHEN COUNT(*) = MAX(dropoff_id) AND MIN(dropoff_id) = 1 
+        THEN '✅ 100% PERFECT: Gapless Sequential Integer (1, 2, 3... 6410)'
+        ELSE '❌ Needs Review'
+    END AS validation_result
+FROM public.sheet_dropoffs;
 
 -- 3. City Distribution & Normalization Audit
 SELECT 
@@ -210,7 +212,7 @@ SELECT
     dropoff_id, vehicle_number, return_date, return_type, 
     city, driver_type, negative_balance, sync_status, created_at, updated_at
 FROM public.sheet_dropoffs 
-ORDER BY source_row ASC 
+ORDER BY dropoff_id ASC 
 LIMIT 10;
 ```
 
