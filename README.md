@@ -41,7 +41,7 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
-### 2. [Vehicle Allocation Google Sheet](./Vehicle%20Allocation%20Google%20Sheet/)
+### 4. [Vehicle Allocation Google Sheet](./Vehicle%20Allocation%20Google%20Sheet/)
 - **Description**: Real-time production ingestion pipeline synchronizing vehicle fleet allocations directly from the Pan India Master Sheet into PostgreSQL.
 - **Key Files**:
   - [`allocation_pipeline_appscript.js`](./Vehicle%20Allocation%20Google%20Sheet/allocation_pipeline_appscript.js): Production Google Apps Script engine featuring direct background Master Sheet reads (`openById`), Zero-Burn CTE Upsert, and 24 standardized data cleaning rules.
@@ -49,11 +49,17 @@ This repository hosts production scripts, architecture specifications, database 
   - [`schema.sql`](./Vehicle%20Allocation%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_allocations` with B-Tree indexes and composite unique constraint `(allocation_date, vehicle_number, driver_phone)`.
   - [`data_issues.md`](./Vehicle%20Allocation%20Google%20Sheet/data_issues.md): Comprehensive issue catalog documenting all 24 standardized data quality anomalies (ISS-01 through ISS-24).
 - **Target Table**: `public.sheet_vehicle_allocations` (PostgreSQL)
-- **Primary Features**:
-  - Direct background memory reads bypassing `=IMPORTRANGE()` cell limits
-  - Zero-burn CTE sequence synchronization (0 ID gaps)
-  - 1-minute time-driven background synchronization (< 3s latency)
-  - Strict deduplication policy (Keep Latest by Timestamp)
+
+---
+
+### 5. [Traffic Challan Google Sheet](./Traffic%20Challan%20Google%20Sheet/)
+- **Description**: Real-time production data pipeline synchronizing master vehicle traffic challan violation events and weekly rolling balance ledgers across 38 tabs (36,039 records across 1,602 unique fleet vehicles) into `public.sheet_challans`.
+- **Key Files**:
+  - [`challan_pipeline_appscript.js`](./Traffic%20Challan%20Google%20Sheet/challan_pipeline_appscript.js): Production Google Apps Script engine featuring 38-tab consolidation, 15-issue data hygiene engine (ISS-01 through ISS-15), JDBC batching, rollback protection, and live `handleOnEdit` triggers.
+  - [`schema.sql`](./Traffic%20Challan%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_challans` with 19 columns, composite unique key on `(vehicle_reg_no, notice_no, week_cycle)`, 6 B-Tree indexes, and verification audit queries.
+  - [`data_issues.md`](./Traffic%20Challan%20Google%20Sheet/data_issues.md): Comprehensive 13-column data hygiene catalog documenting all 15 operational anomalies (`ISS-01` to `ISS-15`) and automated standardization rules.
+  - [`README.md`](./Traffic%20Challan%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) runbook, architectural specifications, trigger setup, and post-migration verification queries.
+- **Target Table**: `public.sheet_challans` $\to$ `public.challans_final`
 
 ---
 
