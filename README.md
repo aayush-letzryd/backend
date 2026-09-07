@@ -63,6 +63,17 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 6. [Vehicle Dropoff Google Sheet](./Vehicle%20Dropoff%20Google%20Sheet/)
+- **Description**: Real-time production ingestion pipeline synchronizing historical and live vehicle dropoff / return records (6,405 records across 1,149 unique fleet vehicles) into `public.sheet_dropoffs`.
+- **Key Files**:
+  - [`dropoff_pipeline_appscript.js`](./Vehicle%20Dropoff%20Google%20Sheet/dropoff_pipeline_appscript.js): Production Google Apps Script engine featuring real-time `handleOnEdit` triggers, 11-issue standardization engine (ISS-01 through ISS-11), deterministic primary key generation, and JDBC batching.
+  - [`schema.sql`](./Vehicle%20Dropoff%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_dropoffs` with 13 columns, primary key constraint on `dropoff_id`, and 6 B-Tree performance indexes.
+  - [`data_issues.md`](./Vehicle%20Dropoff%20Google%20Sheet/data_issues.md): Comprehensive 13-column issue catalog documenting all 11 standardized data anomalies (`ISS-01` through `ISS-11`).
+  - [`README.md`](./Vehicle%20Dropoff%20Google%20Sheet/README.md): Architecture documentation, column dictionary, trigger setup guide, and post-ingestion verification queries.
+- **Target Table**: `public.sheet_dropoffs` $\to$ `public.dropoff_final` (Driver Hisaab Engine)
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `35.200.196.113:5432`
