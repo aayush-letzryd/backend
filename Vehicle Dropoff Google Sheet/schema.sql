@@ -3,7 +3,7 @@
 -- ==============================================================================
 -- Schema      : public
 -- Table Name  : sheet_dropoffs
--- Primary Key : dropoff_id (Synthetic Deterministic Key: DROP-<Plate>-<YYYYMMDD>-<DriverHash>)
+-- Primary Key : dropoff_id (BIGINT / Standard Sequential Integer: 1, 2, 3...)
 -- Downstream  : Feeds dropoff_final (Driver Hisaab Engine)
 -- ==============================================================================
 
@@ -13,9 +13,7 @@ DROP TABLE IF EXISTS public.sheet_dropoffs CASCADE;
 -- 2. Create public.sheet_dropoffs table
 CREATE TABLE public.sheet_dropoffs (
     -- Primary / Natural Key
-    dropoff_id VARCHAR(100) PRIMARY KEY,
-    
-    -- Source Traceability
+    dropoff_id BIGINT PRIMARY KEY,
     source_row INTEGER,
     
     -- Dropoff Core Attributes
@@ -37,10 +35,7 @@ CREATE TABLE public.sheet_dropoffs (
     -- Audit & System Timestamps
     sync_status VARCHAR(20) DEFAULT 'SYNCED',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    
-    -- Idempotency Composite Constraint
-    CONSTRAINT uq_sheet_dropoffs_composite UNIQUE (dropoff_id)
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
 -- 3. High-Performance B-Tree Indexes
@@ -53,7 +48,7 @@ CREATE INDEX idx_sheet_dropoffs_driver_type ON public.sheet_dropoffs(driver_type
 
 -- 4. Table & Column Documentation Comments
 COMMENT ON TABLE public.sheet_dropoffs IS 'Consolidated vehicle dropoff and return logs feeding downstream dropoff_final in Hisaab Engine.';
-COMMENT ON COLUMN public.sheet_dropoffs.dropoff_id IS 'Deterministic synthetic primary key (DROP-<Plate>-<YYYYMMDD>-<Driver/RowHash>).';
+COMMENT ON COLUMN public.sheet_dropoffs.dropoff_id IS 'Standard sequential integer primary key (1, 2, 3...).';
 COMMENT ON COLUMN public.sheet_dropoffs.return_date IS 'Standardized ISO return date (YYYY-MM-DD).';
 COMMENT ON COLUMN public.sheet_dropoffs.return_type IS 'Reason for vehicle return (Attrition, Repair and Maintenance, Force Recovery).';
 COMMENT ON COLUMN public.sheet_dropoffs.negative_balance IS 'Ola negative wallet balance / outstanding driver liability (NUMERIC 12,2).';

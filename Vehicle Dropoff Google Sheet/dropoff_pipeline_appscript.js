@@ -8,10 +8,10 @@
  * Source Tab   : 'Unified_Dropoff_source'
  * 
  * Features:
+ *  - Clean Standard Sequential Integer Primary Key: dropoff_id (1, 2, 3...)
  *  - Real-time live row synchronization on cell edit (handleOnEdit)
  *  - High-performance batch ingestion with rollback protection (syncDropoffsToDatabase)
  *  - Full 11-issue data hygiene engine (ISS-01 through ISS-11)
- *  - Deterministic synthetic primary key (DROP-<Plate>-<YYYYMMDD>-<DriverHash>)
  *  - Automatic city derivation from plate prefixes and 3-letter codes
  *  - Strict ISO Date parsing (handling DD/MM/YYYY, ISO, and Excel serial dates)
  *  - Zero connection leaks (strict try-catch-finally on all JDBC resources)
@@ -37,6 +37,7 @@ const SQL_TYPES = {
   DATE: 91,
   NUMERIC: 2,
   INTEGER: 4,
+  BIGINT: -5,
   TIMESTAMP: 93
 };
 
@@ -50,12 +51,10 @@ function getConnection() {
 
 /**
  * Normalizes Date into ISO 'YYYY-MM-DD' format
- * Handles DD/MM/YYYY strings, ISO strings, Date objects, and Excel serial numbers.
  */
 function normalizeDate(rawDate) {
   if (!rawDate) return null;
   
-  // If already Date object
   if (rawDate instanceof Date) {
     if (isNaN(rawDate.getTime())) return null;
     const y = rawDate.getFullYear();
@@ -67,10 +66,9 @@ function normalizeDate(rawDate) {
   const str = String(rawDate).trim();
   if (!str || str.toLowerCase() === 'null' || str === '-' || str.toLowerCase() === 'return date') return null;
   
-  // Check Excel Serial Integer (e.g., 46272)
+  // Excel Serial Integer
   if (/^\d{5}$/.test(str)) {
     const serial = parseInt(str, 10);
-    // Excel epoch 1899-12-30
     const epoch = new Date(1899, 11, 30);
     epoch.setDate(epoch.getDate() + serial);
     const y = epoch.getFullYear();
@@ -82,19 +80,13 @@ function normalizeDate(rawDate) {
   // DD/MM/YYYY
   const dmyMatch = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
   if (dmyMatch) {
-    const d = dmyMatch[1].padStart(2, '0');
-    const m = dmyMatch[2].padStart(2, '0');
-    const y = dmyMatch[3];
-    return `${y}-${m}-${d}`;
+    return `${dmyMatch[3]}-${dmyMatch[2].padStart(2, '0')}-${dmyMatch[1].padStart(2, '0')}`;
   }
   
   // YYYY-MM-DD
   const ymdMatch = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})$/);
   if (ymdMatch) {
-    const y = ymdMatch[1];
-    const m = ymdMatch[2].padStart(2, '0');
-    const d = ymdMatch[3].padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    return `${ymdMatch[1]}-${ymdMatch[2].padStart(2, '0')}-${ymdMatch[3].padStart(2, '0')}`;
   }
   
   return null;
@@ -118,7 +110,6 @@ function normalizeCity(rawCity, vehiclePlate) {
   if (c === 'HYD' || c === 'HYDERABAD' || c.includes('HYD')) return 'Hyderabad';
   if (c === 'MUM' || c === 'MUMBAI' || c.includes('MUM')) return 'Mumbai';
   
-  // State plate prefix fallback
   const plate = String(vehiclePlate || '').toUpperCase();
   if (plate.startsWith('KA')) return 'Bangalore';
   if (plate.startsWith('TS') || plate.startsWith('TG') || plate.startsWith('AP')) return 'Hyderabad';
@@ -136,18 +127,6 @@ function cleanBalance(rawVal) {
   if (!str || str === '-' || str.toLowerCase() === 'null' || str.toLowerCase() === 'n/a') return 0.00;
   const num = parseFloat(str);
   return isNaN(num) ? 0.00 : num;
-}
-
-/**
- * Generates Deterministic Primary Key
- * Format: DROP-<Plate>-<YYYYMMDD>-<DriverHash>
- */
-function generateDropoffId(vehicleNumber, returnDate, driverId, returnType, sourceRow) {
-  const plate = vehicleNumber || 'UNKNOWN_PLATE';
-  const dt = (returnDate || 'NODATE').replace(/-/g, '');
-  const did = (driverId || 'UNKNOWN').replace(/[^A-Za-z0-9]/g, '').substring(0, 10);
-  const rtype = (returnType || 'RET').substring(0, 3).toUpperCase();
-  return `DROP-${plate}-${dt}-${did}-${rtype}-${sourceRow}`;
 }
 
 /**
@@ -202,6 +181,7 @@ function syncDropoffsToDatabase() {
     
     let validBatchCount = 0;
     let totalProcessed = 0;
+    let dropoffIdCounter = 1;
     const batchSize = 250;
     
     for (let i = 1; i < data.length; i++) {
@@ -217,15 +197,13 @@ function syncDropoffsToDatabase() {
       const rawType = row[6];
       const rawCity = row[7];
       
-      // ISS-01: Filter repeated headers
       if (String(rawDate).trim().toLowerCase() === 'return date' || String(rawPlate).trim().toLowerCase() === 'vehicle number') {
         continue;
       }
       
-      // Sanitizations
       const returnDate = normalizeDate(rawDate);
       const vehicleNumber = cleanVehicleNumber(rawPlate);
-      if (!returnDate || !vehicleNumber) continue; // Skip completely invalid rows
+      if (!returnDate || !vehicleNumber) continue;
       
       const returnType = String(rawReturnType || 'Attrition').trim();
       let driverId = String(rawDriverId || '').trim();
@@ -243,10 +221,10 @@ function syncDropoffsToDatabase() {
       
       const city = normalizeCity(rawCity, vehicleNumber);
       const negativeBalance = cleanBalance(rawBal);
-      const dropoffId = generateDropoffId(vehicleNumber, returnDate, driverId, returnType, sourceRow);
+      const dropoffId = dropoffIdCounter;
+      dropoffIdCounter++;
       
-      // Bind parameters
-      stmt.setString(1, dropoffId);
+      stmt.setLong(1, dropoffId);
       stmt.setInt(2, sourceRow);
       stmt.setString(3, returnDate);
       stmt.setString(4, returnType);
@@ -294,7 +272,7 @@ function handleOnEdit(e) {
   if (sheet.getName() !== DB_CONFIG.tabName) return;
   
   const editedRow = e.range.getRow();
-  if (editedRow <= 1) return; // Ignore header edits
+  if (editedRow <= 1) return;
   
   Logger.log(`Handling live edit on row ${editedRow}...`);
   syncSingleRow(sheet, editedRow);
@@ -331,7 +309,7 @@ function syncSingleRow(sheet, rowNum) {
   
   const city = normalizeCity(rawCity, vehicleNumber);
   const negativeBalance = cleanBalance(rawBal);
-  const dropoffId = generateDropoffId(vehicleNumber, returnDate, driverId, returnType, rowNum);
+  const dropoffId = Math.max(1, rowNum - 1);
   
   let conn = null;
   let stmt = null;
@@ -358,7 +336,7 @@ function syncSingleRow(sheet, rowNum) {
   try {
     conn = getConnection();
     stmt = conn.prepareStatement(sql);
-    stmt.setString(1, dropoffId);
+    stmt.setLong(1, dropoffId);
     stmt.setInt(2, rowNum);
     stmt.setString(3, returnDate);
     stmt.setString(4, returnType);
@@ -369,7 +347,7 @@ function syncSingleRow(sheet, rowNum) {
     stmt.setString(9, city);
     stmt.setDouble(10, negativeBalance);
     stmt.executeUpdate();
-    Logger.log(`Row ${rowNum} (${dropoffId}) synced successfully.`);
+    Logger.log(`Row ${rowNum} (dropoff_id: ${dropoffId}) synced successfully.`);
   } catch (err) {
     Logger.log(`Error syncing row ${rowNum}: ${err.message}`);
   } finally {
@@ -387,13 +365,11 @@ function setupTriggers() {
     ScriptApp.deleteTrigger(triggers[i]);
   }
   
-  // Install onEdit trigger
   ScriptApp.newTrigger("handleOnEdit")
     .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
     .onEdit()
     .create();
     
-  // Install Hourly Catch-up Sync trigger
   ScriptApp.newTrigger("syncDropoffsToDatabase")
     .timeBased()
     .everyHours(1)
