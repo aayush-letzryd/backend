@@ -646,8 +646,7 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         ")");
       }
       
-      let sql = 
-        "WITH incoming ( " +
+      let sql = "WITH incoming ( " +
         "    submission_timestamp, submitter_email, city, onboarding_type, " +
         "    lead_source, driver_plan, driver_name, driver_phone, whatsapp_phone, " +
         "    emergency_name, emergency_phone, reference_name, reference_phone, " +
@@ -659,6 +658,10 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         "    deposit_amount, partner_id, sheet_row_number " +
         ") AS ( " +
         "    VALUES " + valueClauses.join(", ") + " " +
+        "), " +
+        "incoming_deduped AS ( " +
+        "    SELECT DISTINCT ON (submission_timestamp, driver_phone) * " +
+        "    FROM incoming " +
         "), " +
         "upd AS ( " +
         "    UPDATE public.sheet_driver_onboarding t " +
@@ -702,7 +705,7 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         "        partner_id = i.partner_id, " +
         "        sheet_row_number = i.sheet_row_number, " +
         "        updated_at = CURRENT_TIMESTAMP " +
-        "    FROM incoming i " +
+        "    FROM incoming_deduped i " +
         "    WHERE t.submission_timestamp = i.submission_timestamp " +
         "      AND t.driver_phone = i.driver_phone " +
         "    RETURNING t.submission_timestamp, t.driver_phone " +
@@ -728,7 +731,7 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         "    i.local_address_proof, i.selfie_photo, i.pan_aadhaar_photo, i.bank_details_doc, " +
         "    i.referral_phone, i.referral_name, i.account_name, i.account_number, i.ifsc_code, " +
         "    i.deposit_amount, i.partner_id, i.sheet_row_number, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP " +
-        "FROM incoming i " +
+        "FROM incoming_deduped i " +
         "WHERE NOT EXISTS ( " +
         "    SELECT 1 FROM upd u " +
         "    WHERE u.submission_timestamp = i.submission_timestamp " +
