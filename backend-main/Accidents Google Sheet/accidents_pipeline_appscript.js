@@ -384,6 +384,10 @@ function upsertAccidentRecords(records) {
         ") AS ( " +
         "  VALUES " + valuesList.join(",\n") + " " +
         "), " +
+        "incoming_deduped AS ( " +
+        "  SELECT DISTINCT ON (submission_timestamp, vehicle_number, accident_date) * " +
+        "  FROM incoming " +
+        "), " +
         "upd AS ( " +
         "  UPDATE public.sheet_accidents t " +
         "  SET " +
@@ -399,7 +403,7 @@ function upsertAccidentRecords(records) {
         "    letzryd_share = i.letzryd_share, " +
         "    incident_remarks = i.incident_remarks, " +
         "    updated_at = CURRENT_TIMESTAMP " +
-        "  FROM incoming i " +
+        "  FROM incoming_deduped i " +
         "  WHERE t.submission_timestamp = i.submission_timestamp " +
         "    AND t.vehicle_number = i.vehicle_number " +
         "    AND t.accident_date = i.accident_date " +
@@ -418,7 +422,7 @@ function upsertAccidentRecords(records) {
         "  i.driver_name, i.driver_partner_id, i.vehicle_rfd_date, i.total_invoice, i.liability_amount, " +
         "  i.letzryd_share, i.invoice_letter_link, i.incident_remarks, i.workshop_name, i.workshop_status, " +
         "  i.mode_of_repair, i.type_of_payment, CURRENT_TIMESTAMP " +
-        "FROM incoming i " +
+        "FROM incoming_deduped i " +
         "WHERE NOT EXISTS ( " +
         "  SELECT 1 FROM upd u " +
         "  WHERE u.submission_timestamp = i.submission_timestamp " +

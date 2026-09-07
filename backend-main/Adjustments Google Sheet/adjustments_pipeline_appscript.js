@@ -425,6 +425,10 @@ function upsertAdjustmentRecords(records) {
         ") AS ( " +
         "  VALUES " + valuesList.join(",\n") + " " +
         "), " +
+        "incoming_deduped AS ( " +
+        "  SELECT DISTINCT ON (submission_timestamp, partner_phone, adjustment_date, adjustment_type) * " +
+        "  FROM incoming " +
+        "), " +
         "upd AS ( " +
         "  UPDATE public.sheet_adjustments t " +
         "  SET " +
@@ -436,7 +440,7 @@ function upsertAdjustmentRecords(records) {
         "    final_status = i.final_status, " +
         "    remarks = i.remarks, " +
         "    updated_at = CURRENT_TIMESTAMP " +
-        "  FROM incoming i " +
+        "  FROM incoming_deduped i " +
         "  WHERE t.submission_timestamp = i.submission_timestamp " +
         "    AND t.partner_phone = i.partner_phone " +
         "    AND t.adjustment_date = i.adjustment_date " +
@@ -458,7 +462,7 @@ function upsertAdjustmentRecords(records) {
         "  i.adjustment_related_to, i.gps_data, i.first_level_approver, i.first_level_status, i.first_level_timestamp, " +
         "  i.finance_team_status, i.finance_team_remarks, i.final_level_approver, i.final_status, i.final_timestamp, " +
         "  i.hisaab_week_str, i.hisaab_week_number, CURRENT_TIMESTAMP " +
-        "FROM incoming i " +
+        "FROM incoming_deduped i " +
         "WHERE NOT EXISTS ( " +
         "  SELECT 1 FROM upd u " +
         "  WHERE u.submission_timestamp = i.submission_timestamp " +
