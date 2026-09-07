@@ -300,76 +300,147 @@ function formatRecordForSheet(r, nowStr) {
 // DATABASE UPSERT ENGINE
 // =============================================================================
 
+// Helper SQL formatters to eliminate V8-JDBC bridge RPC latency
+function sqlStr(val) {
+  if (val === null || val === undefined) return "NULL::text";
+  var s = String(val).trim();
+  if (s === "") return "NULL::text";
+  return "'" + s.replace(/'/g, "''").replace(/\\/g, "\\\\") + "'::text";
+}
+
+function sqlNum(val) {
+  if (val === null || val === undefined || val === "") return "0.00::numeric";
+  var n = parseFloat(val);
+  return (isNaN(n) ? "0.00" : n.toFixed(2)) + "::numeric";
+}
+
+function sqlBool(val) {
+  return val ? "TRUE::boolean" : "FALSE::boolean";
+}
+
+function sqlDate(val) {
+  if (!val) return "NULL::date";
+  return "'" + String(val).replace(/'/g, "") + "'::date";
+}
+
+function sqlTimestamp(val) {
+  if (!val) return "CURRENT_TIMESTAMP";
+  return "'" + String(val).replace(/'/g, "") + "'::timestamptz";
+}
+
 function upsertAccidentRecords(records) {
   if (!records || records.length === 0) return 0;
   
   var conn = null;
   var stmt = null;
   var url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
-
-  var sql = 
-    "INSERT INTO public.sheet_accidents (" +
-    "  submission_timestamp, submitter_email, vehicle_number, city_code, accident_date," +
-    "  police_acknowledgement, estimate_amount, accident_photos_link, letzryd_payable_amount," +
-    "  driver_name, driver_partner_id, vehicle_rfd_date, total_invoice, liability_amount," +
-    "  letzryd_share, invoice_letter_link, incident_remarks, workshop_name, workshop_status," +
-    "  mode_of_repair, type_of_payment, updated_at" +
-    ") VALUES (" +
-    "  CAST(? AS TIMESTAMPTZ), ?, ?, ?, CAST(? AS DATE)," +
-    "  ?, ?, ?, ?," +
-    "  ?, ?, CAST(? AS DATE), ?, ?," +
-    "  ?, ?, ?, ?, ?," +
-    "  ?, ?, CURRENT_TIMESTAMP" +
-    ") ON CONFLICT (submission_timestamp, vehicle_number, accident_date)" +
-    "DO UPDATE SET" +
-    "  city_code = EXCLUDED.city_code," +
-    "  police_acknowledgement = EXCLUDED.police_acknowledgement," +
-    "  estimate_amount = EXCLUDED.estimate_amount," +
-    "  letzryd_payable_amount = EXCLUDED.letzryd_payable_amount," +
-    "  driver_name = EXCLUDED.driver_name," +
-    "  driver_partner_id = COALESCE(EXCLUDED.driver_partner_id, sheet_accidents.driver_partner_id)," +
-    "  vehicle_rfd_date = EXCLUDED.vehicle_rfd_date," +
-    "  total_invoice = EXCLUDED.total_invoice," +
-    "  liability_amount = EXCLUDED.liability_amount," +
-    "  letzryd_share = EXCLUDED.letzryd_share," +
-    "  incident_remarks = EXCLUDED.incident_remarks," +
-    "  updated_at = CURRENT_TIMESTAMP;";
+  var BATCH_SIZE = 25;
+  var totalCount = 0;
 
   try {
     conn = Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
     conn.setAutoCommit(false);
-    stmt = conn.prepareStatement(sql);
+    stmt = conn.createStatement();
 
-    for (var i = 0; i < records.length; i++) {
-      var r = records[i];
-      stmt.setString(1, r.submission_timestamp);
-      stmt.setString(2, r.submitter_email || "");
-      stmt.setString(3, r.vehicle_number);
-      stmt.setString(4, r.city_code);
-      stmt.setString(5, r.accident_date);
-      stmt.setBoolean(6, r.police_acknowledgement);
-      stmt.setDouble(7, r.estimate_amount);
-      stmt.setString(8, r.accident_photos_link || "");
-      stmt.setDouble(9, r.letzryd_payable_amount);
-      stmt.setString(10, r.driver_name || "");
-      stmt.setString(11, r.driver_partner_id || "");
-      if (r.vehicle_rfd_date) stmt.setString(12, r.vehicle_rfd_date); else stmt.setNull(12, SQL_TYPES.DATE);
-      stmt.setDouble(13, r.total_invoice);
-      stmt.setDouble(14, r.liability_amount);
-      stmt.setDouble(15, r.letzryd_share);
-      stmt.setString(16, r.invoice_letter_link || "");
-      stmt.setString(17, r.incident_remarks || "");
-      stmt.setString(18, r.workshop_name || "");
-      stmt.setString(19, r.workshop_status || "Reported");
-      stmt.setString(20, r.mode_of_repair || "Accident");
-      stmt.setString(21, r.type_of_payment || "Insurance");
-      stmt.addBatch();
+    for (var b = 0; b < records.length; b += BATCH_SIZE) {
+      var chunk = records.slice(b, b + BATCH_SIZE);
+      var valuesList = [];
+
+      for (var i = 0; i < chunk.length; i++) {
+        var r = chunk[i];
+        var rowSql = "(" +
+          sqlTimestamp(r.submission_timestamp) + ", " +
+          sqlStr(r.submitter_email) + ", " +
+          sqlStr(r.vehicle_number) + ", " +
+          sqlStr(r.city_code) + ", " +
+          sqlDate(r.accident_date) + ", " +
+          sqlBool(r.police_acknowledgement) + ", " +
+          sqlNum(r.estimate_amount) + ", " +
+          sqlStr(r.accident_photos_link) + ", " +
+          sqlNum(r.letzryd_payable_amount) + ", " +
+          sqlStr(r.driver_name) + ", " +
+          sqlStr(r.driver_partner_id) + ", " +
+          sqlDate(r.vehicle_rfd_date) + ", " +
+          sqlNum(r.total_invoice) + ", " +
+          sqlNum(r.liability_amount) + ", " +
+          sqlNum(r.letzryd_share) + ", " +
+          sqlStr(r.invoice_letter_link) + ", " +
+          sqlStr(r.incident_remarks) + ", " +
+          sqlStr(r.workshop_name) + ", " +
+          sqlStr(r.workshop_status || "Reported") + ", " +
+          sqlStr(r.mode_of_repair || "Accident") + ", " +
+          sqlStr(r.type_of_payment || "Insurance") +
+        ")";
+        valuesList.push(rowSql);
+      }
+
+      var sql = 
+        "WITH incoming ( " +
+        "  submission_timestamp, submitter_email, vehicle_number, city_code, accident_date, " +
+        "  police_acknowledgement, estimate_amount, accident_photos_link, letzryd_payable_amount, " +
+        "  driver_name, driver_partner_id, vehicle_rfd_date, total_invoice, liability_amount, " +
+        "  letzryd_share, invoice_letter_link, incident_remarks, workshop_name, workshop_status, " +
+        "  mode_of_repair, type_of_payment " +
+        ") AS ( " +
+        "  VALUES " + valuesList.join(",\n") + " " +
+        "), " +
+        "upd AS ( " +
+        "  UPDATE public.sheet_accidents t " +
+        "  SET " +
+        "    city_code = i.city_code, " +
+        "    police_acknowledgement = i.police_acknowledgement, " +
+        "    estimate_amount = i.estimate_amount, " +
+        "    letzryd_payable_amount = i.letzryd_payable_amount, " +
+        "    driver_name = i.driver_name, " +
+        "    driver_partner_id = COALESCE(i.driver_partner_id, t.driver_partner_id), " +
+        "    vehicle_rfd_date = i.vehicle_rfd_date, " +
+        "    total_invoice = i.total_invoice, " +
+        "    liability_amount = i.liability_amount, " +
+        "    letzryd_share = i.letzryd_share, " +
+        "    incident_remarks = i.incident_remarks, " +
+        "    updated_at = CURRENT_TIMESTAMP " +
+        "  FROM incoming i " +
+        "  WHERE t.submission_timestamp = i.submission_timestamp " +
+        "    AND t.vehicle_number = i.vehicle_number " +
+        "    AND t.accident_date = i.accident_date " +
+        "  RETURNING t.submission_timestamp, t.vehicle_number, t.accident_date " +
+        ") " +
+        "INSERT INTO public.sheet_accidents ( " +
+        "  submission_timestamp, submitter_email, vehicle_number, city_code, accident_date, " +
+        "  police_acknowledgement, estimate_amount, accident_photos_link, letzryd_payable_amount, " +
+        "  driver_name, driver_partner_id, vehicle_rfd_date, total_invoice, liability_amount, " +
+        "  letzryd_share, invoice_letter_link, incident_remarks, workshop_name, workshop_status, " +
+        "  mode_of_repair, type_of_payment, updated_at " +
+        ") " +
+        "SELECT " +
+        "  i.submission_timestamp, i.submitter_email, i.vehicle_number, i.city_code, i.accident_date, " +
+        "  i.police_acknowledgement, i.estimate_amount, i.accident_photos_link, i.letzryd_payable_amount, " +
+        "  i.driver_name, i.driver_partner_id, i.vehicle_rfd_date, i.total_invoice, i.liability_amount, " +
+        "  i.letzryd_share, i.invoice_letter_link, i.incident_remarks, i.workshop_name, i.workshop_status, " +
+        "  i.mode_of_repair, i.type_of_payment, CURRENT_TIMESTAMP " +
+        "FROM incoming i " +
+        "WHERE NOT EXISTS ( " +
+        "  SELECT 1 FROM upd u " +
+        "  WHERE u.submission_timestamp = i.submission_timestamp " +
+        "    AND u.vehicle_number = i.vehicle_number " +
+        "    AND u.accident_date = i.accident_date " +
+        ");";
+
+      stmt.executeUpdate(sql);
+      totalCount += chunk.length;
+      Logger.log("Upserted batch: " + totalCount + "/" + records.length + " records into PostgreSQL.");
     }
 
-    stmt.executeBatch();
+    // Zero-Burn Sequence Alignment: Reset sequence to exact MAX(id) to guarantee zero gaps
+    try {
+      stmt.executeUpdate("SELECT setval('public.sheet_accidents_id_seq', COALESCE((SELECT MAX(id) FROM public.sheet_accidents), 1));");
+    } catch(e) {
+      Logger.log("Notice: sequence alignment: " + e.message);
+    }
+
     conn.commit();
-    Logger.log("Successfully upserted batch of " + records.length + " records into PostgreSQL.");
-    return records.length;
+    Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " records.");
+    return totalCount;
   } catch (err) {
     if (conn) conn.rollback();
     Logger.log("Error in upsertAccidentRecords: " + err.message);
@@ -439,16 +510,34 @@ function handleOnFormSubmit(e) {
 }
 
 /**
+ * Helper to find the actual last non-empty row (ignoring blank formatted rows at sheet bottom)
+ */
+function getTrueLastRow(sheet) {
+  if (!sheet) return 0;
+  var lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return lastRow;
+  
+  var colA = sheet.getRange(1, 1, lastRow, 1).getValues();
+  for (var i = colA.length - 1; i >= 0; i--) {
+    var val = colA[i][0];
+    if (val !== "" && val !== null && val !== undefined) {
+      return i + 1;
+    }
+  }
+  return 1;
+}
+
+/**
  * 1-Minute Time-Driven Catch-Up Sync for Recent Submissions
  */
 function syncRecentAccidents() {
   var sourceSheet = getSourceSheet();
-  var lastRow = sourceSheet.getLastRow();
-  if (lastRow <= 1) return;
+  var trueLastRow = getTrueLastRow(sourceSheet);
+  if (trueLastRow <= 1) return;
   
   var WINDOW_SIZE = 100;
-  var startRow = Math.max(2, lastRow - WINDOW_SIZE + 1);
-  var numRows = lastRow - startRow + 1;
+  var startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
+  var numRows = trueLastRow - startRow + 1;
   
   var data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
   var records = [];
@@ -518,17 +607,10 @@ function syncAllAccidents() {
   }
   Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
 
-  // 2. Batch upsert into PostgreSQL in chunks of 250
-  var DB_CHUNK = 250;
-  var totalUpserted = 0;
-  for (var c = 0; c < records.length; c += DB_CHUNK) {
-    var chunk = records.slice(c, c + DB_CHUNK);
-    var count = upsertAccidentRecords(chunk);
-    totalUpserted += count;
-    Logger.log("Upserted batch: " + count + " rows (Total so far: " + totalUpserted + ")");
-  }
-  
-  Logger.log("Completed syncAllAccidents! Total records synced: " + totalUpserted);
+  // 2. Batch upsert into PostgreSQL using single-connection multi-row inserts
+  Logger.log("Starting PostgreSQL upsert for " + records.length + " records...");
+  var totalUpserted = upsertAccidentRecords(records);
+  Logger.log("Completed syncAllAccidents! Total records synced to DB: " + totalUpserted);
 }
 
 // =============================================================================

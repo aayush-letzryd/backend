@@ -553,36 +553,43 @@ function testConnection() {
  * SQL Helper: Escapes string values for SQL literals.
  */
 function sqlEscapeStr(val) {
-  if (val === null || val === undefined) return "NULL";
+  if (val === null || val === undefined) return "NULL::text";
   let s = String(val).replace(/'/g, "''").replace(/\\/g, "\\\\");
-  return "'" + s + "'";
+  return "'" + s + "'::text";
 }
 
-/**
- * SQL Helper: Formats Date objects as SQL date literals.
- */
 function sqlEscapeDate(dt) {
   let s = formatDateOnly(dt);
-  return s ? ("'" + s + "'::date") : "NULL";
+  return s ? ("'" + s + "'::date") : "NULL::date";
 }
 
-/**
- * SQL Helper: Formats Date objects as SQL timestamptz literals.
- */
 function sqlEscapeTimestamp(dt) {
   let s = formatTimestamp(dt);
-  return s ? ("'" + s + "'::timestamptz") : "NULL";
+  return s ? ("'" + s + "'::timestamptz") : "NULL::timestamptz";
+}
+
+function sqlEscapeNum(val) {
+  if (val === null || val === undefined || val === "") return "0.00::numeric";
+  let n = parseFloat(val);
+  return (isNaN(n) ? "0.00" : n.toFixed(2)) + "::numeric";
+}
+
+function sqlEscapeInt(val) {
+  if (val === null || val === undefined || val === "") return "0::integer";
+  let n = parseInt(val, 10);
+  return (isNaN(n) ? "0" : String(n)) + "::integer";
 }
 
 /**
- * Upserts a batch of standardized records into PostgreSQL in a single multi-row SQL query.
+ * Upserts a batch of standardized records into PostgreSQL using CTE Zero-Burn query.
+ * Evaluates nextval() ONLY for brand-new rows; existing rows generate 0 sequence increments.
  */
 function upsertRecordsToDatabase(records, skipCoreMerge) {
   if (!records || records.length === 0) return 0;
   
   let conn = null;
   let stmt = null;
-  const SUB_CHUNK = 20; // Chunk into 20 rows per query to stay well within Apps Script's SQL string size limit
+  const SUB_CHUNK = 10;
   
   try {
     conn = getDbConnection();
@@ -633,15 +640,74 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
           sqlEscapeStr(r.accountName) + ", " +
           sqlEscapeStr(r.accountNumber) + ", " +
           sqlEscapeStr(r.ifscCode) + ", " +
-          (r.depositAmount || 0.0) + ", " +
+          sqlEscapeNum(r.depositAmount) + ", " +
           sqlEscapeStr(r.partnerId) + ", " +
-          (r.sheetRowNumber || 0) + ", " +
-          "CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)"
-        );
+          sqlEscapeInt(r.sheetRowNumber) +
+        ")");
       }
       
       let sql = 
-        "INSERT INTO public.sheet_driver_onboarding (" +
+        "WITH incoming ( " +
+        "    submission_timestamp, submitter_email, city, onboarding_type, " +
+        "    lead_source, driver_plan, driver_name, driver_phone, whatsapp_phone, " +
+        "    emergency_name, emergency_phone, reference_name, reference_phone, " +
+        "    father_name, dob, aadhaar_address, present_address, pan_number, " +
+        "    aadhaar_number, dl_expiry, dl_number, upi_id, pan_aadhaar_linked, " +
+        "    dl_front, dl_back, aadhaar_front, aadhaar_back, pan_card, " +
+        "    local_address_proof, selfie_photo, pan_aadhaar_photo, bank_details_doc, " +
+        "    referral_phone, referral_name, account_name, account_number, ifsc_code, " +
+        "    deposit_amount, partner_id, sheet_row_number " +
+        ") AS ( " +
+        "    VALUES " + valueClauses.join(", ") + " " +
+        "), " +
+        "upd AS ( " +
+        "    UPDATE public.sheet_driver_onboarding t " +
+        "    SET " +
+        "        submitter_email = i.submitter_email, " +
+        "        city = i.city, " +
+        "        onboarding_type = i.onboarding_type, " +
+        "        lead_source = i.lead_source, " +
+        "        driver_plan = i.driver_plan, " +
+        "        driver_name = i.driver_name, " +
+        "        whatsapp_phone = i.whatsapp_phone, " +
+        "        emergency_name = i.emergency_name, " +
+        "        emergency_phone = i.emergency_phone, " +
+        "        reference_name = i.reference_name, " +
+        "        reference_phone = i.reference_phone, " +
+        "        father_name = i.father_name, " +
+        "        dob = i.dob, " +
+        "        aadhaar_address = i.aadhaar_address, " +
+        "        present_address = i.present_address, " +
+        "        pan_number = i.pan_number, " +
+        "        aadhaar_number = i.aadhaar_number, " +
+        "        dl_expiry = i.dl_expiry, " +
+        "        dl_number = i.dl_number, " +
+        "        upi_id = i.upi_id, " +
+        "        pan_aadhaar_linked = i.pan_aadhaar_linked, " +
+        "        dl_front = i.dl_front, " +
+        "        dl_back = i.dl_back, " +
+        "        aadhaar_front = i.aadhaar_front, " +
+        "        aadhaar_back = i.aadhaar_back, " +
+        "        pan_card = i.pan_card, " +
+        "        local_address_proof = i.local_address_proof, " +
+        "        selfie_photo = i.selfie_photo, " +
+        "        pan_aadhaar_photo = i.pan_aadhaar_photo, " +
+        "        bank_details_doc = i.bank_details_doc, " +
+        "        referral_phone = i.referral_phone, " +
+        "        referral_name = i.referral_name, " +
+        "        account_name = i.account_name, " +
+        "        account_number = i.account_number, " +
+        "        ifsc_code = i.ifsc_code, " +
+        "        deposit_amount = i.deposit_amount, " +
+        "        partner_id = i.partner_id, " +
+        "        sheet_row_number = i.sheet_row_number, " +
+        "        updated_at = CURRENT_TIMESTAMP " +
+        "    FROM incoming i " +
+        "    WHERE t.submission_timestamp = i.submission_timestamp " +
+        "      AND t.driver_phone = i.driver_phone " +
+        "    RETURNING t.submission_timestamp, t.driver_phone " +
+        ") " +
+        "INSERT INTO public.sheet_driver_onboarding ( " +
         "    submission_timestamp, submitter_email, city, onboarding_type, " +
         "    lead_source, driver_plan, driver_name, driver_phone, whatsapp_phone, " +
         "    emergency_name, emergency_phone, reference_name, reference_phone, " +
@@ -651,51 +717,34 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         "    local_address_proof, selfie_photo, pan_aadhaar_photo, bank_details_doc, " +
         "    referral_phone, referral_name, account_name, account_number, ifsc_code, " +
         "    deposit_amount, partner_id, sheet_row_number, created_at, updated_at " +
-        ") VALUES " + valueClauses.join(", ") + " " +
-        "ON CONFLICT (submission_timestamp, driver_phone) DO UPDATE SET " +
-        "    submitter_email = EXCLUDED.submitter_email, " +
-        "    city = EXCLUDED.city, " +
-        "    onboarding_type = EXCLUDED.onboarding_type, " +
-        "    lead_source = EXCLUDED.lead_source, " +
-        "    driver_plan = EXCLUDED.driver_plan, " +
-        "    driver_name = EXCLUDED.driver_name, " +
-        "    whatsapp_phone = EXCLUDED.whatsapp_phone, " +
-        "    emergency_name = EXCLUDED.emergency_name, " +
-        "    emergency_phone = EXCLUDED.emergency_phone, " +
-        "    reference_name = EXCLUDED.reference_name, " +
-        "    reference_phone = EXCLUDED.reference_phone, " +
-        "    father_name = EXCLUDED.father_name, " +
-        "    dob = EXCLUDED.dob, " +
-        "    aadhaar_address = EXCLUDED.aadhaar_address, " +
-        "    present_address = EXCLUDED.present_address, " +
-        "    pan_number = EXCLUDED.pan_number, " +
-        "    aadhaar_number = EXCLUDED.aadhaar_number, " +
-        "    dl_expiry = EXCLUDED.dl_expiry, " +
-        "    dl_number = EXCLUDED.dl_number, " +
-        "    upi_id = EXCLUDED.upi_id, " +
-        "    pan_aadhaar_linked = EXCLUDED.pan_aadhaar_linked, " +
-        "    dl_front = EXCLUDED.dl_front, " +
-        "    dl_back = EXCLUDED.dl_back, " +
-        "    aadhaar_front = EXCLUDED.aadhaar_front, " +
-        "    aadhaar_back = EXCLUDED.aadhaar_back, " +
-        "    pan_card = EXCLUDED.pan_card, " +
-        "    local_address_proof = EXCLUDED.local_address_proof, " +
-        "    selfie_photo = EXCLUDED.selfie_photo, " +
-        "    pan_aadhaar_photo = EXCLUDED.pan_aadhaar_photo, " +
-        "    bank_details_doc = EXCLUDED.bank_details_doc, " +
-        "    referral_phone = EXCLUDED.referral_phone, " +
-        "    referral_name = EXCLUDED.referral_name, " +
-        "    account_name = EXCLUDED.account_name, " +
-        "    account_number = EXCLUDED.account_number, " +
-        "    ifsc_code = EXCLUDED.ifsc_code, " +
-        "    deposit_amount = EXCLUDED.deposit_amount, " +
-        "    partner_id = EXCLUDED.partner_id, " +
-        "    sheet_row_number = EXCLUDED.sheet_row_number, " +
-        "    updated_at = CURRENT_TIMESTAMP;";
+        ") " +
+        "SELECT " +
+        "    i.submission_timestamp, i.submitter_email, i.city, i.onboarding_type, " +
+        "    i.lead_source, i.driver_plan, i.driver_name, i.driver_phone, i.whatsapp_phone, " +
+        "    i.emergency_name, i.emergency_phone, i.reference_name, i.reference_phone, " +
+        "    i.father_name, i.dob, i.aadhaar_address, i.present_address, i.pan_number, " +
+        "    i.aadhaar_number, i.dl_expiry, i.dl_number, i.upi_id, i.pan_aadhaar_linked, " +
+        "    i.dl_front, i.dl_back, i.aadhaar_front, i.aadhaar_back, i.pan_card, " +
+        "    i.local_address_proof, i.selfie_photo, i.pan_aadhaar_photo, i.bank_details_doc, " +
+        "    i.referral_phone, i.referral_name, i.account_name, i.account_number, i.ifsc_code, " +
+        "    i.deposit_amount, i.partner_id, i.sheet_row_number, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP " +
+        "FROM incoming i " +
+        "WHERE NOT EXISTS ( " +
+        "    SELECT 1 FROM upd u " +
+        "    WHERE u.submission_timestamp = i.submission_timestamp " +
+        "      AND u.driver_phone = i.driver_phone " +
+        ");";
   
       stmt.executeUpdate(sql);
     }
     
+    // Zero-Burn Sequence Alignment: Reset sequence to exact MAX(id) to guarantee zero gaps
+    try {
+      stmt.executeUpdate("SELECT setval('public.sheet_driver_onboarding_id_seq', COALESCE((SELECT MAX(id) FROM public.sheet_driver_onboarding), 1));");
+    } catch(err) {
+      Logger.log("Notice: sequence alignment: " + err.message);
+    }
+
     conn.commit();
     Logger.log("Successfully upserted " + records.length + " records.");
     
@@ -853,25 +902,56 @@ function syncFromSourceSheetToTargetSheet() {
   
   Logger.log("Wrote " + sheetRows.length + " clean standardized rows to tab '" + DB_CONFIG.targetSheetName + "'.");
   
-  // Sync to PostgreSQL in DB batches of 100
-  let syncedDbCount = 0;
-  for (let k = 0; k < parsedRecords.length; k += 100) {
-    let dbBatch = parsedRecords.slice(k, k + 100);
-    syncedDbCount += upsertRecordsToDatabase(dbBatch, true);
-  }
-  
-  // Refresh core consolidation once at the end
-  let conn = null;
-  try {
-    conn = getDbConnection();
-    triggerCoreMerge(conn);
-  } catch(e) {
-    Logger.log("Core merge notice: " + e.message);
-  } finally {
-    if (conn) { try { conn.close(); } catch(e){} }
-  }
-  
+  // Sync all records to PostgreSQL using persistent single-connection multi-row inserts
+  Logger.log("Starting PostgreSQL upsert for all " + parsedRecords.length + " onboarding records...");
+  let syncedDbCount = upsertRecordsToDatabase(parsedRecords, false);
   Logger.log("Complete! Successfully synchronized " + syncedDbCount + " records to PostgreSQL database.");
+}
+
+function formatRecordForSheet(parsed, nowStr) {
+  return [
+    formatTimestamp(parsed.submissionTimestamp),
+    parsed.email || "",
+    parsed.city || "",
+    parsed.onboardingType || "",
+    parsed.leadSource || "",
+    parsed.driverPlan || "",
+    parsed.driverName || "",
+    parsed.driverPhone || "",
+    parsed.whatsappPhone || "",
+    parsed.emergencyName || "",
+    parsed.emergencyPhone || "",
+    parsed.refName || "",
+    parsed.refPhone || "",
+    parsed.fatherName || "",
+    formatDateOnly(parsed.dob) || "",
+    parsed.aadhaarAddress || "",
+    parsed.presentAddress || "",
+    parsed.panNumber || "",
+    parsed.aadhaarNumber || "",
+    formatDateOnly(parsed.dlExpiry) || "",
+    parsed.dlNumber || "",
+    parsed.upiId || "",
+    parsed.panAadhaarLinked || "",
+    parsed.dlFront || "",
+    parsed.dlBack || "",
+    parsed.aadhaarFront || "",
+    parsed.aadhaarBack || "",
+    parsed.panCard || "",
+    parsed.localAddressProof || "",
+    parsed.selfiePhoto || "",
+    parsed.panAadhaarPhoto || "",
+    parsed.bankDetailsDoc || "",
+    parsed.referralPhone || "",
+    parsed.referralName || "",
+    parsed.accountName || "",
+    parsed.accountNumber || "",
+    parsed.ifscCode || "",
+    parsed.depositAmount || 0,
+    parsed.partnerId || "",
+    parsed.sheetRowNumber,
+    nowStr || formatTimestamp(new Date())
+  ];
 }
 
 // =============================================================================
@@ -897,9 +977,19 @@ function handleOnEdit(e) {
   const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
   
   const records = [];
+  const nowStr = formatTimestamp(new Date());
+  const targetSs = getTargetSpreadsheet();
+  const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
+
   for (let i = 0; i < rawData.length; i++) {
     let parsed = parseRow(rawData[i], actualStart + i);
-    if (parsed) records.push(parsed);
+    if (parsed) {
+      records.push(parsed);
+      if (targetSheet) {
+        let sheetRow = formatRecordForSheet(parsed, nowStr);
+        targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
+      }
+    }
   }
   
   if (records.length > 0) {
@@ -915,8 +1005,33 @@ function handleOnFormSubmit(e) {
   Logger.log("Form submission event received.");
   let parsed = parseRow(e.values, e.range ? e.range.getRow() : 0);
   if (parsed) {
+    const targetSs = getTargetSpreadsheet();
+    const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
+    if (targetSheet && parsed.sheetRowNumber > 1) {
+      let sheetRow = formatRecordForSheet(parsed, formatTimestamp(new Date()));
+      targetSheet.getRange(parsed.sheetRowNumber, 1, 1, sheetRow.length).setValues([sheetRow]);
+    }
     upsertRecordsToDatabase([parsed]);
   }
+}
+
+/**
+ * Helper to find the actual last non-empty row (ignoring blank formatted rows at sheet bottom)
+ */
+function getTrueLastRow(sheet) {
+  if (!sheet) return 0;
+  const lastRow = sheet.getLastRow();
+  if (lastRow <= 1) return lastRow;
+  
+  // Scan timestamps / column A backwards
+  const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
+  for (let i = colA.length - 1; i >= 0; i--) {
+    let val = colA[i][0];
+    if (val !== "" && val !== null && val !== undefined) {
+      return i + 1;
+    }
+  }
+  return 1;
 }
 
 /**
@@ -927,23 +1042,43 @@ function syncRecentOnboardings() {
   const sourceSheet = sourceSs.getSheetByName(DB_CONFIG.sourceSheetName);
   if (!sourceSheet) return;
   
-  const lastRow = sourceSheet.getLastRow();
-  if (lastRow <= 1) return;
+  const trueLastRow = getTrueLastRow(sourceSheet);
+  if (trueLastRow <= 1) return;
   
-  const WINDOW_SIZE = 50;
-  const startRow = Math.max(2, lastRow - WINDOW_SIZE + 1);
-  const numRows = lastRow - startRow + 1;
+  const WINDOW_SIZE = 100;
+  const startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
+  const numRows = trueLastRow - startRow + 1;
   
   const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
   const records = [];
+  const sheetRows = [];
+  const nowStr = formatTimestamp(new Date());
+
   for (let i = 0; i < data.length; i++) {
     let parsed = parseRow(data[i], startRow + i);
-    if (parsed) records.push(parsed);
+    if (parsed) {
+      records.push(parsed);
+      sheetRows.push({
+        rowNum: startRow + i,
+        values: formatRecordForSheet(parsed, nowStr)
+      });
+    }
   }
   
   if (records.length > 0) {
+    // 1. Sync recent rows to clean target sheet tab
+    const targetSs = getTargetSpreadsheet();
+    const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
+    if (targetSheet) {
+      for (let j = 0; j < sheetRows.length; j++) {
+        let r = sheetRows[j];
+        targetSheet.getRange(r.rowNum, 1, 1, r.values.length).setValues([r.values]);
+      }
+    }
+
+    // 2. Sync to PostgreSQL
     upsertRecordsToDatabase(records);
-    Logger.log("Catch-up sync processed " + records.length + " recent records.");
+    Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent records in sheet & database.");
   }
 }
 
