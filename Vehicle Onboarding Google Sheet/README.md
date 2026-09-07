@@ -23,7 +23,8 @@ This pipeline unifies all 3 sources into a **73-column master tabular model**, r
 
 ### Primary System Guarantees
 - **Zero Data Loss Rule**: 100% of the 1,619 vehicle fleet is preserved with full attribution. Legacy fleet records without digital PDI forms or missing invoices are preserved with clean nullable flags.
-- **True Natural Primary Key**: Keyed on normalized uppercase alphanumeric **`registration_no`** (e.g. `KA05AP6032`), guaranteeing 100% unique entity resolution and idempotent `ON CONFLICT (registration_no) DO UPDATE` upserts.
+- **True Natural Primary Key**: Keyed on normalized uppercase alphanumeric **`registration_no`** (e.g. `KA05AP6032`), matching Column F (`vehicle_number (Plate)`), guaranteeing 100% unique entity resolution and idempotent `ON CONFLICT (registration_no) DO UPDATE` upserts.
+- **Clean Sequential ID Alignment**: Internal PostgreSQL sequence `id BIGSERIAL` starts at **`1`** and ends at **`1,619`** (strictly continuous, matching `sl` entry index with 0 sequence jumps/gaps).
 - **Sub-Second Live Synchronization**: Event-driven `handleOnEdit` and `handleOnFormSubmit` triggers propagate cell edits and form submissions to PostgreSQL in **< 1 second**.
 - **Batch Processing Resilience**: Bulk backfills process in **250-row chunks** with transaction rollbacks (`conn.rollback()`), bypassing Apps Script execution timeouts.
 - **Connection Leak-Proof**: Exhaustive `try-catch-finally` resource management ensuring all JDBC connections and prepared statements close gracefully under all failure modes.
