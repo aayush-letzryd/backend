@@ -17,11 +17,13 @@ The **LetzRyd Traffic Challan Live Pipeline** provides real-time data ingestion,
 The operations team logs traffic violations on a weekly cycle across disjoint tabs in **`Traffic Challan details`**. This pipeline consolidates all 38 historical and active weekly tabs, resolves all **15 cataloged data quality anomalies (`CHAL-01` through `CHAL-15`)**, and writes directly into PostgreSQL **`public.sheet_challans`** to feed the downstream driver deduction engine (**`challans_final`**).
 
 ### Primary System Guarantees
-- **Zero Data Loss Rule**: 100% of the 35,930 historical records and 5,043 active violation events are captured and preserved.
-- **Three Financial Pillars Enforced**:
-  1. `vehicle_reg_no`: Normalized uppercase alphanumeric 9-10 character plate (e.g. `KA05AP6032`).
-  2. `violation_date`: Strict ISO `DATE` for actual violations; `NULL` for routine weekly rolling balance snapshots.
-  3. `challan_amount`: Clean `NUMERIC(12,2)` distinguishing government police fines from internal sticker penalties (`sticker_fine`) and rolling cumulative balances (`total_pending`).
+- **Zero Data Loss Rule**: 100% of the 36,098 historical records, 4,917 populated violation dates, and 4,879 active violation events (₹35.65 Lakhs) are captured and preserved.
+- **Dual Record Ledger Architecture**:
+  1. **Active Violations (4,879 rows, ₹35.65 Lakhs)**: Traffic police infraction records with populated ISO `violation_date`, `violation_time`, `challan_amount`, and deterministic notice IDs (`NOT-<REG>-<DATE>-<AMT>`).
+  2. **Weekly Routine Audits (31,219 rows)**: Routine weekly vehicle balance checks where no traffic fine was committed (`challan_amount = 0`, `violation_date = NULL`, `notice_no = BAL-<REG>-<WEEK>`), preserving cumulative rolling balance audit trails.
+- **Primary & Natural Key Specifications**:
+  - **Primary Key**: `id BIGSERIAL PRIMARY KEY` (strictly sequential integers `1` to `36,098` with zero sequence gaps).
+  - **Natural Key / Conflict Target**: `(vehicle_reg_no, notice_no)` across weekly cycles for idempotent synchronization.
 - **Sub-Second Live Synchronization**: Event-driven `handleOnEdit` trigger propagates single-cell edits on the active week to PostgreSQL in **< 1 second**.
 - **Batch Processing Resilience**: Processes weekly cycles in **250-row chunks** with transaction rollbacks (`conn.rollback()`), bypassing execution timeouts.
 - **Connection Leak-Proof**: Exhaustive `try-catch-finally` resource management ensuring all JDBC connections and prepared statements close gracefully under all failure modes.
