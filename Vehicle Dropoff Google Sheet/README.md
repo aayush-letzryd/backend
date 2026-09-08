@@ -1,6 +1,6 @@
 # LetzRyd Vehicle Dropoff Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `YOUR_DB_HOST_HERE:5432`  
+Target Database: `35.200.196.113:5432`  
 Database Name: `postgres`  
 Target Table: `public.sheet_dropoffs`  
 Downstream Master Table: `public.dropoff_final` (Driver Hisaab Engine)  
@@ -47,7 +47,7 @@ flowchart TD
         OE --> S
     end
 
-    subgraph DatabaseLayer ["PostgreSQL Central Database (YOUR_DB_HOST_HERE:5432)"]
+    subgraph DatabaseLayer ["PostgreSQL Central Database (35.200.196.113:5432)"]
         S -->|JDBC PreparedStatement Upserts| DB[("public.sheet_dropoffs<br>PK: dropoff_id (1, 2, 3...)<br>Indexed on vehicle, driver, date, city, type")]
         DB --> F[("public.dropoff_final<br>(Driver Hisaab Settlement Engine)")]
     end
@@ -72,7 +72,7 @@ flowchart TD
 -- ==============================================================================
 -- LETZRYD VEHICLE DROPOFF MASTER TABLE DDL
 -- Target Table: public.sheet_dropoffs
--- Host: YOUR_DB_HOST_HERE:5432 | DB: postgres | Schema: public
+-- Host: 35.200.196.113:5432 | DB: postgres | Schema: public
 -- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS public.sheet_dropoffs (
@@ -130,7 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_sheet_dropoffs_driver_type ON public.sheet_dropof
 ### Step 1: Database Setup
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
 ```
 
 ### Step 2: Google Apps Script Setup
@@ -141,12 +141,12 @@ psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
 
 ### Step 3: Run Full Historical Ingestion
 1. In the Apps Script function dropdown, select **`syncDropoffsToDatabase`**.
-2. Click **Run**.
+2. Click **▶ Run**.
 3. All historical dropoff records will commit in 250-row batches with zero timeouts.
 
 ### Step 4: Activate Continuous Live Triggers
 1. In the Apps Script function dropdown, select **`setupTriggers`**.
-2. Click **Run**.
+2. Click **▶ Run**.
 3. Automated triggers installed:
    - **`handleOnEdit`**: Captures real-time single-cell edits on `Unified_Dropoff_source` in **< 1s**.
    - **`syncDropoffsToDatabase`**: Hourly background catch-up timer ensuring 100% sync parity.
@@ -173,8 +173,8 @@ SELECT
     MAX(dropoff_id) AS max_id,
     CASE 
         WHEN COUNT(*) = MAX(dropoff_id) AND MIN(dropoff_id) = 1 
-        THEN '100% PERFECT: Gapless Sequential Integer (1, 2, 3... 6410)'
-        ELSE 'Needs Review'
+        THEN '✅ 100% PERFECT: Gapless Sequential Integer (1, 2, 3... 6410)'
+        ELSE '❌ Needs Review'
     END AS validation_result
 FROM public.sheet_dropoffs;
 
