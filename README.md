@@ -116,6 +116,24 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 7. [Vehicle Onboarding Final Table](./Vehicle%20Onboarding%20Final%20Table/)
+- **Description**: Real-time unified master Single Source of Truth (`public.core_vehicle_onboarding`) merging Google Sheets fleet onboarding (`sheet_vehicle_onboarding`) and LetzRyd Web Portal Intake Form (`july_vehicle_onboarding`) with deterministic Portal Priority.
+- **Key Files**:
+  - [`schema.sql`](./Vehicle%20Onboarding%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_vehicle_onboarding`, indexes, and dual triggers for live bi-directional sync (<10ms).
+  - [`automation_script.py`](./Vehicle%20Onboarding%20Final%20Table/automation_script.py): Parameterized Python engine for initial backfill, reconciliation, and automated health audits.
+  - [`data_issues.md`](./Vehicle%20Onboarding%20Final%20Table/data_issues.md): Comprehensive data quality catalog (ISS-01 to ISS-05) documenting plate formatting, VIN lengths, city variants, and ops recommendations.
+  - [`README.md`](./Vehicle%20Onboarding%20Final%20Table/README.md): Exhaustive engineering blueprint, architecture diagram, and operational runbook.
+- **Target Table**: `public.core_vehicle_onboarding` (PostgreSQL)
+- **Primary Features**:
+  - Single Source of Truth on `registration_no` (Standardized vehicle plate)
+  - Deterministic Portal Priority: Portal submissions take precedence for core vehicle data while Google Sheet records enrich non-conflicting operational fields
+  - Gapless sequential primary key (`id` allocated via advisory lock `pg_advisory_xact_lock(777999111)`)
+  - Permanent Archival & Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = NOW()`)
+  - Clean IST timestamps without `+05:30` offset confusion
+  - Partial unique indexes and performance query indexes
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
