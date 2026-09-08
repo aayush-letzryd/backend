@@ -108,7 +108,7 @@ This repository hosts production scripts, architecture specifications, database 
   - Zero changes to source tables (`sheet_walkins`, `july_new_walkins`, `july_existing_walkins` remain untouched)
   - Native PostgreSQL triggers providing instant live synchronization (<10ms)
   - Gapless sequential primary key (`id` allocated via transactional advisory lock `pg_advisory_xact_lock` guaranteeing continuous 1..N IDs without sequence jumps)
-  - Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = CURRENT_TIMESTAMP` upon source deletions, exposed via `public.active_core_walkin` view)
+  - Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = CURRENT_TIMESTAMP` upon source deletions, maintaining gapless IDs and audit history)
   - 100% event log preservation (all walk-in records preserved with full fidelity and source attribution)
   - Functional standardization of cities (`Bengaluru`, `Hyderabad`, `Mumbai`) and 10-digit mobile numbers
   - Verbatim pass-through of names, remarks, and Aadhaar numbers without altering raw inputs

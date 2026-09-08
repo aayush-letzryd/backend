@@ -109,9 +109,6 @@ CREATE INDEX IF NOT EXISTS idx_core_walkin_city_date ON public.core_walkin (city
 CREATE INDEX IF NOT EXISTS idx_core_walkin_source_date ON public.core_walkin (source_system, walkin_date DESC);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_active ON public.core_walkin (is_deleted);
 
--- Active Records View (Excludes Soft-Deleted Rows)
-CREATE OR REPLACE VIEW public.active_core_walkin AS 
-SELECT * FROM public.core_walkin WHERE is_deleted = FALSE;
 
 -- -----------------------------------------------------------------------------
 -- 2. Trigger Function: Sync from sheet_walkins

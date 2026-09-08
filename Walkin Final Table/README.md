@@ -56,14 +56,14 @@ This document serves as both:
                                     |   (100% History & Full Audit)     |
                                     +-----------------------------------+
                                                       |
-                                      +---------------+---------------+
-                                      |                               |
-                                      v                               v
-                     +---------------------------------+  +-------------------------------+
-                     |   public.active_core_walkin     |  | Audit & Compliance Queries    |
-                     |   (VIEW: WHERE is_deleted=FALSE)|  | (WHERE is_deleted = TRUE)     |
-                     |   For Dashboards, BI, & APIs    |  | Deleted Row Recovery & History|
-                     +---------------------------------+  +-------------------------------+
+                                                       |
+                                       +---------------+---------------+
+                                       |                               |
+                                       v                               v
+                      +---------------------------------+  +-------------------------------+
+                      |      Live Operations / BI       |  |  Audit & Compliance History   |
+                      |   (WHERE is_deleted = FALSE)    |  |  (WHERE is_deleted = TRUE)    |
+                      +---------------------------------+  +-------------------------------+
 ```
 
 ---
@@ -84,7 +84,7 @@ When designing an enterprise-grade Single Source of Truth across multiple dispar
 4. **Permanent Archival & Soft Deletes (Zero Data Loss)**:
    - When a record is deleted in a source table, the trigger **refuses to delete the master row**.
    - Instead, it marks `is_deleted = TRUE` and `deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`.
-   - Downstream dashboards query `public.active_core_walkin` (which filters out deleted rows), while the complete history remains archived for recovery.
+   - Downstream dashboards query `public.core_walkin WHERE is_deleted = FALSE`, while the complete history remains archived for recovery.
 5. **Standardized Functional Keys vs. Verbatim Pass-Through**:
    - **Functional columns** used for joins and filtering (`city`, `phone_number`, `visiting_reason_category`) are normalized automatically.
    - **Verbatim columns** (`partner_name`, `remarks`, `aadhaar_number`) preserve raw human input exactly as entered.
@@ -340,7 +340,8 @@ If a source system introduces a new form field (for example, `driving_experience
 **Query Active Walk-Ins for Live Dashboards:**
 ```sql
 SELECT id, walkin_date, walkin_time, city, full_name, phone_number, visiting_reason_category, source_system
-FROM public.active_core_walkin
+FROM public.core_walkin
+WHERE is_deleted = FALSE
 ORDER BY walkin_date DESC, id DESC
 LIMIT 50;
 ```
@@ -360,7 +361,8 @@ SELECT
     count(*) AS total_walkins,
     count(CASE WHEN is_joined = TRUE THEN 1 END) AS joined_count,
     round(count(CASE WHEN is_joined = TRUE THEN 1 END) * 100.0 / count(*), 1) AS conversion_rate_pct
-FROM public.active_core_walkin
+FROM public.core_walkin
+WHERE is_deleted = FALSE
 GROUP BY city
 ORDER BY total_walkins DESC;
 ```

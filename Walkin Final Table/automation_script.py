@@ -84,7 +84,7 @@ def audit_health():
     cur.execute("SELECT count(*) FROM public.core_walkin;")
     core_count = cur.fetchone()['count']
 
-    cur.execute("SELECT count(*) FROM public.active_core_walkin;")
+    cur.execute("SELECT count(*) FROM public.core_walkin WHERE is_deleted = FALSE;")
     active_count = cur.fetchone()['count']
 
     cur.execute("SELECT count(*) FROM public.core_walkin WHERE is_deleted = TRUE;")
