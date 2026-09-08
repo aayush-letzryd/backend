@@ -12,6 +12,9 @@ Usage:
 import os
 import re
 import argparse
+import zoneinfo
+
+IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
@@ -178,7 +181,7 @@ def backfill():
                     %s, FALSE, NULL, %s, %s
                 );
             """, (
-                r['id'], w_type, r['submission_timestamp'].date(), r['submission_timestamp'].strftime('%H:%M'), r['submission_timestamp'], city,
+                r['id'], w_type, r['submission_timestamp'].astimezone(IST).date(), r['submission_timestamp'].astimezone(IST).strftime('%H:%M'), r['submission_timestamp'].astimezone(IST).replace(tzinfo=None), city,
                 full, f_name, l_name, phone, r['dl_number'],
                 v_reason, v_cat, j_status, is_j, r['joined_date'],
                 r['attending_executive'], r['submitter_email'], r['remarks'],
