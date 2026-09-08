@@ -81,10 +81,29 @@ def audit_health():
     cur.execute("SELECT count(*) FROM public.core_walkin;")
     core_count = cur.fetchone()['count']
 
+    cur.execute("SELECT count(*) FROM public.active_core_walkin;")
+    active_count = cur.fetchone()['count']
+
+    cur.execute("SELECT count(*) FROM public.core_walkin WHERE is_deleted = TRUE;")
+    deleted_count = cur.fetchone()['count']
+
+    cur.execute("SELECT MIN(id) as min_id, MAX(id) as max_id FROM public.core_walkin;")
+    id_range = cur.fetchone()
+
+    cur.execute("""
+        SELECT s.i 
+        FROM generate_series(1, COALESCE((SELECT MAX(id) FROM public.core_walkin), 0)) s(i) 
+        LEFT JOIN public.core_walkin c ON s.i = c.id 
+        WHERE c.id IS NULL;
+    """)
+    gaps = cur.fetchall()
+
     print(f"Source: sheet_walkins         : {sheet_count} rows")
     print(f"Source: july_new_walkins      : {portal_new_count} rows")
     print(f"Source: july_existing_walkins : {portal_ex_count} rows")
-    print(f"Target: core_walkin           : {core_count} rows")
+    print(f"Target: core_walkin (Total)   : {core_count} rows (Active: {active_count}, Soft-Deleted: {deleted_count})")
+    print(f"Primary Key Range             : ID {id_range['min_id']} to ID {id_range['max_id']}")
+    print(f"Gapless ID Integrity          : {'PASSED (0 missing IDs)' if len(gaps) == 0 else f'FAILED ({len(gaps)} missing IDs: {[g['i'] for g in gaps[:5]]})'}")
     print(f"Reconciliation Status         : {'MATCHED' if core_count == (sheet_count + portal_new_count + portal_ex_count) else 'DELTA DETECTED'}")
 
     print("\n--- Distribution by Source System ---")
@@ -147,7 +166,7 @@ def backfill():
                     visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
                     lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
                     attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                    sheet_row_number, created_at, updated_at
+                    sheet_row_number, is_deleted, deleted_at, created_at, updated_at
                 ) VALUES (
                     'GOOGLE_SHEET', 'sheet_walkins', %s, NULL, NULL,
                     %s, %s, %s, %s, %s, NULL,
@@ -156,7 +175,7 @@ def backfill():
                     %s, %s, %s, %s, %s, 'Submitted',
                     NULL, NULL, NULL, NULL,
                     %s, NULL, %s, %s, NULL,
-                    %s, %s, %s
+                    %s, FALSE, NULL, %s, %s
                 );
             """, (
                 r['id'], w_type, r['submission_timestamp'].date(), r['submission_timestamp'].strftime('%H:%M'), r['submission_timestamp'], city,
@@ -192,7 +211,7 @@ def backfill():
                     visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
                     lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
                     attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                    sheet_row_number, created_at, updated_at
+                    sheet_row_number, is_deleted, deleted_at, created_at, updated_at
                 ) VALUES (
                     'PORTAL_NEW', 'july_new_walkins', NULL, %s, NULL,
                     'NEW_CANDIDATE', %s, %s, %s, %s, %s,
@@ -201,7 +220,7 @@ def backfill():
                     %s, %s, %s, %s, NULL, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s, NULL,
-                    NULL, %s, %s
+                    NULL, FALSE, NULL, %s, %s
                 );
             """, (
                 r['id'], w_date, w_time, r['created_at'], city, r['operating_place'],
@@ -237,7 +256,7 @@ def backfill():
                     visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
                     lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
                     attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                    sheet_row_number, created_at, updated_at
+                    sheet_row_number, is_deleted, deleted_at, created_at, updated_at
                 ) VALUES (
                     'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, %s,
                     'EXISTING_PARTNER', %s, %s, %s, %s, NULL,
@@ -246,7 +265,7 @@ def backfill():
                     %s, %s, 'Partner Visit', FALSE, NULL, %s,
                     NULL, NULL, NULL, NULL,
                     %s, %s, %s, NULL, %s,
-                    NULL, %s, %s
+                    NULL, FALSE, NULL, %s, %s
                 );
             """, (
                 r['id'], w_date, w_time, r['created_at'], city,

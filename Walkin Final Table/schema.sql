@@ -16,6 +16,10 @@
 --       * Partner / Person Names: Stored exactly as submitted by executives
 --       * Aadhaar / Document Numbers: Stored exactly as entered
 --       * Remarks / Visit Notes: Preserved verbatim
+--   - Gapless & Soft-Delete Guarantees:
+--       * Transactional advisory locks guarantee strictly continuous 1..N IDs (no skipped IDs)
+--       * Deletions in source tables soft-delete rows (is_deleted = TRUE, deleted_at = NOW())
+--       * Zero hard data destruction, ensuring complete auditability and continuous ID sequence
 --   - Zero Changes to Source Tables:
 --       * sheet_walkins, july_new_walkins, july_existing_walkins remain 100% untouched
 -- =============================================================================
@@ -36,7 +40,7 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     walkin_date DATE NOT NULL,
     walkin_time VARCHAR(20),
     walkin_timestamp TIMESTAMP WITH TIME ZONE,
-    city VARCHAR(50) NOT NULL,
+    city VARCHAR(100) NOT NULL,
     operating_place VARCHAR(200),
     
     -- Visitor Profile (Verbatim as filled)
@@ -53,7 +57,7 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     aadhaar_image_url TEXT,
     
     -- Visit Details & Status
-    visiting_reason VARCHAR(255),
+    visiting_reason TEXT,
     visiting_reason_category VARCHAR(100),
     joined_status VARCHAR(100),
     is_joined BOOLEAN DEFAULT FALSE,
@@ -74,20 +78,37 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     visit_notes TEXT,
     sheet_row_number INTEGER,
     
+    -- Gapless Audit & Soft Delete
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    extra_attributes JSONB DEFAULT '{}'::jsonb,
+    
     -- Audit Timestamps
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Performance & Reporting Indexes
+-- Partial Unique Indexes for Idempotency
+CREATE UNIQUE INDEX IF NOT EXISTS uq_core_walkin_sheet_id 
+    ON public.core_walkin (sheet_walkin_id) WHERE sheet_walkin_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_core_walkin_portal_new_id 
+    ON public.core_walkin (portal_new_walkin_id) WHERE portal_new_walkin_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_core_walkin_portal_ex_id 
+    ON public.core_walkin (portal_existing_walkin_id) WHERE portal_existing_walkin_id IS NOT NULL;
+
+-- Performance, Query & Analytics Indexes
 CREATE INDEX IF NOT EXISTS idx_core_walkin_date ON public.core_walkin (walkin_date DESC);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_phone ON public.core_walkin (phone_number);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_city ON public.core_walkin (city);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_source ON public.core_walkin (source_system);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_reason_cat ON public.core_walkin (visiting_reason_category);
-CREATE INDEX IF NOT EXISTS idx_core_walkin_sheet_id ON public.core_walkin (sheet_walkin_id);
-CREATE INDEX IF NOT EXISTS idx_core_walkin_portal_new_id ON public.core_walkin (portal_new_walkin_id);
-CREATE INDEX IF NOT EXISTS idx_core_walkin_portal_ex_id ON public.core_walkin (portal_existing_walkin_id);
+CREATE INDEX IF NOT EXISTS idx_core_walkin_city_date ON public.core_walkin (city, walkin_date DESC);
+CREATE INDEX IF NOT EXISTS idx_core_walkin_source_date ON public.core_walkin (source_system, walkin_date DESC);
+CREATE INDEX IF NOT EXISTS idx_core_walkin_active ON public.core_walkin (is_deleted);
+
+-- Active Records View (Excludes Soft-Deleted Rows)
+CREATE OR REPLACE VIEW public.active_core_walkin AS 
+SELECT * FROM public.core_walkin WHERE is_deleted = FALSE;
 
 -- -----------------------------------------------------------------------------
 -- 2. Trigger Function: Sync from sheet_walkins
@@ -95,8 +116,9 @@ CREATE INDEX IF NOT EXISTS idx_core_walkin_portal_ex_id ON public.core_walkin (p
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_sheet()
 RETURNS TRIGGER AS $$
 DECLARE
+    v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
-    v_clean_city VARCHAR(50);
+    v_clean_city VARCHAR(100);
     v_f_name VARCHAR(100);
     v_l_name VARCHAR(100);
     v_full_name VARCHAR(255);
@@ -106,7 +128,12 @@ DECLARE
     v_time_str VARCHAR(20);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        DELETE FROM public.core_walkin WHERE sheet_walkin_id = OLD.id;
+        -- Soft delete to preserve gapless sequence and row identity
+        UPDATE public.core_walkin
+        SET is_deleted = TRUE,
+            deleted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE sheet_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
 
@@ -118,14 +145,14 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
     -- Verbatim name preservation
-    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g'));
-    v_f_name := SPLIT_PART(v_full_name, ' ', 1);
+    v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255);
+    v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; END IF;
+    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -145,7 +172,12 @@ BEGIN
     v_time_str := TO_CHAR(NEW.submission_timestamp AT TIME ZONE 'Asia/Kolkata', 'HH24:MI');
 
     IF TG_OP = 'INSERT' THEN
+        -- Transactional gapless ID allocation
+        PERFORM pg_advisory_xact_lock(777888999);
+        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+
         INSERT INTO public.core_walkin (
+            id,
             source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
             walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
             full_name, first_name, last_name, phone_number, partner_role,
@@ -153,8 +185,9 @@ BEGIN
             visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
             lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
             attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-            sheet_row_number, created_at, updated_at
+            sheet_row_number, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
+            v_next_id,
             'GOOGLE_SHEET', 'sheet_walkins', NEW.id, NULL, NULL,
             v_w_type, NEW.submission_timestamp::date, v_time_str, NEW.submission_timestamp, v_clean_city, NULL,
             v_full_name, v_f_name, v_l_name, v_clean_phone, 'Driver',
@@ -162,10 +195,13 @@ BEGIN
             NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NEW.joined_date, 'Submitted',
             NULL, NULL, NULL, NULL,
             NEW.attending_executive, NULL, NEW.submitter_email, NEW.remarks, NULL,
-            NEW.sheet_row_number, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NEW.sheet_row_number, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         );
+        PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+
     ELSIF TG_OP = 'UPDATE' THEN
         UPDATE public.core_walkin SET
+            walkin_type = v_w_type,
             walkin_date = NEW.submission_timestamp::date,
             walkin_time = v_time_str,
             walkin_timestamp = NEW.submission_timestamp,
@@ -184,6 +220,8 @@ BEGIN
             submitter_email = NEW.submitter_email,
             remarks = NEW.remarks,
             sheet_row_number = NEW.sheet_row_number,
+            is_deleted = FALSE,
+            deleted_at = NULL,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE sheet_walkin_id = NEW.id;
     END IF;
@@ -202,8 +240,9 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_sheet();
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_new()
 RETURNS TRIGGER AS $$
 DECLARE
+    v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
-    v_clean_city VARCHAR(50);
+    v_clean_city VARCHAR(100);
     v_f_name VARCHAR(100);
     v_l_name VARCHAR(100);
     v_full_name VARCHAR(255);
@@ -215,7 +254,12 @@ DECLARE
     v_exec_email VARCHAR(255);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        DELETE FROM public.core_walkin WHERE portal_new_walkin_id = OLD.id;
+        -- Soft delete to preserve gapless sequence and row identity
+        UPDATE public.core_walkin
+        SET is_deleted = TRUE,
+            deleted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE portal_new_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
 
@@ -227,19 +271,19 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
     -- Verbatim name preservation
-    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g'));
+    v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
-        v_full_name := TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, '')));
+        v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
     END IF;
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
-    v_f_name := SPLIT_PART(v_full_name, ' ', 1);
+    v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; END IF;
+    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -264,7 +308,12 @@ BEGIN
     LIMIT 1;
 
     IF TG_OP = 'INSERT' THEN
+        -- Transactional gapless ID allocation
+        PERFORM pg_advisory_xact_lock(777888999);
+        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+
         INSERT INTO public.core_walkin (
+            id,
             source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
             walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
             full_name, first_name, last_name, phone_number, partner_role,
@@ -272,8 +321,9 @@ BEGIN
             visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
             lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
             attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-            sheet_row_number, created_at, updated_at
+            sheet_row_number, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
+            v_next_id,
             'PORTAL_NEW', 'july_new_walkins', NULL, NEW.id, NULL,
             'NEW_CANDIDATE', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NEW.operating_place,
             v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.interested_position, 'Driver'),
@@ -281,8 +331,10 @@ BEGIN
             NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, COALESCE(NEW.submission_status, 'Submitted'),
             NEW.lead_channel, NEW.lead_channel_details, NEW.referred_by_name, NEW.referred_by_phone,
             COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NEW.remarks, NULL,
-            NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NULL, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         );
+        PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+
     ELSIF TG_OP = 'UPDATE' THEN
         UPDATE public.core_walkin SET
             walkin_date = v_date,
@@ -311,6 +363,8 @@ BEGIN
             attending_executive_id = COALESCE(NEW.created_by, NEW.executive_id),
             submitter_email = COALESCE(v_exec_email, submitter_email),
             remarks = NEW.remarks,
+            is_deleted = FALSE,
+            deleted_at = NULL,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE portal_new_walkin_id = NEW.id;
     END IF;
@@ -329,8 +383,9 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_portal_new();
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_existing()
 RETURNS TRIGGER AS $$
 DECLARE
+    v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
-    v_clean_city VARCHAR(50);
+    v_clean_city VARCHAR(100);
     v_f_name VARCHAR(100);
     v_l_name VARCHAR(100);
     v_full_name VARCHAR(255);
@@ -341,7 +396,12 @@ DECLARE
     v_exec_email VARCHAR(255);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        DELETE FROM public.core_walkin WHERE portal_existing_walkin_id = OLD.id;
+        -- Soft delete to preserve gapless sequence and row identity
+        UPDATE public.core_walkin
+        SET is_deleted = TRUE,
+            deleted_at = CURRENT_TIMESTAMP,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE portal_existing_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
 
@@ -353,18 +413,19 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
-    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g'));
+    -- Verbatim name preservation
+    v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
-        v_full_name := TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, '')));
+        v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
     END IF;
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
-    v_f_name := SPLIT_PART(v_full_name, ' ', 1);
+    v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; END IF;
+    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -388,7 +449,12 @@ BEGIN
     LIMIT 1;
 
     IF TG_OP = 'INSERT' THEN
+        -- Transactional gapless ID allocation
+        PERFORM pg_advisory_xact_lock(777888999);
+        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+
         INSERT INTO public.core_walkin (
+            id,
             source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
             walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
             full_name, first_name, last_name, phone_number, partner_role,
@@ -396,8 +462,9 @@ BEGIN
             visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
             lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
             attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-            sheet_row_number, created_at, updated_at
+            sheet_row_number, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
+            v_next_id,
             'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, NEW.id,
             'EXISTING_PARTNER', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NULL,
             v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.partner_type, 'Driver'),
@@ -405,8 +472,10 @@ BEGIN
             NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, COALESCE(NEW.submission_status, 'Submitted'),
             NULL, NULL, NULL, NULL,
             COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NULL, NEW.visit_notes,
-            NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NULL, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         );
+        PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+
     ELSIF TG_OP = 'UPDATE' THEN
         UPDATE public.core_walkin SET
             walkin_date = v_date,
@@ -424,6 +493,8 @@ BEGIN
             attending_executive_id = COALESCE(NEW.created_by, NEW.executive_id),
             submitter_email = COALESCE(v_exec_email, submitter_email),
             visit_notes = NEW.visit_notes,
+            is_deleted = FALSE,
+            deleted_at = NULL,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE portal_existing_walkin_id = NEW.id;
     END IF;
