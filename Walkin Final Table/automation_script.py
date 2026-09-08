@@ -1,17 +1,15 @@
 """
-LetzRyd - Master Walkin Synchronization & Reconciliation Engine
+LetzRyd - Walk-in Final Table Automation & Reconciliation Engine
 ================================================================
 Synchronizes and audits public.core_walkin as the Single Source of Truth
 combining public.sheet_walkins, public.july_new_walkins, and public.july_existing_walkins.
 
 Usage:
-    python sync_core_walkin.py --audit
-    python sync_core_walkin.py --backfill
-    python sync_core_walkin.py --setup-triggers
+    python automation_script.py --audit
+    python automation_script.py --backfill
 """
 
 import os
-import sys
 import re
 import argparse
 import psycopg2
@@ -49,20 +47,6 @@ def clean_city(c):
     if c_str.lower() in ['mumbai', 'mum']:
         return 'Mumbai'
     return c_str.title()
-
-def clean_name(n):
-    if not n:
-        return 'UNKNOWN', 'UNKNOWN', ''
-    s = str(n).strip()
-    s = re.sub(r'\S+@\S+', '', s).strip()
-    s = re.sub(r'\s+', ' ', s)
-    if not s:
-        return 'UNKNOWN', 'UNKNOWN', ''
-    tokens = s.split(' ')
-    f_name = tokens[0].title()
-    l_name = ' '.join(tokens[1:]).title() if len(tokens) > 1 else ''
-    full = f"{f_name} {l_name}".strip()
-    return full, f_name, l_name
 
 def categorize_reason(r):
     if not r:
@@ -126,7 +110,7 @@ def backfill():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        print("Starting full backfill of public.core_walkin...")
+        print("Starting full idempotent backfill of public.core_walkin...")
         cur.execute("TRUNCATE TABLE public.core_walkin RESTART IDENTITY;")
 
         cur.execute("""
@@ -143,7 +127,9 @@ def backfill():
         # 1. Sheet Walkins
         cur.execute("SELECT * FROM public.sheet_walkins ORDER BY submission_timestamp ASC;")
         for r in cur.fetchall():
-            full, f_name, l_name = clean_name(r['partner_name'])
+            full = (r['partner_name'] or 'UNKNOWN').strip()
+            f_name = full.split(' ')[0].title() if full else 'UNKNOWN'
+            l_name = ' '.join(full.split(' ')[1:]).title() if len(full.split(' ')) > 1 else None
             city = clean_city(r['city'])
             phone = clean_phone(r['partner_number'])
             v_reason = r['visiting_reason']
@@ -183,7 +169,9 @@ def backfill():
         # 2. Portal New
         cur.execute("SELECT * FROM public.july_new_walkins ORDER BY id ASC;")
         for r in cur.fetchall():
-            full, f_name, l_name = clean_name(r['person_name'] or f"{r['first_name'] or ''} {r['last_name'] or ''}")
+            full = (r['person_name'] or f"{r['first_name'] or ''} {r['last_name'] or ''}").strip()
+            f_name = r['first_name'] or (full.split(' ')[0].title() if full else 'UNKNOWN')
+            l_name = r['last_name'] or (' '.join(full.split(' ')[1:]).title() if len(full.split(' ')) > 1 else None)
             city = clean_city(r['city'])
             phone = clean_phone(r['person_number'])
             v_reason = r['visiting_reason']
@@ -228,7 +216,9 @@ def backfill():
         # 3. Portal Existing
         cur.execute("SELECT * FROM public.july_existing_walkins ORDER BY id ASC;")
         for r in cur.fetchall():
-            full, f_name, l_name = clean_name(r['person_name'] or f"{r['first_name'] or ''} {r['last_name'] or ''}")
+            full = (r['person_name'] or f"{r['first_name'] or ''} {r['last_name'] or ''}").strip()
+            f_name = r['first_name'] or (full.split(' ')[0].title() if full else 'UNKNOWN')
+            l_name = r['last_name'] or (' '.join(full.split(' ')[1:]).title() if len(full.split(' ')) > 1 else None)
             city = clean_city(r['city'])
             phone = clean_phone(r['person_number'])
             v_reason = r['visiting_reason']
@@ -278,7 +268,7 @@ def backfill():
         conn.close()
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Master Walkin Single Source of Truth Engine")
+    parser = argparse.ArgumentParser(description="Walkin Final Table Automation & Reconciliation Engine")
     parser.add_argument('--audit', action='store_true', help="Run health and row count audit")
     parser.add_argument('--backfill', action='store_true', help="Run full idempotent backfill")
     args = parser.parse_args()

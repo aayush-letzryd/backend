@@ -1,17 +1,23 @@
 -- =============================================================================
--- LetzRyd Single Source of Truth: public.core_walkin Schema & Live Triggers
+-- LetzRyd Walk-in Final Single Source of Truth: public.core_walkin Schema & Triggers
 -- =============================================================================
 -- Description:
--- Unifies three independent walk-in data sources:
---   1. public.sheet_walkins (Google Sheet synced via Apps Script)
---   2. public.july_new_walkins (Portal Onboarding for new candidates)
---   3. public.july_existing_walkins (Portal Visits for existing partners)
+-- Master table unifying three independent walk-in event sources:
+--   1. public.sheet_walkins (Google Sheet form entries synced via Apps Script)
+--   2. public.july_new_walkins (Portal onboarding form for new candidates)
+--   3. public.july_existing_walkins (Portal visit logs for active partners)
 --
--- Features:
---   - Real-time synchronization via PostgreSQL triggers (zero app changes required)
---   - Full audit lineage (source_system, source_table, original primary key IDs)
---   - Automated data standardization (cities, phone numbers, name cleaning)
---   - Verbatim reason preservation + standardized categorization
+-- Standardization Philosophy:
+--   - Functional Standardizations:
+--       * City: Standardized to canonical hub names ('Bengaluru', 'Hyderabad', 'Mumbai')
+--       * Phone Number: Cleaned to standard 10-digit mobile numbers for relational joins
+--       * Visiting Reason Category: Standardized category ('ONBOARDING', 'ENQUIRY', etc.)
+--   - Verbatim Fields (Pass-Through without Modification):
+--       * Partner / Person Names: Stored exactly as submitted by executives
+--       * Aadhaar / Document Numbers: Stored exactly as entered
+--       * Remarks / Visit Notes: Preserved verbatim
+--   - Zero Changes to Source Tables:
+--       * sheet_walkins, july_new_walkins, july_existing_walkins remain 100% untouched
 -- =============================================================================
 
 -- 1. Master Table Definition
@@ -33,7 +39,7 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     city VARCHAR(50) NOT NULL,
     operating_place VARCHAR(200),
     
-    -- Visitor Profile
+    -- Visitor Profile (Verbatim as filled)
     full_name VARCHAR(255) NOT NULL,
     first_name VARCHAR(100),
     last_name VARCHAR(100),
@@ -73,7 +79,7 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
 
--- Performance & Analytics Indexes
+-- Performance & Reporting Indexes
 CREATE INDEX IF NOT EXISTS idx_core_walkin_date ON public.core_walkin (walkin_date DESC);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_phone ON public.core_walkin (phone_number);
 CREATE INDEX IF NOT EXISTS idx_core_walkin_city ON public.core_walkin (city);
@@ -84,7 +90,7 @@ CREATE INDEX IF NOT EXISTS idx_core_walkin_portal_new_id ON public.core_walkin (
 CREATE INDEX IF NOT EXISTS idx_core_walkin_portal_ex_id ON public.core_walkin (portal_existing_walkin_id);
 
 -- -----------------------------------------------------------------------------
--- 2. Trigger Function 1: Sync from sheet_walkins
+-- 2. Trigger Function: Sync from sheet_walkins
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_sheet()
 RETURNS TRIGGER AS $$
@@ -104,8 +110,10 @@ BEGIN
         RETURN OLD;
     END IF;
 
+    -- Functional standardization: Clean 10-digit mobile number
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.partner_number, ''), '\D', '', 'g'), 10);
     
+    -- Functional standardization: Canonical cities
     v_clean_city := CASE 
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
@@ -113,7 +121,8 @@ BEGIN
         ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
     END;
 
-    v_full_name := UPPER(TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g')));
+    -- Verbatim name preservation
+    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g'));
     v_f_name := SPLIT_PART(v_full_name, ' ', 1);
     v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
     IF v_l_name = '' THEN v_l_name := NULL; END IF;
@@ -177,28 +186,6 @@ BEGIN
             sheet_row_number = NEW.sheet_row_number,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE sheet_walkin_id = NEW.id;
-        
-        IF NOT FOUND THEN
-            INSERT INTO public.core_walkin (
-                source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
-                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
-                full_name, first_name, last_name, phone_number, partner_role,
-                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
-                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
-                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
-                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                sheet_row_number, created_at, updated_at
-            ) VALUES (
-                'GOOGLE_SHEET', 'sheet_walkins', NEW.id, NULL, NULL,
-                v_w_type, NEW.submission_timestamp::date, v_time_str, NEW.submission_timestamp, v_clean_city, NULL,
-                v_full_name, v_f_name, v_l_name, v_clean_phone, 'Driver',
-                NEW.dl_number, NULL, NULL, NULL,
-                NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NEW.joined_date, 'Submitted',
-                NULL, NULL, NULL, NULL,
-                NEW.attending_executive, NULL, NEW.submitter_email, NEW.remarks, NULL,
-                NEW.sheet_row_number, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
-            );
-        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -210,7 +197,7 @@ AFTER INSERT OR UPDATE OR DELETE ON public.sheet_walkins
 FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_sheet();
 
 -- -----------------------------------------------------------------------------
--- 3. Trigger Function 2: Sync from july_new_walkins (Portal New Candidates)
+-- 3. Trigger Function: Sync from july_new_walkins
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_new()
 RETURNS TRIGGER AS $$
@@ -232,8 +219,10 @@ BEGIN
         RETURN OLD;
     END IF;
 
+    -- Functional standardization: Clean 10-digit mobile number
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.person_number, ''), '\D', '', 'g'), 10);
     
+    -- Functional standardization: Canonical cities
     v_clean_city := CASE 
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
@@ -241,11 +230,10 @@ BEGIN
         ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
     END;
 
-    -- Strip accidentally pasted email addresses from name fields
-    v_full_name := INITCAP(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\S+@\S+', '', 'g'), '\s+', ' ', 'g')));
+    -- Verbatim name preservation
+    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g'));
     IF v_full_name = '' THEN
-        v_full_name := INITCAP(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))));
-        v_full_name := TRIM(REGEXP_REPLACE(REGEXP_REPLACE(v_full_name, '\S+@\S+', '', 'g'), '\s+', ' ', 'g'));
+        v_full_name := TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, '')));
     END IF;
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
@@ -266,7 +254,6 @@ BEGIN
     v_date := COALESCE(NEW.event_date, NEW.created_at::date, CURRENT_DATE);
     v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI'));
 
-    -- Resolve executive from portal users and employee directory
     SELECT 
         COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'),
         COALESCE(pu.email, pu.username, '')
@@ -326,28 +313,6 @@ BEGIN
             remarks = NEW.remarks,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE portal_new_walkin_id = NEW.id;
-
-        IF NOT FOUND THEN
-            INSERT INTO public.core_walkin (
-                source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
-                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
-                full_name, first_name, last_name, phone_number, partner_role,
-                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
-                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
-                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
-                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                sheet_row_number, created_at, updated_at
-            ) VALUES (
-                'PORTAL_NEW', 'july_new_walkins', NULL, NEW.id, NULL,
-                'NEW_CANDIDATE', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NEW.operating_place,
-                v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.interested_position, 'Driver'),
-                NEW.dl_number, NEW.aadhaar_number, NEW.dl_image, NEW.aadhaar_image,
-                NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, COALESCE(NEW.submission_status, 'Submitted'),
-                NEW.lead_channel, NEW.lead_channel_details, NEW.referred_by_name, NEW.referred_by_phone,
-                COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NEW.remarks, NULL,
-                NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
-            );
-        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -359,7 +324,7 @@ AFTER INSERT OR UPDATE OR DELETE ON public.july_new_walkins
 FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_portal_new();
 
 -- -----------------------------------------------------------------------------
--- 4. Trigger Function 3: Sync from july_existing_walkins (Portal Returning Partners)
+-- 4. Trigger Function: Sync from july_existing_walkins
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_existing()
 RETURNS TRIGGER AS $$
@@ -380,8 +345,10 @@ BEGIN
         RETURN OLD;
     END IF;
 
+    -- Functional standardization: Clean 10-digit mobile number
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.person_number, ''), '\D', '', 'g'), 10);
     
+    -- Functional standardization: Canonical cities
     v_clean_city := CASE 
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
@@ -389,10 +356,9 @@ BEGIN
         ELSE INITCAP(TRIM(COALESCE(NEW.city, 'Unknown')))
     END;
 
-    v_full_name := INITCAP(TRIM(REGEXP_REPLACE(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\S+@\S+', '', 'g'), '\s+', ' ', 'g')));
+    v_full_name := TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g'));
     IF v_full_name = '' THEN
-        v_full_name := INITCAP(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))));
-        v_full_name := TRIM(REGEXP_REPLACE(REGEXP_REPLACE(v_full_name, '\S+@\S+', '', 'g'), '\s+', ' ', 'g'));
+        v_full_name := TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, '')));
     END IF;
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
@@ -460,28 +426,6 @@ BEGIN
             visit_notes = NEW.visit_notes,
             updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
         WHERE portal_existing_walkin_id = NEW.id;
-
-        IF NOT FOUND THEN
-            INSERT INTO public.core_walkin (
-                source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
-                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
-                full_name, first_name, last_name, phone_number, partner_role,
-                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
-                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
-                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
-                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
-                sheet_row_number, created_at, updated_at
-            ) VALUES (
-                'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, NEW.id,
-                'EXISTING_PARTNER', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NULL,
-                v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.partner_type, 'Driver'),
-                NULL, NULL, NULL, NULL,
-                NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, COALESCE(NEW.submission_status, 'Submitted'),
-                NULL, NULL, NULL, NULL,
-                COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NULL, NEW.visit_notes,
-                NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
-            );
-        END IF;
     END IF;
     RETURN NEW;
 END;

@@ -97,19 +97,20 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
-### 9. [Walkin Master Single Source](./Walkin%20Master%20Single%20Source/)
+### 9. [Walkin Final Table](./Walkin%20Final%20Table/)
 - **Description**: Real-time unified master single source of truth (`public.core_walkin`) combining driver and partner walk-in event records from Google Sheets (`sheet_walkins`) and web portal systems (`july_new_walkins` and `july_existing_walkins`).
 - **Key Files**:
-  - [`schema.sql`](./Walkin%20Master%20Single%20Source/schema.sql): PostgreSQL DDL for `public.core_walkin`, indexes, and 3 automated PostgreSQL triggers for real-time synchronization (<10ms).
-  - [`sync_core_walkin.py`](./Walkin%20Master%20Single%20Source/sync_core_walkin.py): Parameterized Python engine for initial idempotent backfill, health auditing, and reconciliation.
-  - [`data_reconciliation_report.md`](./Walkin%20Master%20Single%20Source/data_reconciliation_report.md): Comprehensive data quality and standardization audit detailing all discovered anomalies and recommendations for source form improvements.
-  - [`README.md`](./Walkin%20Master%20Single%20Source/README.md): Exhaustive architecture documentation, trigger mapping matrix, and operational commands.
+  - [`schema.sql`](./Walkin%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_walkin`, indexes, and 3 automated PostgreSQL triggers for real-time synchronization (<10ms).
+  - [`automation_script.py`](./Walkin%20Final%20Table/automation_script.py): Parameterized Python engine for initial idempotent backfill, health auditing, and reconciliation.
+  - [`data_issues.md`](./Walkin%20Final%20Table/data_issues.md): Comprehensive data quality catalog (ISS-01 to ISS-06) documenting form-level anomalies and ops recommendations.
+  - [`README.md`](./Walkin%20Final%20Table/README.md): Exhaustive architecture documentation, trigger mapping matrix, and operational commands.
 - **Target Table**: `public.core_walkin` (PostgreSQL)
 - **Primary Features**:
   - Zero changes to source tables (`sheet_walkins`, `july_new_walkins`, `july_existing_walkins` remain untouched)
-  - Native PostgreSQL triggers providing instant live synchronization
-  - 100% event log preservation (977 walk-in records preserved with full fidelity)
-  - Automatic standardization of cities (`Bengaluru`), phone numbers, and name fields
+  - Native PostgreSQL triggers providing instant live synchronization (<10ms)
+  - 100% event log preservation (all walk-in records preserved with full fidelity)
+  - Functional standardization of cities (`Bengaluru`, `Hyderabad`, `Mumbai`) and 10-digit mobile numbers
+  - Verbatim pass-through of names, remarks, and Aadhaar numbers without altering raw inputs
 
 ---
 
