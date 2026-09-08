@@ -52,6 +52,7 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+<<<<<<< HEAD
 ### 5. [Traffic Challan Google Sheet](./Traffic%20Challan%20Google%20Sheet/)
 - **Description**: Real-time production data pipeline synchronizing master vehicle traffic challan violation events and weekly rolling balance ledgers across 38 tabs (36,039 records across 1,602 unique fleet vehicles) into `public.sheet_challans`.
 - **Key Files**:
@@ -93,6 +94,22 @@ This repository hosts production scripts, architecture specifications, database 
   - [`data_issues.md`](./Adjustments%20Google%20Sheet/data_issues.md): Comprehensive data hygiene catalog documenting all 11 identified data quality anomalies (ADJ-01 through ADJ-11) and automated normalization specifications.
   - [`README.md`](./Adjustments%20Google%20Sheet/README.md): Architecture documentation, multi-level approval hierarchy rules, table column dictionaries, and deployment runbooks.
 - **Target Tables**: `public.sheet_adjustments` + `public.july_partner_adjustment` $\to$ `public.core_adjustments`
+
+---
+
+### 9. [Walkin Master Single Source](./Walkin%20Master%20Single%20Source/)
+- **Description**: Real-time unified master single source of truth (`public.core_walkin`) combining driver and partner walk-in event records from Google Sheets (`sheet_walkins`) and web portal systems (`july_new_walkins` and `july_existing_walkins`).
+- **Key Files**:
+  - [`schema.sql`](./Walkin%20Master%20Single%20Source/schema.sql): PostgreSQL DDL for `public.core_walkin`, indexes, and 3 automated PostgreSQL triggers for real-time synchronization (<10ms).
+  - [`sync_core_walkin.py`](./Walkin%20Master%20Single%20Source/sync_core_walkin.py): Parameterized Python engine for initial idempotent backfill, health auditing, and reconciliation.
+  - [`data_reconciliation_report.md`](./Walkin%20Master%20Single%20Source/data_reconciliation_report.md): Comprehensive data quality and standardization audit detailing all discovered anomalies and recommendations for source form improvements.
+  - [`README.md`](./Walkin%20Master%20Single%20Source/README.md): Exhaustive architecture documentation, trigger mapping matrix, and operational commands.
+- **Target Table**: `public.core_walkin` (PostgreSQL)
+- **Primary Features**:
+  - Zero changes to source tables (`sheet_walkins`, `july_new_walkins`, `july_existing_walkins` remain untouched)
+  - Native PostgreSQL triggers providing instant live synchronization
+  - 100% event log preservation (977 walk-in records preserved with full fidelity)
+  - Automatic standardization of cities (`Bengaluru`), phone numbers, and name fields
 
 ---
 
