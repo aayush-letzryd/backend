@@ -629,6 +629,7 @@ function syncAllVehicles() {
 
 /**
  * Core batch synchronization worker.
+ * Filters out trailing empty spreadsheet formatting and syncs all valid vehicle rows.
  */
 function syncBatchInternal(limitRows, customStartRow) {
   const ss = getTargetSpreadsheet();
@@ -652,9 +653,21 @@ function syncBatchInternal(limitRows, customStartRow) {
     totalRowsToSync = lastRow - startRow + 1;
   }
 
-  Logger.log("Starting batch sync for rows " + startRow + " to " + lastRow + " (Total: " + totalRowsToSync + ")...");
+  Logger.log("Reading sheet rows " + startRow + " to " + lastRow + "...");
 
+  // Read data range
   const data = sheet.getRange(startRow, 1, totalRowsToSync, lastCol).getValues();
+
+  // Extract only populated rows (ensures full 73-column fidelity for all real vehicles)
+  const populatedRows = [];
+  for (let i = 0; i < data.length; i++) {
+    const regNo = cleanRegNo(data[i][3]); // Col D: registration_no
+    if (regNo) {
+      populatedRows.push({ rowValues: data[i], rowNumber: startRow + i });
+    }
+  }
+
+  Logger.log("Starting batch sync for " + populatedRows.length + " populated vehicles...");
 
   let conn = null;
   let pstmt = null;
@@ -669,11 +682,10 @@ function syncBatchInternal(limitRows, customStartRow) {
     const BATCH_SIZE = 250;
     let pendingBatch = 0;
 
-    for (let i = 0; i < data.length; i++) {
-      const row = data[i];
-      const currentRowNumber = startRow + i;
+    for (let i = 0; i < populatedRows.length; i++) {
+      const item = populatedRows[i];
 
-      if (bindVehicleRow(pstmt, row, currentRowNumber)) {
+      if (bindVehicleRow(pstmt, item.rowValues, item.rowNumber)) {
         pstmt.addBatch();
         pendingBatch++;
         successCount++;
@@ -694,7 +706,7 @@ function syncBatchInternal(limitRows, customStartRow) {
       conn.commit();
     }
 
-    Logger.log("Sync Complete. Success: " + successCount + ", Skipped (Missing RegNo): " + skippedCount);
+    Logger.log("Sync Complete. Successfully synced " + successCount + " vehicles to Postgres.");
     try {
       SpreadsheetApp.getUi().alert(
         "Sync Complete",
