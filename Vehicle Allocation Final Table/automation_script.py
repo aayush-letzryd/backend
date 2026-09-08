@@ -26,13 +26,18 @@ import argparse
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DB_HOST = os.getenv("DB_HOST", "35.200.196.113")
+DB_HOST = os.getenv("DB_HOST", "YOUR_DB_HOST_HERE")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", r"8S5]U3@L^Xz)\FH}")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "YOUR_DB_PASSWORD_HERE")
 
 def get_connection():
+    if DB_HOST == "YOUR_DB_HOST_HERE" or DB_PASSWORD == "YOUR_DB_PASSWORD_HERE":
+        raise ValueError(
+            "Database credentials not configured. Please set the DB_HOST, DB_PORT, "
+            "DB_NAME, DB_USER, and DB_PASSWORD environment variables."
+        )
     conn = psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -190,24 +195,24 @@ def verify_triggers():
     test_date = "2026-09-08"
 
     # Pre-clean
-    cur.execute(f"DELETE FROM public.sheet_vehicle_allocations WHERE vehicle_number = '{test_veh}';")
-    cur.execute(f"DELETE FROM public.july_allocation_form WHERE vehicle_number = '{test_veh}';")
-    cur.execute(f"DELETE FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
+    cur.execute("DELETE FROM public.sheet_vehicle_allocations WHERE vehicle_number = %s;", (test_veh,))
+    cur.execute("DELETE FROM public.july_allocation_form WHERE vehicle_number = %s;", (test_veh,))
+    cur.execute("DELETE FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
 
     # Step 1: Sheet INSERT
     print("1. Testing Sheet Ingestion (INSERT on public.sheet_vehicle_allocations)...")
-    cur.execute(f"""
+    cur.execute("""
         INSERT INTO public.sheet_vehicle_allocations (
             allocation_date, vehicle_number, operator_driver_id, driver_phone,
             driver_name, city, allocation_type, jack, created_at, updated_at
         ) VALUES (
-            '{test_date}', '{test_veh}', '{test_did}', '{test_phone}',
+            %s, %s, %s, %s,
             'AUTOMATION TEST DRIVER', 'Bengaluru', 'New Allocation', 'Yes',
             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
         ) RETURNING id;
-    """)
+    """, (test_date, test_veh, test_did, test_phone))
     sheet_id = cur.fetchone()["id"]
-    cur.execute(f"SELECT id, source_origin, sheet_record_id, jack FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
+    cur.execute("SELECT id, source_origin, sheet_record_id, jack FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
     core_row = cur.fetchone()
     assert core_row is not None, "Failed: Row was not synced to core_vehicle_allocation"
     assert core_row["source_origin"] == "GOOGLE_SHEET", f"Unexpected source_origin: {core_row['source_origin']}"
@@ -216,14 +221,14 @@ def verify_triggers():
 
     # Step 2: Sheet UPDATE
     print("\n2. Testing Sheet Update (UPDATE on public.sheet_vehicle_allocations)...")
-    cur.execute(f"""
+    cur.execute("""
         UPDATE public.sheet_vehicle_allocations 
         SET jack = 'No',
             reason_to_visit = 'Automated Verification Update',
             updated_at = CURRENT_TIMESTAMP
-        WHERE id = {sheet_id};
-    """)
-    cur.execute(f"SELECT jack, reason_to_visit FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
+        WHERE id = %s;
+    """, (sheet_id,))
+    cur.execute("SELECT jack, reason_to_visit FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
     updated_core = cur.fetchone()
     assert updated_core["jack"] == "No", "Update failed: jack value did not sync"
     assert updated_core["reason_to_visit"] == "Automated Verification Update", "Update failed: reason did not sync"
@@ -231,19 +236,19 @@ def verify_triggers():
 
     # Step 3: Portal Overlay (MERGE)
     print("\n3. Testing Portal Overlay / Merge (INSERT on public.july_allocation_form)...")
-    cur.execute(f"""
+    cur.execute("""
         INSERT INTO public.july_allocation_form (
             allocation_date, vehicle_number, driver_id, driver_phone,
             driver_name, city_name, allocation_type, insp_jack, insp_remarks,
             status, created_at, updated_at
         ) VALUES (
-            '{test_date}', '{test_veh}', '{test_did}', '{test_phone}',
+            %s, %s, %s, %s,
             'AUTOMATION TEST DRIVER', 'Bangalore', 'Fresh Allocation', 'Yes', 'Merged Audit Passed',
             'Approved', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
         ) RETURNING id;
-    """)
+    """, (test_date, test_veh, test_did, test_phone))
     portal_id = cur.fetchone()["id"]
-    cur.execute(f"SELECT source_origin, sheet_record_id, portal_record_id, status, insp_remarks FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
+    cur.execute("SELECT source_origin, sheet_record_id, portal_record_id, status, insp_remarks FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
     merged_core = cur.fetchone()
     assert merged_core["source_origin"] == "MERGED", f"Failed: Expected 'MERGED' but got {merged_core['source_origin']}"
     assert merged_core["portal_record_id"] == portal_id, "Portal record id mismatch"
@@ -253,19 +258,19 @@ def verify_triggers():
 
     # Step 4: Soft-Delete
     print("\n4. Testing Soft-Delete Protection (DELETE on public.sheet_vehicle_allocations)...")
-    cur.execute(f"DELETE FROM public.sheet_vehicle_allocations WHERE id = {sheet_id};")
-    cur.execute(f"SELECT is_deleted, deleted_at FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
+    cur.execute("DELETE FROM public.sheet_vehicle_allocations WHERE id = %s;", (sheet_id,))
+    cur.execute("SELECT is_deleted, deleted_at FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
     deleted_core = cur.fetchone()
     assert deleted_core["is_deleted"] is True, "Soft-delete failed: is_deleted is not TRUE"
     assert deleted_core["deleted_at"] is not None, "Soft-delete failed: deleted_at is NULL"
     print(f"   [PASS] Soft-delete verified (is_deleted={deleted_core['is_deleted']}, deleted_at={deleted_core['deleted_at']})")
 
-    # Step 5: Cleanup & Sequence Realignment
+    # Step 5: Cleanup & Sequence Realignment (Non-Destructive)
     print("\n5. Cleaning Up Test Artifacts & Realigning Sequence...")
-    cur.execute(f"DELETE FROM public.sheet_vehicle_allocations WHERE vehicle_number = '{test_veh}';")
-    cur.execute(f"DELETE FROM public.july_allocation_form WHERE vehicle_number = '{test_veh}';")
-    cur.execute(f"DELETE FROM public.core_vehicle_allocation WHERE vehicle_number = '{test_veh}';")
-    cur.execute("CALL public.sp_backfill_core_vehicle_allocation();")
+    cur.execute("DELETE FROM public.sheet_vehicle_allocations WHERE vehicle_number = %s;", (test_veh,))
+    cur.execute("DELETE FROM public.july_allocation_form WHERE vehicle_number = %s;", (test_veh,))
+    cur.execute("DELETE FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
+    cur.execute("SELECT setval('public.core_vehicle_allocation_id_seq', COALESCE((SELECT MAX(id) FROM public.core_vehicle_allocation), 1), true);")
 
     cur.execute("SELECT count(*) as total, MIN(id) as min_id, MAX(id) as max_id FROM public.core_vehicle_allocation;")
     final_stats = cur.fetchone()

@@ -176,9 +176,9 @@ CREATE INDEX IF NOT EXISTS idx_cva_portal_id ON public.core_vehicle_allocation (
 CREATE OR REPLACE FUNCTION public.sync_core_allocation_from_sheet()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_clean_vnum VARCHAR(20);
-    v_norm_partner_id VARCHAR(50);
-    v_clean_phone VARCHAR(20);
+    v_clean_vnum VARCHAR(100);
+    v_norm_partner_id VARCHAR(150);
+    v_clean_phone VARCHAR(50);
     v_clean_city VARCHAR(100);
     v_clean_alloc_type VARCHAR(100);
     v_clean_name VARCHAR(255);
@@ -200,7 +200,7 @@ BEGIN
     END IF;
 
     -- Normalization
-    v_clean_vnum := UPPER(REGEXP_REPLACE(COALESCE(NEW.vehicle_number, ''), '[^A-Z0-9]', '', 'g'));
+    v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
     v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
 
@@ -263,12 +263,12 @@ BEGIN
             driver_name = v_clean_name,
             city = v_clean_city,
             allocation_type = v_clean_alloc_type,
-            car_model = LEFT(NEW.car_model, 100),
-            driver_plan = LEFT(NEW.driver_plan, 100),
-            type_of_plan = LEFT(NEW.type_of_plan, 100),
-            rental_plan = LEFT(NEW.rental_plan, 100),
-            partner_type = LEFT(NEW.partner_type, 50),
-            odometer_reading = NEW.odometer_reading,
+            car_model = COALESCE(LEFT(NEW.car_model, 100), car_model),
+            driver_plan = COALESCE(LEFT(NEW.driver_plan, 100), driver_plan),
+            type_of_plan = COALESCE(LEFT(NEW.type_of_plan, 100), type_of_plan),
+            rental_plan = COALESCE(LEFT(NEW.rental_plan, 100), rental_plan),
+            partner_type = COALESCE(LEFT(NEW.partner_type, 50), partner_type),
+            odometer_reading = COALESCE(NEW.odometer_reading, odometer_reading),
             ola_negative_balance = COALESCE(NEW.ola_negative_amount, ola_negative_balance),
             ola_negative_balance_proof = COALESCE(NEW.ola_negative_amount_ss, ola_negative_balance_proof),
             driver_agreement_doc = COALESCE(NEW.upload_agreement, driver_agreement_doc),
@@ -352,9 +352,9 @@ FOR EACH ROW EXECUTE FUNCTION public.sync_core_allocation_from_sheet();
 CREATE OR REPLACE FUNCTION public.sync_core_allocation_from_portal()
 RETURNS TRIGGER AS $$
 DECLARE
-    v_clean_vnum VARCHAR(20);
-    v_norm_partner_id VARCHAR(50);
-    v_clean_phone VARCHAR(20);
+    v_clean_vnum VARCHAR(100);
+    v_norm_partner_id VARCHAR(150);
+    v_clean_phone VARCHAR(50);
     v_clean_city VARCHAR(100);
     v_clean_alloc_type VARCHAR(100);
     v_clean_name VARCHAR(255);
@@ -377,7 +377,7 @@ BEGIN
     END IF;
 
     -- Normalization
-    v_clean_vnum := UPPER(REGEXP_REPLACE(COALESCE(NEW.vehicle_number, ''), '[^A-Z0-9]', '', 'g'));
+    v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
     v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
 
@@ -409,7 +409,8 @@ BEGIN
 
     -- Odometer reading parsing
     v_odo_val := CASE 
-        WHEN NEW.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' THEN ROUND(NEW.odometer_reading::numeric)::integer
+        WHEN NEW.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' AND NEW.odometer_reading::numeric BETWEEN 0 AND 2000000 
+        THEN ROUND(NEW.odometer_reading::numeric)::integer
         ELSE NULL
     END;
 
@@ -604,7 +605,7 @@ BEGIN
         s.id AS sheet_record_id,
         NULL::INTEGER AS portal_record_id,
         s.allocation_date,
-        UPPER(REGEXP_REPLACE(COALESCE(s.vehicle_number, ''), '[^A-Z0-9]', '', 'g')) AS vehicle_number,
+        REGEXP_REPLACE(UPPER(COALESCE(s.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS vehicle_number,
         REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS partner_id,
         RIGHT(REGEXP_REPLACE(COALESCE(s.driver_phone, ''), '\D', '', 'g'), 10) AS driver_phone,
         LEFT(TRIM(REGEXP_REPLACE(COALESCE(s.driver_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255) AS driver_name,
@@ -701,7 +702,7 @@ BEGIN
         COALESCE(s.updated_at AT TIME ZONE 'Asia/Kolkata', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') AS updated_at
     FROM public.sheet_vehicle_allocations s
     WHERE s.allocation_date IS NOT NULL
-      AND LENGTH(UPPER(REGEXP_REPLACE(COALESCE(s.vehicle_number, ''), '[^A-Z0-9]', '', 'g'))) BETWEEN 8 AND 12
+      AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(s.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
       AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$';
 
     GET DIAGNOSTICS v_sheet_count = ROW_COUNT;
@@ -709,17 +710,17 @@ BEGIN
     -- Step 2: Overlay valid records from july_allocation_form matching core events (MERGE)
     WITH portal_ranked AS (
         SELECT p.*,
-               UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g')) AS clean_vnum,
+               REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS clean_vnum,
                REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS norm_id,
                ROW_NUMBER() OVER (
                    PARTITION BY p.allocation_date, 
-                                UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g')),
+                                REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g'),
                                 REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
                    ORDER BY p.created_at DESC NULLS LAST, p.id DESC
                ) as rn
         FROM public.july_allocation_form p
         WHERE p.allocation_date IS NOT NULL
-          AND LENGTH(UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g'))) BETWEEN 8 AND 12
+          AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
           AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
     ),
     portal_clean AS (
@@ -790,7 +791,8 @@ BEGIN
         approved_by = p.approved_by,
         approval_remarks = p.approval_remarks,
         odometer_reading = CASE 
-            WHEN p.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' THEN ROUND(p.odometer_reading::numeric)::integer 
+            WHEN p.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' AND p.odometer_reading::numeric BETWEEN 0 AND 2000000 
+            THEN ROUND(p.odometer_reading::numeric)::integer 
             ELSE c.odometer_reading 
         END,
         event_date_time = COALESCE(p.event_date_time AT TIME ZONE 'Asia/Kolkata', c.event_date_time)
@@ -806,17 +808,17 @@ BEGIN
 
     WITH portal_ranked AS (
         SELECT p.*,
-               UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g')) AS clean_vnum,
+               REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS clean_vnum,
                REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS norm_id,
                ROW_NUMBER() OVER (
                    PARTITION BY p.allocation_date, 
-                                UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g')),
+                                REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g'),
                                 REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
                    ORDER BY p.created_at DESC NULLS LAST, p.id DESC
                ) as rn
         FROM public.july_allocation_form p
         WHERE p.allocation_date IS NOT NULL
-          AND LENGTH(UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Z0-9]', '', 'g'))) BETWEEN 8 AND 12
+          AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
           AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
     ),
     portal_clean AS (
@@ -880,7 +882,8 @@ BEGIN
         NULL::VARCHAR AS rental_plan,
         NULL::VARCHAR AS partner_type,
         CASE 
-            WHEN p.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' THEN ROUND(p.odometer_reading::numeric)::integer 
+            WHEN p.odometer_reading ~ '^[0-9]+(\.[0-9]+)?$' AND p.odometer_reading::numeric BETWEEN 0 AND 2000000 
+            THEN ROUND(p.odometer_reading::numeric)::integer 
             ELSE NULL 
         END AS odometer_reading,
         p.ola_negative_balance,

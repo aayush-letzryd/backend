@@ -48,7 +48,7 @@ The **Master Vehicle Allocation Pipeline** unifies vehicle allocation and driver
                                  +-----------------------------------+
                                  |        MASTER DESTINATION         |
                                  |  public.core_vehicle_allocation   |
-                                 |    (7,230 Consolidated Rows)      |
+                                 |    (7,231 Consolidated Rows)      |
                                  +-----------------------------------+
                                                    |
                                                    +---------------+
@@ -301,29 +301,29 @@ python automation_script.py --verify-triggers
    - Web Portal    (july_allocation_form)       : 306 rows (Valid: 255, Test/Rejected: 51)
 
 2. Master Table Volume (core_vehicle_allocation):
-   - Total Records     : 7,230
-   - Active Records    : 7,230
+   - Total Records     : 7,231
+   - Active Records    : 7,231
    - Soft-Deleted Rows : 0
 
 3. Provenance Distribution (source_origin):
    - GOOGLE_SHEET       : 6,987 rows
    - MERGED             : 156 rows
-   - PORTAL_FORM        : 87 rows
+   - PORTAL_FORM        : 88 rows
 
 4. City Distribution (Standardized):
    - Bengaluru          : 4,306 rows
    - Mumbai             : 1,622 rows
-   - Hyderabad          : 1,302 rows
+   - Hyderabad          : 1,303 rows
 
 5. Allocation Type Distribution (Standardized):
-   - New Allocation     : 5,643 rows
+   - New Allocation     : 5,644 rows
    - Reallocation       : 1,143 rows
    - Car Swap           : 379 rows
    - Drop-Off           : 65 rows
 
 6. ID Sequence Continuity Integrity:
-   - ID Range          : 1 to 7,230
-   - Total Rows        : 7,230
+   - ID Range          : 1 to 7,231
+   - Total Rows        : 7,231
    - Sequence Gaps     : 0
    - Gapless Status    : PASSED (Continuous 1..N Sequence, Zero Gaps)
 
