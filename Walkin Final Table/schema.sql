@@ -116,7 +116,7 @@ SELECT * FROM public.core_walkin WHERE is_deleted = FALSE;
 -- -----------------------------------------------------------------------------
 -- 2. Trigger Function: Sync from sheet_walkins
 -- -----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_sheet()
+CREATE OR REPLACE FUNCTION public.fn_sync_core_walkin_from_sheet()
 RETURNS TRIGGER AS $$
 DECLARE
     v_next_id BIGINT;
@@ -132,7 +132,6 @@ DECLARE
     v_ts TIMESTAMP WITHOUT TIME ZONE;
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -141,7 +140,7 @@ BEGIN
         RETURN OLD;
     END IF;
 
-    -- Standardize timestamp to clean IST (without +05:30)
+    -- Standardize timestamp to clean IST
     v_ts := NEW.submission_timestamp AT TIME ZONE 'Asia/Kolkata';
     v_time_str := TO_CHAR(v_ts, 'HH24:MI');
 
@@ -156,8 +155,9 @@ BEGIN
         ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
-    -- Verbatim name preservation with defensive bounding
+    -- Verbatim name preservation with defensive bounding & fallback
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255);
+    IF v_full_name = '' OR v_full_name IS NULL THEN v_full_name := 'UNKNOWN'; END IF;
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
 
@@ -178,7 +178,6 @@ BEGIN
     v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
 
     IF TG_OP = 'INSERT' THEN
-        -- Transactional gapless ID allocation
         PERFORM pg_advisory_xact_lock(777888999);
         SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
 
@@ -197,12 +196,12 @@ BEGIN
             'GOOGLE_SHEET', 'sheet_walkins', NEW.id, NULL, NULL,
             v_w_type, v_ts::date, v_time_str, v_ts, v_clean_city, NULL,
             v_full_name, v_f_name, v_l_name, v_clean_phone, 'Driver',
-            NEW.dl_number, NULL, NULL, NULL,
+            LEFT(NEW.dl_number, 50), NULL, NULL, NULL,
             NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NEW.joined_date, 'Submitted',
             NULL, NULL, NULL, NULL,
-            NEW.attending_executive, NULL, NEW.submitter_email, NEW.remarks, NULL,
+            LEFT(NEW.attending_executive, 150), NULL, LEFT(NEW.submitter_email, 255), NEW.remarks, NULL,
             NEW.sheet_row_number, FALSE, NULL, 
-            COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
+            COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')), 
             COALESCE(NEW.updated_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'))
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
@@ -218,20 +217,47 @@ BEGIN
             first_name = v_f_name,
             last_name = v_l_name,
             phone_number = v_clean_phone,
-            dl_number = NEW.dl_number,
+            dl_number = LEFT(NEW.dl_number, 50),
             visiting_reason = NEW.visiting_reason,
             visiting_reason_category = v_reason_cat,
             joined_status = NEW.joined_status,
             is_joined = v_is_joined,
             joined_date = NEW.joined_date,
-            attending_executive = NEW.attending_executive,
-            submitter_email = NEW.submitter_email,
+            attending_executive = LEFT(NEW.attending_executive, 150),
+            submitter_email = LEFT(NEW.submitter_email, 255),
             remarks = NEW.remarks,
             sheet_row_number = NEW.sheet_row_number,
             is_deleted = FALSE,
             deleted_at = NULL,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE sheet_walkin_id = NEW.id;
+
+        IF NOT FOUND THEN
+            PERFORM pg_advisory_xact_lock(777888999);
+            SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+            INSERT INTO public.core_walkin (
+                id, source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
+                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
+                full_name, first_name, last_name, phone_number, partner_role,
+                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
+                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
+                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
+                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
+                sheet_row_number, is_deleted, deleted_at, created_at, updated_at
+            ) VALUES (
+                v_next_id, 'GOOGLE_SHEET', 'sheet_walkins', NEW.id, NULL, NULL,
+                v_w_type, v_ts::date, v_time_str, v_ts, v_clean_city, NULL,
+                v_full_name, v_f_name, v_l_name, v_clean_phone, 'Driver',
+                LEFT(NEW.dl_number, 50), NULL, NULL, NULL,
+                NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NEW.joined_date, 'Submitted',
+                NULL, NULL, NULL, NULL,
+                LEFT(NEW.attending_executive, 150), NULL, LEFT(NEW.submitter_email, 255), NEW.remarks, NULL,
+                NEW.sheet_row_number, FALSE, NULL,
+                COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
+                COALESCE(NEW.updated_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'))
+            );
+            PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -245,7 +271,7 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_sheet();
 -- -----------------------------------------------------------------------------
 -- 3. Trigger Function: Sync from july_new_walkins
 -- -----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_new()
+CREATE OR REPLACE FUNCTION public.fn_sync_core_walkin_from_portal_new()
 RETURNS TRIGGER AS $$
 DECLARE
     v_next_id BIGINT;
@@ -263,7 +289,6 @@ DECLARE
     v_exec_email VARCHAR(255);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -287,7 +312,7 @@ BEGIN
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
     END IF;
-    IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
+    IF v_full_name = '' OR v_full_name IS NULL THEN v_full_name := 'UNKNOWN'; END IF;
     
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
@@ -301,22 +326,28 @@ BEGIN
         ELSE 'OTHER'
     END;
 
-    v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
-    v_ts := COALESCE(NEW.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
-    v_date := COALESCE(NEW.event_date, v_ts::date);
-    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(v_ts, 'HH24:MI'));
+    v_is_joined := (NEW.joined_status ILIKE '%onboard%' OR NEW.joined_status ILIKE '%joined%' OR NEW.joined_status ILIKE '%active%')
+                   AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%reject%';
+
+    v_date := COALESCE(NEW.event_date, (NEW.created_at AT TIME ZONE 'Asia/Kolkata')::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date);
+    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(NEW.created_at AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'), TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'));
+
+    BEGIN
+        v_ts := (v_date::text || ' ' || v_time_str)::timestamp;
+    EXCEPTION WHEN OTHERS THEN
+        v_ts := COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+    END;
 
     SELECT 
-        LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
-        LEFT(COALESCE(pu.email, pu.username, ''), 255)
+        COALESCE(pu.full_name, e.first_name || ' ' || COALESCE(e.last_name, ''), 'Executive'),
+        COALESCE(pu.email, e.email, '')
     INTO v_exec_name, v_exec_email
-    FROM july_portal_users pu
-    LEFT JOIN july_employees e ON e.employee_id = pu.employee_id
+    FROM public.july_portal_users pu
+    LEFT JOIN public.july_employees e ON e.id = pu.employee_id
     WHERE pu.portal_user_id = COALESCE(NEW.created_by, NEW.executive_id)
     LIMIT 1;
 
     IF TG_OP = 'INSERT' THEN
-        -- Transactional gapless ID allocation
         PERFORM pg_advisory_xact_lock(777888999);
         SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
 
@@ -333,12 +364,12 @@ BEGIN
         ) VALUES (
             v_next_id,
             'PORTAL_NEW', 'july_new_walkins', NULL, NEW.id, NULL,
-            'NEW_CANDIDATE', v_date, v_time_str, v_ts, v_clean_city, NEW.operating_place,
-            v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.interested_position, 'Driver'),
-            NEW.dl_number, NEW.aadhaar_number, NEW.dl_image, NEW.aadhaar_image,
-            NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, COALESCE(NEW.submission_status, 'Submitted'),
-            NEW.lead_channel, NEW.lead_channel_details, NEW.referred_by_name, NEW.referred_by_phone,
-            COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NEW.remarks, NULL,
+            'NEW_CANDIDATE', v_date, v_time_str, v_ts, v_clean_city, LEFT(NEW.operating_place, 150),
+            v_full_name, v_f_name, v_l_name, v_clean_phone, LEFT(COALESCE(NEW.interested_position, 'Driver'), 100),
+            LEFT(NEW.dl_number, 50), LEFT(NEW.aadhaar_number, 50), NEW.dl_image, NEW.aadhaar_image,
+            NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
+            LEFT(NEW.lead_channel, 100), LEFT(NEW.lead_channel_details, 255), LEFT(NEW.referred_by_name, 255), LEFT(NEW.referred_by_phone, 50),
+            LEFT(COALESCE(v_exec_name, 'Executive'), 150), COALESCE(NEW.created_by, NEW.executive_id), LEFT(v_exec_email, 255), NEW.remarks, NULL,
             NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
@@ -348,33 +379,60 @@ BEGIN
             walkin_date = v_date,
             walkin_time = v_time_str,
             city = v_clean_city,
-            operating_place = NEW.operating_place,
+            operating_place = LEFT(NEW.operating_place, 150),
             full_name = v_full_name,
             first_name = v_f_name,
             last_name = v_l_name,
             phone_number = v_clean_phone,
-            partner_role = COALESCE(NEW.interested_position, 'Driver'),
-            dl_number = NEW.dl_number,
-            aadhaar_number = NEW.aadhaar_number,
+            partner_role = LEFT(COALESCE(NEW.interested_position, 'Driver'), 100),
+            dl_number = LEFT(NEW.dl_number, 50),
+            aadhaar_number = LEFT(NEW.aadhaar_number, 50),
             dl_image_url = NEW.dl_image,
             aadhaar_image_url = NEW.aadhaar_image,
             visiting_reason = NEW.visiting_reason,
             visiting_reason_category = v_reason_cat,
             joined_status = NEW.joined_status,
             is_joined = v_is_joined,
-            submission_status = COALESCE(NEW.submission_status, 'Submitted'),
-            lead_channel = NEW.lead_channel,
-            lead_channel_details = NEW.lead_channel_details,
-            referred_by_name = NEW.referred_by_name,
-            referred_by_phone = NEW.referred_by_phone,
-            attending_executive = COALESCE(v_exec_name, attending_executive),
+            submission_status = LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
+            lead_channel = LEFT(NEW.lead_channel, 100),
+            lead_channel_details = LEFT(NEW.lead_channel_details, 255),
+            referred_by_name = LEFT(NEW.referred_by_name, 255),
+            referred_by_phone = LEFT(NEW.referred_by_phone, 50),
+            attending_executive = LEFT(COALESCE(v_exec_name, attending_executive), 150),
             attending_executive_id = COALESCE(NEW.created_by, NEW.executive_id),
-            submitter_email = COALESCE(v_exec_email, submitter_email),
+            submitter_email = LEFT(COALESCE(v_exec_email, submitter_email), 255),
             remarks = NEW.remarks,
             is_deleted = FALSE,
             deleted_at = NULL,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_new_walkin_id = NEW.id;
+
+        IF NOT FOUND THEN
+            PERFORM pg_advisory_xact_lock(777888999);
+            SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+            INSERT INTO public.core_walkin (
+                id,
+                source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
+                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
+                full_name, first_name, last_name, phone_number, partner_role,
+                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
+                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
+                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
+                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
+                sheet_row_number, is_deleted, deleted_at, created_at, updated_at
+            ) VALUES (
+                v_next_id,
+                'PORTAL_NEW', 'july_new_walkins', NULL, NEW.id, NULL,
+                'NEW_CANDIDATE', v_date, v_time_str, v_ts, v_clean_city, LEFT(NEW.operating_place, 150),
+                v_full_name, v_f_name, v_l_name, v_clean_phone, LEFT(COALESCE(NEW.interested_position, 'Driver'), 100),
+                LEFT(NEW.dl_number, 50), LEFT(NEW.aadhaar_number, 50), NEW.dl_image, NEW.aadhaar_image,
+                NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
+                LEFT(NEW.lead_channel, 100), LEFT(NEW.lead_channel_details, 255), LEFT(NEW.referred_by_name, 255), LEFT(NEW.referred_by_phone, 50),
+                LEFT(COALESCE(v_exec_name, 'Executive'), 150), COALESCE(NEW.created_by, NEW.executive_id), LEFT(v_exec_email, 255), NEW.remarks, NULL,
+                NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
+            );
+            PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+        END IF;
     END IF;
     RETURN NEW;
 END;
@@ -388,7 +446,7 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_portal_new();
 -- -----------------------------------------------------------------------------
 -- 4. Trigger Function: Sync from july_existing_walkins
 -- -----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTION fn_sync_core_walkin_from_portal_existing()
+CREATE OR REPLACE FUNCTION public.fn_sync_core_walkin_from_portal_existing()
 RETURNS TRIGGER AS $$
 DECLARE
     v_next_id BIGINT;
@@ -405,7 +463,6 @@ DECLARE
     v_exec_email VARCHAR(255);
 BEGIN
     IF TG_OP = 'DELETE' THEN
-        -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -429,7 +486,7 @@ BEGIN
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
     END IF;
-    IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
+    IF v_full_name = '' OR v_full_name IS NULL THEN v_full_name := 'UNKNOWN'; END IF;
     
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
@@ -443,21 +500,25 @@ BEGIN
         ELSE 'OTHER'
     END;
 
-    v_ts := COALESCE(NEW.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
-    v_date := COALESCE(NEW.event_date, v_ts::date);
-    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(v_ts, 'HH24:MI'));
+    v_date := COALESCE(NEW.event_date, (NEW.created_at AT TIME ZONE 'Asia/Kolkata')::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date);
+    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(NEW.created_at AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'), TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'));
+
+    BEGIN
+        v_ts := (v_date::text || ' ' || v_time_str)::timestamp;
+    EXCEPTION WHEN OTHERS THEN
+        v_ts := COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+    END;
 
     SELECT 
-        LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
-        LEFT(COALESCE(pu.email, pu.username, ''), 255)
+        COALESCE(pu.full_name, e.first_name || ' ' || COALESCE(e.last_name, ''), 'Executive'),
+        COALESCE(pu.email, e.email, '')
     INTO v_exec_name, v_exec_email
-    FROM july_portal_users pu
-    LEFT JOIN july_employees e ON e.employee_id = pu.employee_id
+    FROM public.july_portal_users pu
+    LEFT JOIN public.july_employees e ON e.id = pu.employee_id
     WHERE pu.portal_user_id = COALESCE(NEW.created_by, NEW.executive_id)
     LIMIT 1;
 
     IF TG_OP = 'INSERT' THEN
-        -- Transactional gapless ID allocation
         PERFORM pg_advisory_xact_lock(777888999);
         SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
 
@@ -475,11 +536,11 @@ BEGIN
             v_next_id,
             'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, NEW.id,
             'EXISTING_PARTNER', v_date, v_time_str, v_ts, v_clean_city, NULL,
-            v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.partner_type, 'Driver'),
+            v_full_name, v_f_name, v_l_name, v_clean_phone, LEFT(COALESCE(NEW.partner_type, 'Driver'), 100),
             NULL, NULL, NULL, NULL,
-            NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, COALESCE(NEW.submission_status, 'Submitted'),
+            NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
             NULL, NULL, NULL, NULL,
-            COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NULL, NEW.visit_notes,
+            LEFT(COALESCE(v_exec_name, 'Executive'), 150), COALESCE(NEW.created_by, NEW.executive_id), LEFT(v_exec_email, 255), NULL, NEW.visit_notes,
             NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
@@ -493,18 +554,45 @@ BEGIN
             first_name = v_f_name,
             last_name = v_l_name,
             phone_number = v_clean_phone,
-            partner_role = COALESCE(NEW.partner_type, 'Driver'),
+            partner_role = LEFT(COALESCE(NEW.partner_type, 'Driver'), 100),
             visiting_reason = NEW.visiting_reason,
             visiting_reason_category = v_reason_cat,
-            submission_status = COALESCE(NEW.submission_status, 'Submitted'),
-            attending_executive = COALESCE(v_exec_name, attending_executive),
+            submission_status = LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
+            attending_executive = LEFT(COALESCE(v_exec_name, attending_executive), 150),
             attending_executive_id = COALESCE(NEW.created_by, NEW.executive_id),
-            submitter_email = COALESCE(v_exec_email, submitter_email),
+            submitter_email = LEFT(COALESCE(v_exec_email, submitter_email), 255),
             visit_notes = NEW.visit_notes,
             is_deleted = FALSE,
             deleted_at = NULL,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_existing_walkin_id = NEW.id;
+
+        IF NOT FOUND THEN
+            PERFORM pg_advisory_xact_lock(777888999);
+            SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_walkin;
+            INSERT INTO public.core_walkin (
+                id,
+                source_system, source_table, sheet_walkin_id, portal_new_walkin_id, portal_existing_walkin_id,
+                walkin_type, walkin_date, walkin_time, walkin_timestamp, city, operating_place,
+                full_name, first_name, last_name, phone_number, partner_role,
+                dl_number, aadhaar_number, dl_image_url, aadhaar_image_url,
+                visiting_reason, visiting_reason_category, joined_status, is_joined, joined_date, submission_status,
+                lead_channel, lead_channel_details, referred_by_name, referred_by_phone,
+                attending_executive, attending_executive_id, submitter_email, remarks, visit_notes,
+                sheet_row_number, is_deleted, deleted_at, created_at, updated_at
+            ) VALUES (
+                v_next_id,
+                'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, NEW.id,
+                'EXISTING_PARTNER', v_date, v_time_str, v_ts, v_clean_city, NULL,
+                v_full_name, v_f_name, v_l_name, v_clean_phone, LEFT(COALESCE(NEW.partner_type, 'Driver'), 100),
+                NULL, NULL, NULL, NULL,
+                NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, LEFT(COALESCE(NEW.submission_status, 'Submitted'), 50),
+                NULL, NULL, NULL, NULL,
+                LEFT(COALESCE(v_exec_name, 'Executive'), 150), COALESCE(NEW.created_by, NEW.executive_id), LEFT(v_exec_email, 255), NULL, NEW.visit_notes,
+                NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
+            );
+            PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
+        END IF;
     END IF;
     RETURN NEW;
 END;

@@ -185,7 +185,9 @@ def backfill():
                 full, f_name, l_name, phone, r['dl_number'],
                 v_reason, v_cat, j_status, is_j, r['joined_date'],
                 r['attending_executive'], r['submitter_email'], r['remarks'],
-                r['sheet_row_number'], r['created_at'], r['updated_at']
+                r['sheet_row_number'],
+                (r['created_at'].astimezone(IST).replace(tzinfo=None) if r['created_at'] else None),
+                (r['updated_at'].astimezone(IST).replace(tzinfo=None) if r['updated_at'] else None)
             ))
 
         # 2. Portal New

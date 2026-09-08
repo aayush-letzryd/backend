@@ -205,6 +205,32 @@ Create an `automation_script.py` with two core modes:
 - `--audit`: Compares source row counts vs. target count, verifies gapless primary key continuity (`generate_series`), and prints category distributions.
 - `--backfill`: Idempotently populates the master table from historical rows if a database re-index is ever needed.
 
+### Step 6: Allocate Domain-Specific Advisory Lock IDs
+To prevent cross-domain lock contention where different tables block each other's inserts, each engineering domain must use a dedicated 64-bit advisory lock integer:
+
+| Business Domain | Master Table Name | Dedicated Advisory Lock ID |
+|:---|:---|:---|
+| **Walk-in & Partner Visits** | `public.core_walkin` | `777888999` |
+| **Vehicle Allocation** | `public.core_vehicle_allocation` | `777888001` |
+| **Vehicle Dropoff / Returns** | `public.core_vehicle_dropoff` | `777888002` |
+| **Traffic Challans** | `public.core_traffic_challans` | `777888003` |
+| **Partner Onboarding** | `public.core_partner_onboarding` | `777888004` |
+| **Financial Adjustments** | `public.core_adjustments` | `777888005` |
+| **Vehicle Accidents** | `public.core_accidents` | `777888006` |
+
+### Step 7: Enforce the 3-Tier Data Quality Policy
+Whenever you build triggers and backfill logic, categorize every column into one of three tiers:
+1. **Tier 1: Functional Standardization**:
+   - Fields used in joins, foreign keys, or group-by reporting (e.g. `phone_number`, `vehicle_number`, `city`, `visiting_reason_category`).
+   - Must be strictly sanitized (strip non-digits from phones, uppercase and format vehicle registration plates, canonicalize cities).
+2. **Tier 2: Verbatim Pass-Through with Defensive String Bounding**:
+   - Fields containing human-entered text (e.g. `full_name`, `remarks`, `visit_notes`, `lead_channel_details`).
+   - Store exactly what the user typed without altering spelling.
+   - **Crucial**: Always wrap with `LEFT(val, max_column_length)` to protect against SQL character overflow exceptions (`SQLSTATE 22001`).
+3. **Tier 3: Zero Source Table Mutability**:
+   - Source systems (`sheet_walkins`, `july_new_walkins`, Google Sheets) must remain strictly read-only to the pipeline.
+   - Never run DDL modifications, column drops, or updates against source tables.
+
 ---
 
 ## 5. Complete 42-Column Master Field Dictionary (`public.core_walkin`)
