@@ -21,11 +21,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "YOUR_DB_HOST_HERE",
+  host: "35.200.196.113",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "YOUR_DB_PASSWORD_HERE",
+  password: "8S5]U3@L^Xz)\\FH}",
   
   // Source Spreadsheet with raw form responses ('Onboarding form_V2')
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1ix6iKa9nEh4li44ZRcpkAvEMLo4r94mT4VbwRCfNZIM/edit",
@@ -276,22 +276,39 @@ function parseReferral(val) {
   };
 }
 
+function resolveTwoDigitYear(yy, isDob) {
+  let currentYear = new Date().getFullYear();
+  if (isDob) {
+    // Driver partners must be adults (>= 18 yrs). Any 2-digit birth year producing future or underage date belongs to 1900s.
+    let maxDobYY = (currentYear - 18) % 100;
+    return (yy > maxDobYY) ? 1900 + yy : 2000 + yy;
+  }
+  return (yy > 50) ? 1900 + yy : 2000 + yy;
+}
+
 /**
  * Multi-format Date / Timestamp Parser (ISS-30, ISS-31, ISS-32, ISS-46).
  */
-function parseDateTime(val) {
+function parseDateTime(val, isDob) {
   if (!val) return null;
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return null;
     let y = val.getFullYear();
     if (y < 100) {
-      val.setFullYear(y > 50 ? 1900 + y : 2000 + y);
+      val.setFullYear(resolveTwoDigitYear(y, isDob));
+    } else if (isDob && y > new Date().getFullYear()) {
+      val.setFullYear(y - 100);
     }
     return val;
   }
   if (typeof val === "number") {
     let dt = new Date(Math.round((val - 25569) * 86400 * 1000));
-    return isNaN(dt.getTime()) ? null : dt;
+    if (isNaN(dt.getTime())) return null;
+    let y = dt.getFullYear();
+    if (isDob && y > new Date().getFullYear()) {
+      dt.setFullYear(y - 100);
+    }
+    return dt;
   }
   let str = String(val).trim();
   if (!str || str === "-" || str.toLowerCase() === "na" || str.toLowerCase() === "null") return null;
@@ -305,6 +322,7 @@ function parseDateTime(val) {
     let hour = ymdMatch[4] ? parseInt(ymdMatch[4], 10) : 0;
     let min = ymdMatch[5] ? parseInt(ymdMatch[5], 10) : 0;
     let sec = ymdMatch[6] ? parseInt(ymdMatch[6], 10) : 0;
+    if (isDob && year > new Date().getFullYear()) year -= 100;
     let dt = new Date(year, month, day, hour, min, sec);
     return isNaN(dt.getTime()) ? null : dt;
   }
@@ -316,7 +334,9 @@ function parseDateTime(val) {
     let month = parseInt(dmyMatch[2], 10) - 1;
     let year = parseInt(dmyMatch[3], 10);
     if (year < 100) {
-      year += (year > 50 ? 1900 : 2000);
+      year = resolveTwoDigitYear(year, isDob);
+    } else if (isDob && year > new Date().getFullYear()) {
+      year -= 100;
     }
     let hour = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 0;
     let min = dmyMatch[5] ? parseInt(dmyMatch[5], 10) : 0;
@@ -333,7 +353,8 @@ function parseDateTime(val) {
     let months = ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec"];
     let month = months.indexOf(monthStr);
     let year = parseInt(dMmmYMatch[3], 10);
-    if (year < 100) year += (year > 50 ? 1900 : 2000);
+    if (year < 100) year = resolveTwoDigitYear(year, isDob);
+    else if (isDob && year > new Date().getFullYear()) year -= 100;
     if (month !== -1) {
       let dt = new Date(year, month, day);
       return isNaN(dt.getTime()) ? null : dt;
@@ -343,8 +364,8 @@ function parseDateTime(val) {
   // 4. YY-MM-DD (e.g. 37-05-08 -> 2037-05-08)
   let yyMdMatch = str.match(/^(\d{2})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
   if (yyMdMatch) {
-    let year = parseInt(yyMdMatch[1], 10);
-    year += (year > 50 ? 1900 : 2000);
+    let yy = parseInt(yyMdMatch[1], 10);
+    let year = resolveTwoDigitYear(yy, isDob);
     let month = parseInt(yyMdMatch[2], 10) - 1;
     let day = parseInt(yyMdMatch[3], 10);
     let dt = new Date(year, month, day);
@@ -355,17 +376,19 @@ function parseDateTime(val) {
   if (isNaN(parsed.getTime())) return null;
   let y = parsed.getFullYear();
   if (y < 100) {
-    parsed.setFullYear(y > 50 ? 1900 + y : 2000 + y);
+    parsed.setFullYear(resolveTwoDigitYear(y, isDob));
+  } else if (isDob && y > new Date().getFullYear()) {
+    parsed.setFullYear(y - 100);
   }
   return parsed;
 }
 
 function formatDateOnly(dt) {
   if (!dt || isNaN(dt.getTime())) return null;
-  let y = dt.getFullYear();
-  if (y < 100) {
-    y += (y > 50 ? 1900 : 2000);
+  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
+    return Utilities.formatDate(dt, "Asia/Kolkata", "yyyy-MM-dd");
   }
+  let y = dt.getFullYear();
   let yStr = ("0000" + y).slice(-4);
   let m = ("0" + (dt.getMonth() + 1)).slice(-2);
   let d = ("0" + dt.getDate()).slice(-2);
@@ -374,6 +397,9 @@ function formatDateOnly(dt) {
 
 function formatTimestamp(dt) {
   if (!dt || isNaN(dt.getTime())) return null;
+  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
+    return Utilities.formatDate(dt, "Asia/Kolkata", "yyyy-MM-dd HH:mm:ssXXX");
+  }
   return dt.toISOString();
 }
 
@@ -417,7 +443,13 @@ function parseRow(row, rowIndex) {
   let driverName = sanitizeText(row[6]) ? String(sanitizeText(row[6])).toUpperCase() : null;
   let driverPhone = sanitizePhone(row[7]);
   
-  if (!driverPhone && !driverName) return null; // Empty row
+  // A valid 10-digit driver phone is mandatory for onboarding. Skip row if missing to prevent batch rollback.
+  if (!driverPhone) {
+    if (driverName) {
+      Logger.log("Skipping row " + rowIndex + " (" + driverName + "): Missing valid 10-digit phone number.");
+    }
+    return null;
+  }
   
   let whatsappPhone = sanitizePhone(row[8]) || driverPhone; // ISS-25: fallback to driver phone
   let emergencyName = sanitizeText(row[9]);
@@ -425,7 +457,7 @@ function parseRow(row, rowIndex) {
   let refName = sanitizeText(row[11]);
   let refPhone = sanitizePhone(row[12]);
   let fatherName = sanitizeText(row[13]);
-  let dob = parseDateTime(row[14]);
+  let dob = parseDateTime(row[14], true);
   let aadhaarAddress = sanitizeText(row[15]);
   let presentAddress = sanitizeText(row[16]) || aadhaarAddress; // ISS-35: fallback to Aadhaar address
   let panNumber = sanitizePAN(row[17]);
@@ -589,15 +621,16 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
   
   let conn = null;
   let stmt = null;
-  const SUB_CHUNK = 10;
+  const BATCH_SIZE = 15;
+  let totalCount = 0;
   
   try {
     conn = getDbConnection();
     conn.setAutoCommit(false);
     stmt = conn.createStatement();
     
-    for (let i = 0; i < records.length; i += SUB_CHUNK) {
-      let chunk = records.slice(i, i + SUB_CHUNK);
+    for (let i = 0; i < records.length; i += BATCH_SIZE) {
+      let chunk = records.slice(i, i + BATCH_SIZE);
       let valueClauses = [];
       
       for (let k = 0; k < chunk.length; k++) {
@@ -739,24 +772,13 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
         ");";
   
       stmt.executeUpdate(sql);
+      conn.commit();
+      totalCount += chunk.length;
+      Logger.log("Upserted batch: " + totalCount + "/" + records.length + " onboarding records into PostgreSQL.");
     }
     
-    // Zero-Burn Sequence Alignment: Reset sequence to exact MAX(id) to guarantee zero gaps
-    try {
-      stmt.executeUpdate("SELECT setval('public.sheet_driver_onboarding_id_seq', COALESCE((SELECT MAX(id) FROM public.sheet_driver_onboarding), 1));");
-    } catch(err) {
-      Logger.log("Notice: sequence alignment: " + err.message);
-    }
-
-    conn.commit();
-    Logger.log("Successfully upserted " + records.length + " records.");
-    
-    // Automatically trigger master merge into core_partner_onboarding if not skipped
-    if (!skipCoreMerge) {
-      triggerCoreMerge(conn);
-    }
-    
-    return records.length;
+    Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " records.");
+    return totalCount;
   } catch(e) {
     if (conn) {
       try { conn.rollback(); } catch(err){}
@@ -799,9 +821,14 @@ function triggerCoreMerge(conn) {
 // =============================================================================
 
 /**
+ * Full synchronization function for Partner Onboarding.
  * Pulls all records from 'Onboarding form_V2', standardizes every column,
  * populates the target spreadsheet tab, and syncs to PostgreSQL in batches.
  */
+function syncAllOnboardings() {
+  return syncFromSourceSheetToTargetSheet();
+}
+
 function syncFromSourceSheetToTargetSheet() {
   Logger.log("Starting direct cross-sheet pull and standardization...");
   
@@ -967,7 +994,9 @@ function formatRecordForSheet(parsed, nowStr) {
 function handleOnEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  if (sheet.getName() !== DB_CONFIG.sourceSheetName && sheet.getName() !== DB_CONFIG.targetSheetName) return;
+  // Restrict live edit handling strictly to the raw source form tab (Onboarding form_V2).
+  // Never process edits on target sheet_driver_onboarding tab to prevent column-scrambling.
+  if (sheet.getName() !== DB_CONFIG.sourceSheetName) return;
   
   const startRow = e.range.getRow();
   const endRow = e.range.getLastRow();

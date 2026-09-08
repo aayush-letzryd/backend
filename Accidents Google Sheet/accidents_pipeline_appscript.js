@@ -6,7 +6,7 @@
  * Source Sheet : 'Accident vehicle report' (Raw Form Responses)
  * Target Sheet : 'sheet_accidents' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_accidents & public.core_accidents
- * Host         : YOUR_DB_HOST_HERE:5432
+ * Host         : 35.200.196.113:5432
  * 
  * Features:
  *  - Dual Ingestion: Populates standardized 'sheet_accidents' tab AND PostgreSQL database
@@ -24,11 +24,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "YOUR_DB_HOST_HERE",
+  host: "35.200.196.113",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "YOUR_DB_PASSWORD_HERE",
+  password: "8S5]U3@L^Xz)\\FH}",
   
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Qp_JL4gbTgUXMLuEQaGaaYwHWTNwNnrIP4lNzKsWl50/edit",
   sourceSheetName: "Accident vehicle report",
@@ -155,12 +155,39 @@ function parseDateOrTimestamp(val, isDateOnly) {
     return isDateOnly ? formatDateOnly(val) : formatTimestamp(val);
   }
   var str = String(val).trim();
-  if (!str || ["NA", "NAN", "NULL", "0"].indexOf(str.toUpperCase()) !== -1) return null;
+  if (!str || ["NA", "NAN", "NULL", "0", "#N/A", "#VALUE!", "#REF!"].indexOf(str.toUpperCase()) !== -1) return null;
   
   var num = parseFloat(str);
-  if (!isNaN(num) && num > 30000 && num < 60000) {
-    var ms = (num - 25569) * 86400 * 1000;
+  if (!isNaN(num) && num > 30000 && num < 60000 && /^\d+(\.\d+)?$/.test(str)) {
+    var ms = Math.round((num - 25569) * 86400 * 1000);
     var d = new Date(ms);
+    return isDateOnly ? formatDateOnly(d) : formatTimestamp(d);
+  }
+
+  // DD/MM/YYYY or DD-MM-YYYY (prevents Google Apps Script V8 date swapping)
+  var dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (dmy) {
+    var day = parseInt(dmy[1], 10);
+    var month = parseInt(dmy[2], 10) - 1;
+    var year = parseInt(dmy[3], 10);
+    if (year < 100) year += (year > 50 ? 1900 : 2000);
+    var hh = dmy[4] ? parseInt(dmy[4], 10) : 0;
+    var mm = dmy[5] ? parseInt(dmy[5], 10) : 0;
+    var ss = dmy[6] ? parseInt(dmy[6], 10) : 0;
+    var d = new Date(year, month, day, hh, mm, ss);
+    return isDateOnly ? formatDateOnly(d) : formatTimestamp(d);
+  }
+
+  // YYYY-MM-DD or YYYY/MM/DD
+  var ymd = str.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
+  if (ymd) {
+    var year = parseInt(ymd[1], 10);
+    var month = parseInt(ymd[2], 10) - 1;
+    var day = parseInt(ymd[3], 10);
+    var hh = ymd[4] ? parseInt(ymd[4], 10) : 0;
+    var mm = ymd[5] ? parseInt(ymd[5], 10) : 0;
+    var ss = ymd[6] ? parseInt(ymd[6], 10) : 0;
+    var d = new Date(year, month, day, hh, mm, ss);
     return isDateOnly ? formatDateOnly(d) : formatTimestamp(d);
   }
   
@@ -172,20 +199,28 @@ function parseDateOrTimestamp(val, isDateOnly) {
 }
 
 function formatDateOnly(d) {
-  var y = d.getUTCFullYear();
-  var m = ("0" + (d.getUTCMonth() + 1)).slice(-2);
-  var day = ("0" + d.getUTCDate()).slice(-2);
+  if (!d || isNaN(d.getTime())) return null;
+  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
+    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+  }
+  var y = d.getFullYear();
+  var m = ("0" + (d.getMonth() + 1)).slice(-2);
+  var day = ("0" + d.getDate()).slice(-2);
   return y + "-" + m + "-" + day;
 }
 
 function formatTimestamp(d) {
-  var y = d.getUTCFullYear();
-  var m = ("0" + (d.getUTCMonth() + 1)).slice(-2);
-  var day = ("0" + d.getUTCDate()).slice(-2);
-  var hh = ("0" + d.getUTCHours()).slice(-2);
-  var mm = ("0" + d.getUTCMinutes()).slice(-2);
-  var ss = ("0" + d.getUTCSeconds()).slice(-2);
-  return y + "-" + m + "-" + day + " " + hh + ":" + mm + ":" + ss + "+00";
+  if (!d || isNaN(d.getTime())) return null;
+  if (typeof Utilities !== "undefined" && Utilities.formatDate) {
+    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd HH:mm:ssXXX");
+  }
+  var y = d.getFullYear();
+  var m = ("0" + (d.getMonth() + 1)).slice(-2);
+  var day = ("0" + d.getDate()).slice(-2);
+  var hh = ("0" + d.getHours()).slice(-2);
+  var mm = ("0" + d.getMinutes()).slice(-2);
+  var ss = ("0" + d.getSeconds()).slice(-2);
+  return y + "-" + m + "-" + day + " " + hh + ":" + mm + ":" + ss + "+05:30";
 }
 
 function consolidatePoliceAck(colYes, colNo, colAck) {
@@ -205,6 +240,14 @@ function parseNumericAmount(val) {
   if (!str) return 0.00;
   var num = parseFloat(str);
   return isNaN(num) ? 0.00 : num;
+}
+
+function parseNullableNumericAmount(val) {
+  if (val === null || val === undefined) return null;
+  var str = String(val).replace(/[^0-9.-]/g, "").trim();
+  if (!str) return null;
+  var num = parseFloat(str);
+  return isNaN(num) ? null : num;
 }
 
 function transformAccidentRow(row, rowIndex) {
@@ -241,6 +284,9 @@ function transformAccidentRow(row, rowIndex) {
   var cityCode = standardizeCityCode(rawLoc);
   var policeAck = consolidatePoliceAck(polYes, polNo, polAck);
   var driverName = (drvNameN || drvNameM || "").toString().trim().toUpperCase() || null;
+  if (driverName && (/^#N\/A/i.test(driverName) || driverName === "NA" || driverName === "NULL")) {
+    driverName = null;
+  }
 
   return {
     submission_timestamp: subTimestamp,
@@ -255,9 +301,9 @@ function transformAccidentRow(row, rowIndex) {
     driver_name: driverName,
     driver_partner_id: drvLid && String(drvLid).indexOf("LETZ") !== -1 ? String(drvLid).trim() : null,
     vehicle_rfd_date: parseDateOrTimestamp(rfdDate, true),
-    total_invoice: parseNumericAmount(totInv),
-    liability_amount: parseNumericAmount(liability),
-    letzryd_share: parseNumericAmount(lrShare),
+    total_invoice: parseNullableNumericAmount(totInv),
+    liability_amount: parseNullableNumericAmount(liability),
+    letzryd_share: parseNullableNumericAmount(lrShare),
     invoice_letter_link: invLink ? String(invLink).trim() : null,
     incident_remarks: remarks ? String(remarks).trim() : null,
     workshop_name: row[14] ? String(row[14]).trim() : null,
@@ -314,6 +360,12 @@ function sqlNum(val) {
   return (isNaN(n) ? "0.00" : n.toFixed(2)) + "::numeric";
 }
 
+function sqlNullableNum(val) {
+  if (val === null || val === undefined || val === "") return "NULL::numeric";
+  var n = parseFloat(val);
+  return (isNaN(n) ? "NULL::numeric" : n.toFixed(2)) + "::numeric";
+}
+
 function sqlBool(val) {
   return val ? "TRUE::boolean" : "FALSE::boolean";
 }
@@ -361,9 +413,9 @@ function upsertAccidentRecords(records) {
           sqlStr(r.driver_name) + ", " +
           sqlStr(r.driver_partner_id) + ", " +
           sqlDate(r.vehicle_rfd_date) + ", " +
-          sqlNum(r.total_invoice) + ", " +
-          sqlNum(r.liability_amount) + ", " +
-          sqlNum(r.letzryd_share) + ", " +
+          sqlNullableNum(r.total_invoice) + ", " +
+          sqlNullableNum(r.liability_amount) + ", " +
+          sqlNullableNum(r.letzryd_share) + ", " +
           sqlStr(r.invoice_letter_link) + ", " +
           sqlStr(r.incident_remarks) + ", " +
           sqlStr(r.workshop_name) + ", " +
@@ -391,9 +443,11 @@ function upsertAccidentRecords(records) {
         "upd AS ( " +
         "  UPDATE public.sheet_accidents t " +
         "  SET " +
+        "    submitter_email = i.submitter_email, " +
         "    city_code = i.city_code, " +
         "    police_acknowledgement = i.police_acknowledgement, " +
         "    estimate_amount = i.estimate_amount, " +
+        "    accident_photos_link = i.accident_photos_link, " +
         "    letzryd_payable_amount = i.letzryd_payable_amount, " +
         "    driver_name = i.driver_name, " +
         "    driver_partner_id = COALESCE(i.driver_partner_id, t.driver_partner_id), " +
@@ -401,7 +455,12 @@ function upsertAccidentRecords(records) {
         "    total_invoice = i.total_invoice, " +
         "    liability_amount = i.liability_amount, " +
         "    letzryd_share = i.letzryd_share, " +
+        "    invoice_letter_link = i.invoice_letter_link, " +
         "    incident_remarks = i.incident_remarks, " +
+        "    workshop_name = i.workshop_name, " +
+        "    workshop_status = i.workshop_status, " +
+        "    mode_of_repair = i.mode_of_repair, " +
+        "    type_of_payment = i.type_of_payment, " +
         "    updated_at = CURRENT_TIMESTAMP " +
         "  FROM incoming_deduped i " +
         "  WHERE t.submission_timestamp = i.submission_timestamp " +
@@ -435,20 +494,6 @@ function upsertAccidentRecords(records) {
       Logger.log("Upserted batch: " + totalCount + "/" + records.length + " records into PostgreSQL.");
     }
 
-    // Zero-Burn Sequence Alignment: Reset sequence to exact MAX(id) to guarantee zero gaps
-    try {
-      stmt.executeUpdate("SELECT setval('public.sheet_accidents_id_seq', COALESCE((SELECT MAX(id) FROM public.sheet_accidents), 1));");
-    } catch(e) {
-      Logger.log("Notice: sequence alignment: " + e.message);
-    }
-
-    // Refresh core_accidents master table in a single high-speed pass
-    try {
-      stmt.executeUpdate("SELECT public.refresh_core_accidents();");
-    } catch(e) {
-      Logger.log("Notice: core accidents refresh: " + e.message);
-    }
-
     conn.commit();
     Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " records.");
     return totalCount;
@@ -473,7 +518,8 @@ function handleOnEdit(e) {
   if (!e || !e.range) return;
   var sheet = e.range.getSheet();
   var sName = sheet.getName().trim().toLowerCase();
-  if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase() && sName !== DB_CONFIG.targetSheetName.trim().toLowerCase()) return;
+  // Restrict live edit handling strictly to raw source form tab. Never process edits on target sheet_accidents tab.
+  if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase()) return;
   
   var startRow = e.range.getRow();
   var endRow = e.range.getLastRow();

@@ -1,6 +1,6 @@
 # LetzRyd Partner Onboarding Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `YOUR_DB_HOST_HERE:5432`  
+Target Database: `35.200.196.113:5432`  
 Database Name: `postgres`  
 Target Landing Table: `public.sheet_driver_onboarding`  
 Target Master Table: `public.core_partner_onboarding`  
@@ -176,7 +176,7 @@ CREATE TABLE IF NOT EXISTS public.core_partner_onboarding (
 ### Step 1: Database Setup
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
 ```
 
 ### Step 2: Google Apps Script Setup
@@ -186,7 +186,7 @@ psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
 
 ### Step 3: Run Full Historical Sync
 1. Select function **`syncFromSourceSheetToTargetSheet`** from the toolbar dropdown.
-2. Click **Run**.
+2. Click **Run** (▶️).
 3. The script will:
    - Read all 50,000+ raw entries from `Onboarding form_V2`.
    - Standardize and output 2,259 clean rows to `sheet_driver_onboarding`.
