@@ -81,6 +81,7 @@ function getTargetSheet(ss) {
 function onOpen() {
   try {
     SpreadsheetApp.getUi().createMenu("LetzRyd Pipeline")
+      .addItem("Sync All Sources (Asset List + Docs + PDI)", "syncAllSourcesToUnifiedAndPostgres")
       .addItem("Sync Entire Sheet to Postgres", "syncAllVehicles")
       .addItem("Resume Sync (Rows 1000 to End)", "syncRemainingVehicles")
       .addItem("Sync Recent 50 Rows", "syncRecentVehicles")
@@ -720,7 +721,105 @@ function syncBatchInternal(limitRows, customStartRow) {
 }
 
 /**
- * Installs automated triggers (onEdit and time-driven sync).
+ * Multi-Source Consolidation & Direct Sync:
+ * Reads raw records from src_asset_list (Cols 1-26), src_master_docs (Cols 27-40),
+ * and src_pdi_vehicle (Cols 41-73), joins them on registration_no, updates
+ * Unified_Vehicle_onboarding_source, and syncs newly found vehicles to Postgres.
+ */
+function syncAllSourcesToUnifiedAndPostgres() {
+  const ss = getTargetSpreadsheet();
+  if (!ss) {
+    Logger.log("Target spreadsheet not accessible.");
+    return;
+  }
+
+  const assetSheet = ss.getSheetByName("src_asset_list");
+  const docsSheet = ss.getSheetByName("src_master_docs");
+  const pdiSheet = ss.getSheetByName("src_pdi_vehicle");
+  const unifiedSheet = ss.getSheetByName(DB_CONFIG.sheetName) || ss.insertSheet(DB_CONFIG.sheetName);
+
+  if (!assetSheet) {
+    Logger.log("Source tab src_asset_list not found. Falling back to direct unified sync.");
+    syncAllVehicles();
+    return;
+  }
+
+  Logger.log("Starting multi-source consolidation across Asset List, Master Docs, and PDI...");
+
+  // 1. Read Asset List (Cols 1-26)
+  const assetData = assetSheet.getDataRange().getValues();
+  if (assetData.length <= 1) {
+    Logger.log("Asset list has no data rows.");
+    return;
+  }
+
+  // 2. Read Master Docs (Cols 27-40) into Map keyed by clean RegNo
+  const docsMap = {};
+  if (docsSheet && docsSheet.getLastRow() > 1) {
+    const docsData = docsSheet.getDataRange().getValues();
+    for (let i = 1; i < docsData.length; i++) {
+      const reg = cleanRegNo(docsData[i][2]);
+      if (reg) docsMap[reg] = docsData[i];
+    }
+  }
+
+  // 3. Read PDI Vehicle (Cols 41-73) into Map keyed by clean RegNo
+  const pdiMap = {};
+  if (pdiSheet && pdiSheet.getLastRow() > 1) {
+    const pdiData = pdiSheet.getDataRange().getValues();
+    for (let i = 1; i < pdiData.length; i++) {
+      const reg = cleanRegNo(pdiData[i][3]);
+      if (reg) pdiMap[reg] = pdiData[i];
+    }
+  }
+
+  // 4. Read existing Unified Sheet to determine existing vehicles
+  const existingUnifiedRegs = new Set();
+  if (unifiedSheet.getLastRow() > 1) {
+    const unifiedRegs = unifiedSheet.getRange(2, 2, unifiedSheet.getLastRow() - 1, 1).getValues();
+    for (let i = 0; i < unifiedRegs.length; i++) {
+      const reg = cleanRegNo(unifiedRegs[i][0]);
+      if (reg) existingUnifiedRegs.add(reg);
+    }
+  }
+
+  const rowsToAppend = [];
+
+  for (let i = 1; i < assetData.length; i++) {
+    const assetRow = assetData[i];
+    const regNo = cleanRegNo(assetRow[1]); // Col 2 is registration_no
+    if (!regNo) continue;
+
+    if (!existingUnifiedRegs.has(regNo)) {
+      const docRow = docsMap[regNo] || [];
+      const pdiRow = pdiMap[regNo] || [];
+
+      const fullRow = new Array(73).fill("");
+      // Asset List (1-26)
+      for (let c = 0; c < 26; c++) fullRow[c] = assetRow[c] !== undefined ? assetRow[c] : "";
+      // Docs (27-40)
+      for (let c = 0; c < 14; c++) fullRow[26 + c] = docRow[c] !== undefined ? docRow[c] : "";
+      // PDI (41-73)
+      for (let c = 0; c < 33; c++) fullRow[40 + c] = pdiRow[c] !== undefined ? pdiRow[c] : "";
+
+      rowsToAppend.push(fullRow);
+      existingUnifiedRegs.add(regNo);
+    }
+  }
+
+  if (rowsToAppend.length > 0) {
+    unifiedSheet.getRange(unifiedSheet.getLastRow() + 1, 1, rowsToAppend.length, 73).setValues(rowsToAppend);
+    Logger.log("Appended " + rowsToAppend.length + " newly merged vehicles into " + DB_CONFIG.sheetName);
+  } else {
+    Logger.log("All source vehicles are already consolidated in " + DB_CONFIG.sheetName);
+  }
+
+  // 5. Ingest / update all records to PostgreSQL
+  syncBatchInternal(null, 2);
+}
+
+/**
+ * Installs automated triggers (onEdit, form submit, and hourly multi-source sync).
  */
 function setupTriggers() {
   deleteAllTriggers();
@@ -738,6 +837,12 @@ function setupTriggers() {
     .onFormSubmit()
     .create();
 
+  // Install hourly multi-source catchup sync trigger
+  ScriptApp.newTrigger("syncAllSourcesToUnifiedAndPostgres")
+    .timeBased()
+    .everyHours(1)
+    .create();
+
   // Install 15-minute catchup sync trigger
   ScriptApp.newTrigger("syncRecentVehicles")
     .timeBased()
@@ -748,7 +853,7 @@ function setupTriggers() {
   try {
     SpreadsheetApp.getUi().alert(
       "Triggers Installed",
-      "Automated onEdit and 15-minute sync triggers have been installed.",
+      "Automated onEdit, onFormSubmit, and hourly multi-source sync triggers have been installed.",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   } catch(e) {}
