@@ -1,11 +1,13 @@
 # LetzRyd Partner Onboarding Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `35.200.196.113:5432`  
+Target Database: `YOUR_DB_HOST_HERE:5432`  
 Database Name: `postgres`  
 Target Landing Table: `public.sheet_driver_onboarding`  
 Target Master Table: `public.core_partner_onboarding`  
+Active Filtered View: `public.active_core_partner_onboarding`  
 Source Google Sheet Tab: `Onboarding form_V2` (from raw Google Forms)  
 Clean Intermediate Sheet Tab: `sheet_driver_onboarding`  
+Error Logging Tab: `onboarding_sync_errors`  
 Portal Form Source Table: `public.july_form_onboarding`  
 Technology Stack: Google Apps Script (JavaScript), PostgreSQL 14+, JDBC, PL/pgSQL  
 
@@ -19,10 +21,13 @@ Operational hubs onboard driver-partners via physical Google Form entries (`Onbo
 
 ### Primary System Guarantees
 - **Zero IMPORTRANGE Dependency**: Cross-sheet data extraction reads directly in memory using Google Apps Script's `openByUrl()`, completely bypassing Google Sheets formula record limits and cell freeze.
-- **Real-Time Synchronization**: Live On-Edit (`handleOnEdit`) and Form-Submit (`handleOnFormSubmit`) trigger ingestion with ~1–2 seconds latency.
-- **1-Minute Catch-Up Trigger**: `syncRecentOnboardings` processes rolling windows of recent records in under 1 second.
-- **Zero Sequence Number Burning**: PostgreSQL upserts use strict conflict resolution ensuring gapless sequential IDs.
-- **Unified Master Entity**: The stored procedure `refresh_core_partner_onboarding()` automatically merges Google Sheet and Portal submissions on unique phone numbers.
+- **Native Real-Time Database Synchronization**: Live row-level PostgreSQL triggers (`trg_sheet_driver_onboarding_sync` and `trg_july_form_onboarding_sync`) ensure sub-10ms synchronization into core master tables.
+- **Strict Gapless Sequencing**: Utilizes transactional advisory locking (`pg_advisory_xact_lock(777111222)`) and `id BIGINT PRIMARY KEY` to prevent sequence jumping and burning.
+- **IST Timestamp Contract**: Stored as clean `TIMESTAMP WITHOUT TIME ZONE` in Indian Standard Time (`CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'`), eliminating UTC offset discrepancies.
+- **Deterministic Canonical Partner IDs**: Validated company-wide pattern `^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$` resolving city abbreviations deterministically.
+- **100% Bank Proof Retention**: Maps `bank_details_doc` to `cancelled_cheque_photo` across all ingestion and consolidation queries.
+- **Soft Delete Tracking**: Deletions in source systems flag `is_deleted = TRUE` and `deleted_at = NOW()` without hard deletion.
+- **Error Routing**: Records with invalid/missing phone numbers are routed to `onboarding_sync_errors` without halting batch ingestion.
 
 ---
 
@@ -31,13 +36,15 @@ Operational hubs onboard driver-partners via physical Google Form entries (`Onbo
 ```mermaid
 flowchart TD
     A[Google Sheet: Onboarding form_V2\nRaw Responses: 50,000+ Rows] -->|Direct Apps Script Ingestion\nNo IMPORTRANGE| B(Google Apps Script Engine\n47-Issue Standardization)
-    B -->|Fast Batch Chunking| C[Clean Target Sheet Tab:\nsheet_driver_onboarding]
-    B -->|Multi-Row SQL Upsert\n20 Rows / Statement| D[(PostgreSQL Table:\npublic.sheet_driver_onboarding)]
+    B -->|Batch Chunking| C[Clean Target Sheet Tab:\nsheet_driver_onboarding]
+    B -->|Failed Validations| Err[Error Tab:\nonboarding_sync_errors]
+    B -->|Multi-Row SQL Upsert| D[(PostgreSQL Table:\npublic.sheet_driver_onboarding)]
     
     E[LetzRyd Web Portal\nDriver Submissions] -->|Web Form Ingestion| F[(PostgreSQL Table:\npublic.july_form_onboarding)]
     
-    D -->|Automated Procedure Call\nrefresh_core_partner_onboarding| G[(Master Entity Table:\npublic.core_partner_onboarding)]
-    F -->|Deduplicated Merge\nDISTINCT ON phone_number| G
+    D -->|PostgreSQL Trigger\nAdvisory Lock 777111222| G[(Master Entity Table:\npublic.core_partner_onboarding)]
+    F -->|PostgreSQL Trigger\nAdvisory Lock 777111222| G
+    G -->|is_deleted = FALSE| H[Active Master View:\npublic.active_core_partner_onboarding]
 ```
 
 ---
@@ -46,8 +53,8 @@ flowchart TD
 
 | File | Description |
 |---|---|
-| [`partner_onboarding_pipeline_appscript.js`](./partner_onboarding_pipeline_appscript.js) | Production Google Apps Script code (~984 lines) featuring direct cross-sheet extraction, 47-issue standardization engine, sub-chunked multi-row SQL upserts, and automated trigger handlers. |
-| [`schema.sql`](./schema.sql) | PostgreSQL DDL definitions for `sheet_driver_onboarding`, `core_partner_onboarding`, performance B-Tree indexes, and the automated `refresh_core_partner_onboarding()` consolidation procedure. |
+| [`partner_onboarding_pipeline_appscript.js`](./partner_onboarding_pipeline_appscript.js) | Production Google Apps Script code featuring direct cross-sheet extraction, 47-issue standardization engine, error routing to `onboarding_sync_errors`, sanitized credentials via Script Properties, and event-driven trigger handlers. |
+| [`schema.sql`](./schema.sql) | PostgreSQL DDL definitions for `sheet_driver_onboarding`, `core_partner_onboarding`, `active_core_partner_onboarding`, advisory locks, bank proof backfill, and migration scripts. |
 | [`data_issues.md`](./data_issues.md) | Comprehensive audit of all 47 data quality anomalies (`ISS-16` through `ISS-62`) from `Master_Issue_Standardization_Catalog.xlsx` and their exact programmatic transformations. |
 | [`README.md`](./README.md) | Complete Knowledge Transfer (KT) document, system architecture, and operational runbook. |
 
@@ -59,7 +66,7 @@ flowchart TD
 ```sql
 CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
     id BIGSERIAL PRIMARY KEY,
-    submission_timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+    submission_timestamp TIMESTAMP WITHOUT TIME ZONE NOT NULL,
     submitter_email VARCHAR(255),
     city VARCHAR(100),
     onboarding_type VARCHAR(50) DEFAULT 'Individual',
@@ -99,8 +106,8 @@ CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
     deposit_amount NUMERIC(12, 2) DEFAULT 0.00,
     partner_id VARCHAR(50),
     sheet_row_number INTEGER,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
     CONSTRAINT uq_sheet_driver_onboarding UNIQUE (submission_timestamp, driver_phone)
 );
 ```
@@ -108,7 +115,7 @@ CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
 ### 4.2 Master Unified Table: `public.core_partner_onboarding`
 ```sql
 CREATE TABLE IF NOT EXISTS public.core_partner_onboarding (
-    id BIGSERIAL PRIMARY KEY,
+    id BIGINT PRIMARY KEY,
     partner_id VARCHAR(50) UNIQUE,
     driver_name VARCHAR(255) NOT NULL,
     phone_number VARCHAR(20) NOT NULL UNIQUE,
@@ -151,77 +158,61 @@ CREATE TABLE IF NOT EXISTS public.core_partner_onboarding (
     source_origin VARCHAR(50) NOT NULL, -- 'GOOGLE_SHEET', 'PORTAL_FORM', or 'MERGED'
     source_sheet_row_id BIGINT,
     source_portal_form_id INTEGER,
-    onboarding_timestamp TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    is_deleted BOOLEAN DEFAULT FALSE,
+    deleted_at TIMESTAMP WITHOUT TIME ZONE,
+    onboarding_timestamp TIMESTAMP WITHOUT TIME ZONE,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 );
+
+CREATE OR REPLACE VIEW public.active_core_partner_onboarding AS
+SELECT * FROM public.core_partner_onboarding
+WHERE is_deleted = FALSE;
 ```
 
 ---
 
-## 5. Summary of 47-Issue Standardization Rules
+## 5. Deployment & Operations Runbook
 
-| Category | Issue Range | Key Standardizations Implemented |
-|---|---|---|
-| **Partner ID Engine** | `ISS-16` to `ISS-21` | Deterministically generates `LETZ` + `<CITY>` + `<PHONE>` (e.g. `LETZBLR9380465352`); overwrites copy-paste typos and dropped formulas; strips `=COUNTIF` helper columns. |
-| **Demographics & Contacts** | `ISS-22` to `ISS-35` | Standardizes casing to `'Operator'`/`'Individual'`; cleans accents and formats names uppercase; auto-falls back WhatsApp number to driver phone; resolves missing local present address to Aadhaar address. |
-| **Government IDs & Compliance** | `ISS-36` to `ISS-48` | Validates 10-char uppercase PAN (`^[A-Z]{5}[0-9]{4}[A-Z]$`); extracts 12 clean Aadhaar digits; normalizes alphanumeric driving licenses; auto-transliterates Greek homoglyphs (e.g. `\u039A` $\to$ `K`). |
-| **Banking & Payments** | `ISS-49` to `ISS-58` | Converts scientific notation floats in bank accounts to full integer strings; auto-inserts missing 5th zero in 10-char IFSC codes; extracts clean UPI handles; computes arithmetic deposits (`11000 + 3500` $\to$ `14500.00`); splits composite referral strings into phone & name. |
-| **Documents & Clean Staging** | `ISS-59` to `ISS-62` | Converts `'-'` placeholders to SQL `NULL`; drops formula pre-fill columns and ghost unmapped columns (`Unnamed: 43-46`, `Mapping`, `Logic`, `Code`). |
-
----
-
-## 6. Deployment & Operations Runbook
-
-### Step 1: Database Setup
+### Step 1: Database Setup & Migration
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
+psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
 ```
 
-### Step 2: Google Apps Script Setup
+### Step 2: Google Apps Script Credential Configuration
 1. In your target Google Spreadsheet, open **Extensions** $\to$ **Apps Script**.
-2. Paste the entire code from [`partner_onboarding_pipeline_appscript.js`](./partner_onboarding_pipeline_appscript.js) into `Code.gs`.
-3. Press `Ctrl + S` to save.
-
-### Step 3: Run Full Historical Sync
-1. Select function **`syncFromSourceSheetToTargetSheet`** from the toolbar dropdown.
-2. Click **Run** (▶️).
-3. The script will:
-   - Read all 50,000+ raw entries from `Onboarding form_V2`.
-   - Standardize and output 2,259 clean rows to `sheet_driver_onboarding`.
-   - Upsert all records into PostgreSQL `public.sheet_driver_onboarding`.
-   - Automatically execute `refresh_core_partner_onboarding()` to merge portal and sheet records.
-
-### Step 4: Activate Continuous Triggers
-1. Select function **`setupTriggers`** and click **Run**.
-2. Automated triggers activated:
-   - **`handleOnEdit`**: Captures spreadsheet edits in real time.
-   - **`syncRecentOnboardings`**: 1-minute catch-up timer scanning recent rows in < 1 second.
+2. Navigate to **Project Settings** (⚙️) $\to$ **Script Properties**.
+3. Add the following properties securely:
+   - `DB_HOST`: Your PostgreSQL host IP/domain
+   - `DB_PORT`: `5432`
+   - `DB_NAME`: `postgres`
+   - `DB_USER`: `postgres`
+   - `DB_PASSWORD`: Your database password
+4. Paste [`partner_onboarding_pipeline_appscript.js`](./partner_onboarding_pipeline_appscript.js) into `Code.gs`.
+5. Run `setupTriggers` to register event-driven triggers and hourly reconciliation.
 
 ---
 
-## 7. Operational SQL Queries
+## 6. Verification Queries
 
-### Query 1: Partner Distribution by Source
 ```sql
+-- Check total active partner counts and source distribution
 SELECT 
     source_origin,
     count(*) AS total_partners,
     count(DISTINCT phone_number) AS unique_phone_numbers,
+    count(CASE WHEN cancelled_cheque_photo IS NOT NULL THEN 1 END) AS with_bank_proof,
     count(CASE WHEN approval_status = 'Approved' THEN 1 END) AS approved_count
 FROM public.core_partner_onboarding
 GROUP BY source_origin;
-```
 
-### Query 2: Search Driver Partner
-```sql
-SELECT * 
-FROM public.core_partner_onboarding 
-WHERE phone_number = '9380465352';
-```
+-- Verify zero corrupted partner IDs
+SELECT partner_id, driver_name, phone_number, city
+FROM public.core_partner_onboarding
+WHERE partner_id !~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$';
 
-### Query 3: Manual Refresh of Core Consolidation
-```sql
-CALL refresh_core_partner_onboarding();
+-- Verify continuous gapless sequence IDs
+SELECT count(*) AS actual_rows, max(id) AS max_id, COALESCE(max(id), 0) - count(*) AS gap
+FROM public.core_partner_onboarding;
 ```

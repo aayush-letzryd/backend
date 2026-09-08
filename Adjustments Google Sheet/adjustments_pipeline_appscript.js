@@ -6,7 +6,7 @@
  * Source Sheet : 'Adjustment-Form' (Raw Form Responses)
  * Target Sheet : 'sheet_adjustments' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_adjustments & public.core_adjustments
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * 
  * Features:
  *  - Dual Ingestion: Populates standardized 'sheet_adjustments' tab AND PostgreSQL database
@@ -694,10 +694,7 @@ function syncAllAdjustments() {
 function setupTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    var fnName = triggers[i].getHandlerFunction();
-    if (fnName === "syncRecentAdjustments" || fnName === "handleOnEdit" || fnName === "handleOnFormSubmit") {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
+    ScriptApp.deleteTrigger(triggers[i]);
   }
 
   ScriptApp.newTrigger("syncRecentAdjustments")

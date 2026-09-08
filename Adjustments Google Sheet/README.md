@@ -8,44 +8,74 @@ Real-time and batch synchronization engine bridging partner adjustment submissio
 
 ```mermaid
 graph TD
-    A[Google Form / Response Sheet\n'Adjustment-Form'] -->|On-FormSubmit & Time-Driven Trigger| B[Google Apps Script\nadjustments_pipeline_appscript.js]
+    A[Google Form / Response Sheet\n'Adjustment-Form'] -->|On-FormSubmit & On-Edit| B[Google Apps Script\nadjustments_pipeline_appscript.js]
     B -->|JDBC Batch Upsert with Standardizations| C[(PostgreSQL Staging\npublic.sheet_adjustments)]
     D[Web Portal Form\njuly_partner_adjustment] -->|Portal Submissions| E[(PostgreSQL Portal Table\npublic.july_partner_adjustment)]
-    C -->|Trigger: trg_sheet_adjustments_refresh| F[Procedure: refresh_core_adjustments]
-    E -->|Automated Consolidation| F
-    F -->|Master Deduped Table| G[(Production Master\npublic.core_adjustments)]
+    C -->|Trigger: trg_sheet_adjustments_sync\nAdvisory Lock 777333444| G[(Production Master\npublic.core_adjustments)]
+    E -->|Trigger: trg_july_partner_adjustment_sync\nAdvisory Lock 777333444| G
+    G -->|is_deleted = FALSE| H[Active Master View:\npublic.active_core_adjustments]
 ```
 
 ---
 
-## Standardizations & Features (ADJ-01 to ADJ-11)
+## Key Guarantees & V2 Audit Enhancements
 
-1. **City Normalization (ADJ-01)**: Normalizes city entries into standard Title Case (`Bengaluru`, `Mumbai`, `Hyderabad`, `Delhi`, `Chennai`, `Pune`).
-2. **Deterministic Partner ID (ADJ-04)**: Generates canonical partner IDs (`LETZ<CITY><PHONE>`) when partner code is missing or dummy placeholder (`na`, `nan`).
-3. **Phone Number Sanitization (ADJ-03)**: Normalizes floating-point numbers (`9136840411.0`), scientific notations, and truncated phone strings into clean 10-digit mobile numbers.
-4. **Multi-Level Approval Resolution (ADJ-07)**: Resolves approval state contradictions using strict hierarchy (Final Level > Level 1 > Default Pending) and preserves dual audit timestamps.
-5. **Excel Serial Date Parsing (ADJ-08)**: Automatically parses serial day numbers (e.g. `45705.43008`) into ISO-8601 timestamps and dates.
-6. **Hisaab Week Parsing (ADJ-10)**: Extracts clean integer week numbers from free-text strings (`21. MUM Hisaab -May 19th to May 25th CY25WK21`).
-7. **Portal JSON Approval Preservation (ADJ-11)**: Consolidates rich portal JSON metadata and contested line items into `public.core_adjustments`.
+1. **Cross-Source Business Key Deduplication**:
+   - Reconciles adjustments across sheet and portal submissions on composite key `(partner_phone, vehicle_number, adjustment_date, amount, adjustment_type)`. When matches occur across sources, the master row is merged (`data_source = 'MERGED'`) without inflating driver Hisaab ledgers.
+2. **Gapless Continuous Sequencing**:
+   - Primary key defined as `id BIGINT PRIMARY KEY`. Employs transactional advisory lock `pg_advisory_xact_lock(777333444)` and explicit `UPDATE` / zero-burn inserts, completely halting the sequence burn (>13.4M IDs).
+3. **NULL Phone Duplication Protection**:
+   - Unique composite index `uq_sheet_adjustments_dedup` on `(submission_timestamp, COALESCE(partner_phone, 'NO_PHONE'), adjustment_date, adjustment_type)` prevents repeated script syncs from inserting duplicate NULL-phone rows.
+4. **Pure IST Timestamp Contract**:
+   - Timestamps stored as `TIMESTAMP WITHOUT TIME ZONE` in Indian Standard Time (`(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`).
+5. **Multi-Level Approvals & Contested Line Items**:
+   - Preserves `first_level_approver`, `final_level_approver`, `current_approver_id`, and `approved_by` across both sheet and web portal flows.
+6. **Credential Security**:
+   - Database credentials sanitized and retrieved via `PropertiesService.getScriptProperties()`.
 
 ---
 
 ## Target Database Schema
 
-- **Host**: `35.200.196.113:5432`
+- **Host**: `YOUR_DB_HOST_HERE:5432`
 - **Database**: `postgres`
 - **Staging Table**: `public.sheet_adjustments`
 - **Master Table**: `public.core_adjustments`
+- **Active Master View**: `public.active_core_adjustments`
 - **Consolidation Function**: `public.refresh_core_adjustments()`
 
 ---
 
-## Deployment Instructions
+## Deployment & Verification Instructions
 
-1. **Database DDL**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database.
+1. **Database DDL**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database:
+   ```bash
+   psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+   ```
 2. **Apps Script Setup**:
-   - Open the target Google Sheet (`Pan India Master Sheet` or dedicated response sheet).
+   - Open the target Google Sheet.
    - Go to **Extensions** $\to$ **Apps Script**.
+   - Navigate to **Project Settings** (⚙️) $\to$ **Script Properties** and configure `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
    - Paste the code from [`adjustments_pipeline_appscript.js`](./adjustments_pipeline_appscript.js).
-   - Set up an **On Form Submit** installable trigger pointing to `handleOnFormSubmit`.
-   - Set up a **Time-Driven** hourly trigger pointing to `syncAllAdjustments`.
+   - Run `setupTriggers` to register live On-Edit / Form-Submit and hourly reconciliation triggers.
+
+3. **Verification Queries**:
+   ```sql
+   -- Verify source distribution
+   SELECT data_source, count(*), sum(amount) AS total_amount
+   FROM public.core_adjustments 
+   GROUP BY data_source;
+
+   -- Check for zero duplicate adjustment entries
+   SELECT partner_phone, vehicle_number, adjustment_date, amount, adjustment_type, count(*)
+   FROM public.core_adjustments
+   WHERE is_deleted = FALSE 
+     AND partner_phone IS NOT NULL AND partner_phone != ''
+     AND vehicle_number IS NOT NULL AND vehicle_number != ''
+   GROUP BY partner_phone, vehicle_number, adjustment_date, amount, adjustment_type
+   HAVING count(*) > 1;
+
+   -- Check gapless IDs
+   SELECT count(*), max(id), max(id) - count(*) AS gap
+   FROM public.core_adjustments;
+   ```

@@ -6,7 +6,7 @@
  * Source Sheet : 'Accident vehicle report' (Raw Form Responses)
  * Target Sheet : 'sheet_accidents' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_accidents & public.core_accidents
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * 
  * Features:
  *  - Dual Ingestion: Populates standardized 'sheet_accidents' tab AND PostgreSQL database
@@ -327,9 +327,9 @@ function formatRecordForSheet(r, nowStr) {
     r.driver_name || "",
     r.driver_partner_id || "",
     r.vehicle_rfd_date || "",
-    r.total_invoice,
-    r.liability_amount,
-    r.letzryd_share,
+    r.total_invoice !== null && r.total_invoice !== undefined ? r.total_invoice : "",
+    r.liability_amount !== null && r.liability_amount !== undefined ? r.liability_amount : "",
+    r.letzryd_share !== null && r.letzryd_share !== undefined ? r.letzryd_share : "",
     r.accident_photos_link || "",
     r.invoice_letter_link || "",
     r.incident_remarks || "",
@@ -677,10 +677,7 @@ function syncAllAccidents() {
 function setupTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
-    var fnName = triggers[i].getHandlerFunction();
-    if (fnName === "syncRecentAccidents" || fnName === "handleOnEdit" || fnName === "handleOnFormSubmit") {
-      ScriptApp.deleteTrigger(triggers[i]);
-    }
+    ScriptApp.deleteTrigger(triggers[i]);
   }
 
   ScriptApp.newTrigger("syncRecentAccidents")

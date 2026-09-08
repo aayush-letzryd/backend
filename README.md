@@ -15,7 +15,7 @@ This repository hosts production scripts, architecture specifications, database 
   - [`README.md`](./Walkin%20Form%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document detailing architecture, working processes, schema DDL, the 12 audit bug fixes, deployment runbook, and operational SQL queries.
   - [`schema.sql`](./Walkin%20Form%20Google%20Sheet/schema.sql): PostgreSQL Data Definition Language (DDL) for `public.sheet_walkins`, composite unique constraints, B-Tree performance indexes, and sample operational queries.
   - [`data_issues.md`](./Walkin%20Form%20Google%20Sheet/data_issues.md): Comprehensive data quality audit documenting all 24 identified anomalies (ISS-01 through ISS-24) and their exact standardization implementations.
-- **Target Table**: `public.sheet_walkins` $\to$ `public.core_walkins`
+- **Target Table**: `public.sheet_walkins` $\to$ `public.core_walkin`
 
 ---
 
@@ -96,9 +96,47 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 9. [Walkin Final Table](./Walkin%20Final%20Table/)
+- **Description**: Real-time unified master single source of truth (`public.core_walkin`) combining driver and partner walk-in event records from Google Sheets (`sheet_walkins`) and web portal systems (`july_new_walkins` and `july_existing_walkins`).
+- **Key Files**:
+  - [`schema.sql`](./Walkin%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_walkin`, indexes, and 3 automated PostgreSQL triggers for real-time synchronization (<10ms).
+  - [`automation_script.py`](./Walkin%20Final%20Table/automation_script.py): Parameterized Python engine for initial idempotent backfill, health auditing, and reconciliation.
+  - [`data_issues.md`](./Walkin%20Final%20Table/data_issues.md): Comprehensive data quality catalog (ISS-01 to ISS-06) documenting form-level anomalies and ops recommendations.
+  - [`README.md`](./Walkin%20Final%20Table/README.md): Exhaustive architecture documentation, trigger mapping matrix, and operational commands.
+- **Target Table**: `public.core_walkin` (PostgreSQL)
+- **Primary Features**:
+  - Zero changes to source tables (`sheet_walkins`, `july_new_walkins`, `july_existing_walkins` remain untouched)
+  - Native PostgreSQL triggers providing instant live synchronization (<10ms)
+  - Gapless sequential primary key (`id` allocated via transactional advisory lock `pg_advisory_xact_lock` guaranteeing continuous 1..N IDs without sequence jumps)
+  - Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = CURRENT_TIMESTAMP` upon source deletions, maintaining gapless IDs and audit history)
+  - 100% event log preservation (all walk-in records preserved with full fidelity and source attribution)
+  - Functional standardization of cities (`Bengaluru`, `Hyderabad`, `Mumbai`) and 10-digit mobile numbers
+  - Verbatim pass-through of names, remarks, and Aadhaar numbers without altering raw inputs
+  - Future-proof schema evolution guide and semi-structured metadata storage via `extra_attributes JSONB`
+
+---
+
+### 10. [Vehicle Onboarding Final Table](./Vehicle%20Onboarding%20Final%20Table/)
+- **Description**: Real-time unified master Single Source of Truth (`public.core_vehicle_onboarding`) merging Google Sheets fleet onboarding (`sheet_vehicle_onboarding`) and LetzRyd Web Portal Intake Form (`july_vehicle_onboarding`) with deterministic Portal Priority.
+- **Key Files**:
+  - [`schema.sql`](./Vehicle%20Onboarding%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_vehicle_onboarding`, indexes, and dual triggers for live bi-directional sync (<10ms).
+  - [`automation_script.py`](./Vehicle%20Onboarding%20Final%20Table/automation_script.py): Parameterized Python engine for initial backfill, reconciliation, and automated health audits.
+  - [`data_issues.md`](./Vehicle%20Onboarding%20Final%20Table/data_issues.md): Comprehensive data quality catalog (ISS-01 to ISS-05) documenting plate formatting, VIN lengths, city variants, and ops recommendations.
+  - [`README.md`](./Vehicle%20Onboarding%20Final%20Table/README.md): Exhaustive engineering blueprint, architecture diagram, and operational runbook.
+- **Target Table**: `public.core_vehicle_onboarding` (PostgreSQL)
+- **Primary Features**:
+  - Single Source of Truth on `registration_no` (Standardized vehicle plate)
+  - Deterministic Portal Priority: Portal submissions take precedence for core vehicle data while Google Sheet records enrich non-conflicting operational fields
+  - Gapless sequential primary key (`id` allocated via advisory lock `pg_advisory_xact_lock(777999111)`)
+  - Permanent Archival & Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = NOW()`)
+  - Clean IST timestamps without `+05:30` offset confusion
+  - Partial unique indexes and performance query indexes
+
+---
+
 ## Infrastructure Overview
 
-- **Primary Database Host**: `35.200.196.113:5432`
+- **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
 - **Database Engine**: PostgreSQL 14+
 - **Default Database**: `postgres`
 - **Architecture**: Decoupled ingestion layers utilizing Google Apps Script JDBC, FastAPI microservices, and PostgreSQL persistence.

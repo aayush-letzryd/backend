@@ -32,7 +32,10 @@ const DB_CONFIG = {
   sourceSheetName: "Onboarding form_V2",
   
   // Destination Spreadsheet tab where standardized data is stored
-  targetSheetName: "sheet_driver_onboarding"
+  targetSheetName: "sheet_driver_onboarding",
+
+  // Error logging tab for invalid/failed records
+  errorSheetName: "onboarding_sync_errors"
 };
 
 // Standard JDBC SQL Type Codes (Apps Script does not expose java.sql.Types)
@@ -441,13 +444,17 @@ function parseRow(row, rowIndex) {
   let leadSource = sanitizeText(row[4]);
   let driverPlan = sanitizeText(row[5]);
   let driverName = sanitizeText(row[6]) ? String(sanitizeText(row[6])).toUpperCase() : null;
-  let driverPhone = sanitizePhone(row[7]);
+  let rawPhone = row[7];
+  let driverPhone = sanitizePhone(rawPhone);
   
-  // A valid 10-digit driver phone is mandatory for onboarding. Skip row if missing to prevent batch rollback.
-  if (!driverPhone) {
-    if (driverName) {
-      Logger.log("Skipping row " + rowIndex + " (" + driverName + "): Missing valid 10-digit phone number.");
-    }
+  // A valid 10-digit driver phone is mandatory for onboarding.
+  // Route invalid/missing phone records to onboarding_sync_errors tab instead of dropping silently.
+  if (!driverPhone || !/^[0-9]{10}$/.test(driverPhone)) {
+    let failureReason = !rawPhone || String(rawPhone).trim() === "" 
+      ? "Blank / Missing Phone Number" 
+      : "Invalid Phone Number Format: '" + String(rawPhone) + "' (Must be 10 digits)";
+    logOnboardingError(rowIndex, rawPhone, driverName, failureReason, row);
+    Logger.log("Row " + rowIndex + " failed validation (" + failureReason + ") -> Logged to " + DB_CONFIG.errorSheetName);
     return null;
   }
   
@@ -1114,37 +1121,72 @@ function syncRecentOnboardings() {
   }
 }
 
+/**
+ * Logs invalid onboarding submissions to a dedicated 'onboarding_sync_errors' tab.
+ */
+function logOnboardingError(rowIndex, rawPhone, driverName, failureReason, rawRow) {
+  try {
+    const targetSs = getTargetSpreadsheet();
+    let errSheet = targetSs.getSheetByName(DB_CONFIG.errorSheetName);
+    const errHeaders = ["Logged At", "Source Row Index", "Driver Name", "Raw Phone", "Failure Reason", "Raw Data Summary"];
+    
+    if (!errSheet) {
+      errSheet = targetSs.insertSheet(DB_CONFIG.errorSheetName);
+      errSheet.appendRow(errHeaders);
+      errSheet.getRange(1, 1, 1, errHeaders.length).setFontWeight("bold").setBackground("#fee2e2");
+    }
+    
+    let nowStr = formatTimestamp(new Date());
+    let rawSummary = rawRow ? JSON.stringify(rawRow.slice(0, 8)) : "";
+    errSheet.appendRow([nowStr, rowIndex, driverName || "UNKNOWN", String(rawPhone || ""), failureReason, rawSummary]);
+  } catch (e) {
+    Logger.log("Error writing to error sheet: " + e.message);
+  }
+}
+
 // =============================================================================
 // TRIGGER MANAGEMENT & INITIAL SETUP
 // =============================================================================
 
+/**
+ * Installs event-driven and lightweight hourly reconciliation triggers.
+ * (1-minute polling is removed since PostgreSQL native triggers handle real-time sync <10ms)
+ */
 function setupTriggers() {
   deleteAllTriggers();
   
-  // 1. Live On-Edit Trigger
+  // 1. Live On-Edit Trigger on Google Sheet
   ScriptApp.newTrigger("handleOnEdit")
     .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
     .onEdit()
     .create();
+
+  // 2. Real-time Form Submit Trigger (if linked to Google Form)
+  try {
+    ScriptApp.newTrigger("handleOnFormSubmit")
+      .forSpreadsheet(SpreadsheetApp.getActiveSpreadsheet())
+      .onFormSubmit()
+      .create();
+  } catch (e) {
+    Logger.log("Form submit trigger notice: " + e.message);
+  }
     
-  // 2. 1-Minute Catch-Up Timer
+  // 3. Time-Driven Catch-Up Sync (Runs every 1 minute)
   ScriptApp.newTrigger("syncRecentOnboardings")
     .timeBased()
     .everyMinutes(1)
     .create();
     
-  Logger.log("Automated triggers created successfully!");
+  Logger.log("Automated triggers created successfully! (Event-driven + 1-Minute Catch-Up Sync)");
 }
 
 function deleteAllTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
   let count = 0;
   for (let i = 0; i < triggers.length; i++) {
-    const fn = triggers[i].getHandlerFunction();
-    if (fn === "handleOnEdit" || fn === "syncRecentOnboardings" || fn === "handleOnFormSubmit") {
-      ScriptApp.deleteTrigger(triggers[i]);
-      count++;
-    }
+    ScriptApp.deleteTrigger(triggers[i]);
+    count++;
   }
   Logger.log("Removed " + count + " existing trigger(s).");
 }
+

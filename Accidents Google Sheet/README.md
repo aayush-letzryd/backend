@@ -8,44 +8,72 @@ Real-time and batch synchronization engine bridging vehicle accident reports fro
 
 ```mermaid
 graph TD
-    A[Google Form / Response Sheet\n'Accident vehicle report'] -->|On-FormSubmit & Time-Driven Trigger| B[Google Apps Script\naccidents_pipeline_appscript.js]
+    A[Google Form / Response Sheet\n'Accident vehicle report'] -->|On-FormSubmit & On-Edit| B[Google Apps Script\naccidents_pipeline_appscript.js]
     B -->|JDBC Batch Upsert with Standardizations| C[(PostgreSQL Staging\npublic.sheet_accidents)]
     D[Web Portal Form\njuly_accidents_registry] -->|Portal Submissions| E[(PostgreSQL Portal Table\npublic.july_accidents_registry)]
-    C -->|Trigger: trg_sheet_accidents_refresh| F[Procedure: refresh_core_accidents]
-    E -->|Automated Consolidation| F
-    F -->|Master Deduped Table| G[(Production Master\npublic.core_accidents)]
+    C -->|Trigger: trg_sheet_accidents_sync\nAdvisory Lock 777222333| G[(Production Master\npublic.core_accidents)]
+    E -->|Trigger: trg_july_accidents_registry_sync\nAdvisory Lock 777222333| G
+    G -->|is_deleted = FALSE| H[Active Master View:\npublic.active_core_accidents]
 ```
 
 ---
 
-## Standardizations & Features (ACC-01 to ACC-10)
+## Key Guarantees & V2 Audit Enhancements
 
-1. **Vehicle Number Sanitization (ACC-01)**: Normalizes vehicle numbers to standard uppercase alphanumeric pattern without hyphens or spaces (`MH03ES1189`).
-2. **Canonical City Codes (ACC-02)**: Converts all city variations to 3-letter uppercase codes (`BLR`, `HYD`, `MUM`, `DEL`, `CHN`, `PUN`).
-3. **Excel Serial Date Parsing (ACC-03)**: Automatically converts float serial dates (e.g. `45707.42965`) into ISO-8601 timestamps and dates.
-4. **Police Status Consolidation (ACC-04)**: Unifies fragmented police columns (`Police Acknowledgement [Yes]`, `Police Acknowledgement [NO]`, `Police Acknowledgement`) into a single boolean `police_acknowledgement`.
-5. **Driver Entity Resolution (ACC-07)**: Links vehicle allocation master history to backfill missing Partner IDs (`LETZ<CITY><PHONE>`).
-6. **Financial Sanitization (ACC-06)**: Cleanses currency symbols and commas, parsing valid `NUMERIC(12,2)` amounts.
-7. **Leak-Proof Resource Management**: Explicit `try-catch-finally` closing JDBC statements and connections.
+1. **Cross-Source Deduplication & Claim Preservation**:
+   - Reconciles sheet and portal submissions on matching `(vehicle_number, accident_date)`. When reports arrive from both sources for the same accident, portal inspection records overlay onto sheet claims and mark `data_source = 'MERGED'` without creating duplicate rows.
+2. **Gapless Continuous Sequencing**:
+   - Primary key is `id BIGINT PRIMARY KEY`. Ingestion uses transactional advisory locking (`pg_advisory_xact_lock(777222333)`) and explicit `UPDATE` for existing records, completely eliminating sequence burning.
+3. **Multi-Angle Inspection Photo Preservation**:
+   - Replaced single `COALESCE` with `fn_combine_portal_photos` (`CONCAT_WS(',', front, back, right, left)`), preserving all 4 inspection angles.
+4. **Pure IST Timestamp Contract**:
+   - Timestamps stored as `TIMESTAMP WITHOUT TIME ZONE` in Indian Standard Time (`(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`).
+5. **Accounting Precision (0.00 vs NULL)**:
+   - Financial columns (`total_invoice`, `liability_amount`, `letzryd_share`) preserve `NULL` for unassessed/unbilled claims and write `0.00` only when zero is explicitly recorded.
+6. **Credential Security**:
+   - Hardcoded database passwords removed in favor of `PropertiesService.getScriptProperties()`.
 
 ---
 
 ## Target Database Schema
 
-- **Host**: `35.200.196.113:5432`
+- **Host**: `YOUR_DB_HOST_HERE:5432`
 - **Database**: `postgres`
 - **Staging Table**: `public.sheet_accidents`
 - **Master Table**: `public.core_accidents`
+- **Active Master View**: `public.active_core_accidents`
 - **Consolidation Function**: `public.refresh_core_accidents()`
 
 ---
 
-## Deployment Instructions
+## Deployment & Verification Instructions
 
-1. **Database DDL**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database.
+1. **Database DDL**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database:
+   ```bash
+   psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+   ```
 2. **Apps Script Setup**:
-   - Open the target Google Sheet (`WIP- Pan India` or dedicated response sheet).
+   - Open the target Google Sheet.
    - Go to **Extensions** $\to$ **Apps Script**.
+   - Navigate to **Project Settings** (⚙️) $\to$ **Script Properties** and configure `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
    - Paste the code from [`accidents_pipeline_appscript.js`](./accidents_pipeline_appscript.js).
-   - Set up an **On Form Submit** installable trigger pointing to `handleOnFormSubmit`.
-   - Set up a **Time-Driven** hourly trigger pointing to `syncAllAccidents`.
+   - Run `setupTriggers` to register live On-Edit / Form-Submit and hourly reconciliation triggers.
+
+3. **Verification Queries**:
+   ```sql
+   -- Verify source distribution
+   SELECT data_source, count(*) 
+   FROM public.core_accidents 
+   GROUP BY data_source;
+
+   -- Check for zero duplicate vehicle + accident date rows
+   SELECT vehicle_number, accident_date, count(*)
+   FROM public.core_accidents
+   WHERE is_deleted = FALSE
+   GROUP BY vehicle_number, accident_date
+   HAVING count(*) > 1;
+
+   -- Check gapless IDs
+   SELECT count(*), max(id), max(id) - count(*) AS gap
+   FROM public.core_accidents;
+   ```
