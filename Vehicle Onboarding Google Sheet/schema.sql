@@ -4,7 +4,7 @@
 -- Target Database: postgres
 -- Target Schema  : public
 -- Target Table   : sheet_vehicle_onboarding
--- Host           : YOUR_DB_HOST_HERE:5432
+-- Host           : 35.200.196.113:5432
 -- Description    : Central master table storing real-time vehicle onboarding data
 --                  synced from Google Sheets (tab: Unified_Vehicle_onboarding_source).
 -- =============================================================================
@@ -76,7 +76,8 @@ CREATE TABLE IF NOT EXISTS public.sheet_vehicle_onboarding (
     kms_reading NUMERIC(10, 2),
     fast_tag_image_from_inside TEXT,
     music_system_image TEXT,
-    key_quantity TEXT,
+    key_quantity VARCHAR(50),
+    key_photo_url TEXT,
     rh_fr_tyre_brand_sl_no TEXT,
     lh_fr_tyre_brand_sl_no TEXT,
     rh_rear_tyre_brand_sl_no TEXT,
@@ -95,8 +96,9 @@ CREATE TABLE IF NOT EXISTS public.sheet_vehicle_onboarding (
     cng_plate VARCHAR(255),
     cng_installation_date DATE,
     
-    -- Metadata & Row Traceability
+    -- Metadata, Traceability & Exception Queue Flags
     sheet_row_number INTEGER,
+    chassis_review_flag BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     
@@ -125,3 +127,6 @@ CREATE INDEX IF NOT EXISTS idx_sheet_vehicle_pdi_status
 
 CREATE INDEX IF NOT EXISTS idx_sheet_vehicle_delivery_date 
     ON public.sheet_vehicle_onboarding (delivery_date DESC);
+
+CREATE INDEX IF NOT EXISTS idx_sheet_vehicle_chassis_flag 
+    ON public.sheet_vehicle_onboarding (chassis_review_flag);

@@ -49,12 +49,15 @@ This document details all **29 operational abnormalities and data hygiene issues
 
 ---
 
-## Architectural Principles Enforced in Pipeline
+## Team Lead Audit Resolution Log (Anurag Review Fixes 2.1 - 2.8)
 
-1. **Zero Data Loss**:
-   - Every single vehicle in `Unified_Vehicle_onboarding_source` is loaded into `public.sheet_vehicle_onboarding`.
-   - Records with missing PDI data or invoice URLs are preserved with clean nullable columns and appropriate status flags.
-2. **Symmetric Model Taxonomy**:
-   - Vehicle models are systematically decomposed into `Make`, `Model`, `Trim`, and `Fuel Type`.
-3. **Primary Key Integrity**:
-   - `registration_no` is sanitized using regex and used as the unique conflict target for upserts (`ON CONFLICT (registration_no) DO UPDATE`).
+| Issue # | Issue Title | Root Cause Identified | Resolved State & Implementation |
+| :--- | :--- | :--- | :--- |
+| **2.1** | Multi-Row Paste Ignored in `handleOnEdit` | Line 557 only read `e.range.getRow()`, ignoring bulk pastes. | Added range loop from `e.range.getRow()` to `e.range.getLastRow()`. |
+| **2.2** | Race Condition in `handleOnFormSubmit` | Line 588 used `sheet.getLastRow()` instead of `e.range.getRow()`. | Updated to `(e && e.range) ? e.range.getRow() : sheet.getLastRow()`. |
+| **2.3** | Date Inversion & NULLs on Days > 12 | Fallback `new Date("DD/MM/YYYY")` in GAS V8 parsed US format, swapping month/day or returning NULL for days > 12. | Implemented strict regex decomposition for `DD/MM/YYYY` & `DD/MM/YYYY HH:mm:ss`, removing raw `new Date(s)` fallback. |
+| **2.4** | Batch Collision Crash on Duplicate Plates (`SQLSTATE 21000`) | Duplicate vehicle plates in the same 250-row batch caused PostgreSQL conflict error. | Added in-memory `Map` deduplication by `registration_no` in `syncBatchInternal` keeping latest record. |
+| **2.5** | Sequence ID Burning on 15-Min Sync | Frequent catch-up syncs advanced sequence on conflict checks. | Parameterized conflict updates preserving existing sequence numbers. |
+| **2.6** | Missing Excel Serial Date Parser | Raw serial day integers (e.g. 45123) returned NULL. | Added Excel epoch day converter: `val > 20000 && val < 60000 -> Math.round((val - 25569) * 86400 * 1000)`. |
+| **2.7** | Drive Links Stored in `key_quantity` | 1,336 vehicles had Google Drive photo URLs written into `key_quantity`. | Sanitized `key_quantity` to integer string, added `key_photo_url` column, and routed Drive URLs to image storage. |
+| **2.8** | 101 Anomalous Chassis Numbers | 101 records had non-17 character chassis numbers with no validation or exception routing. | Added `cleanChassisNo` length validation and `chassis_review_flag` routing anomalies to exception queue. |

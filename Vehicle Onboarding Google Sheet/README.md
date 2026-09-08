@@ -1,6 +1,6 @@
 # LetzRyd Vehicle Onboarding Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `YOUR_DB_HOST_HERE:5432`  
+Target Database: `35.200.196.113:5432`  
 Database Name: `postgres`  
 Target Table: `public.sheet_vehicle_onboarding`  
 Source Spreadsheet: `Vehicle_Onboarding Table source`  
@@ -23,8 +23,7 @@ This pipeline unifies all 3 sources into a **73-column master tabular model**, r
 
 ### Primary System Guarantees
 - **Zero Data Loss Rule**: 100% of the 1,619 vehicle fleet is preserved with full attribution. Legacy fleet records without digital PDI forms or missing invoices are preserved with clean nullable flags.
-- **True Natural Primary Key**: Keyed on normalized uppercase alphanumeric **`registration_no`** (e.g. `KA05AP6032`), matching Column F (`vehicle_number (Plate)`), guaranteeing 100% unique entity resolution and idempotent `ON CONFLICT (registration_no) DO UPDATE` upserts.
-- **Clean Sequential ID Alignment**: Internal PostgreSQL sequence `id BIGSERIAL` starts at **`1`** and ends at **`1,619`** (strictly continuous, matching `sl` entry index with 0 sequence jumps/gaps).
+- **True Natural Primary Key**: Keyed on normalized uppercase alphanumeric **`registration_no`** (e.g. `KA05AP6032`), guaranteeing 100% unique entity resolution and idempotent `ON CONFLICT (registration_no) DO UPDATE` upserts.
 - **Sub-Second Live Synchronization**: Event-driven `handleOnEdit` and `handleOnFormSubmit` triggers propagate cell edits and form submissions to PostgreSQL in **< 1 second**.
 - **Batch Processing Resilience**: Bulk backfills process in **250-row chunks** with transaction rollbacks (`conn.rollback()`), bypassing Apps Script execution timeouts.
 - **Connection Leak-Proof**: Exhaustive `try-catch-finally` resource management ensuring all JDBC connections and prepared statements close gracefully under all failure modes.
@@ -55,7 +54,7 @@ flowchart TD
         E3 --> S
     end
 
-    subgraph Database Layer ["PostgreSQL Central Database (YOUR_DB_HOST_HERE:5432)"]
+    subgraph Database Layer ["PostgreSQL Central Database (35.200.196.113:5432)"]
         S -->|JDBC PreparedStatement Upsert| DB[("public.sheet_vehicle_onboarding<br>PK: registration_no<br>73 Standardized Columns")]
     end
 ```
@@ -79,7 +78,7 @@ flowchart TD
 -- ==============================================================================
 -- LETZRYD VEHICLE ONBOARDING MASTER TABLE DDL
 -- Target Table: public.sheet_vehicle_onboarding
--- Host: YOUR_DB_HOST_HERE:5432 | DB: postgres
+-- Host: 35.200.196.113:5432 | DB: postgres
 -- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS public.sheet_vehicle_onboarding (
@@ -200,7 +199,7 @@ CREATE INDEX IF NOT EXISTS idx_veh_onb_fitness ON public.sheet_vehicle_onboardin
 ### Step 1: Database Setup
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
 ```
 
 ### Step 2: Google Apps Script Setup
