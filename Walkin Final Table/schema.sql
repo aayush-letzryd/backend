@@ -51,7 +51,7 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     first_name VARCHAR(100),
     last_name VARCHAR(100),
     phone_number VARCHAR(20) NOT NULL,
-    partner_role VARCHAR(50) DEFAULT 'Driver',
+    partner_role VARCHAR(100) DEFAULT 'Driver',
     
     -- KYC & Documents
     dl_number VARCHAR(100),
