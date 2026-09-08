@@ -26,11 +26,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "YOUR_DB_HOST_HERE",
+  host: "35.200.196.113",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "YOUR_DB_PASSWORD_HERE",
+  password: "8S5]U3@L^Xz)\\FH}",
   
   // Target spreadsheet URL:
   sheetUrl: "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
@@ -708,11 +708,10 @@ function syncBatchInternal(limitRows, customStartRow) {
 
     Logger.log("Sync Complete. Successfully synced " + successCount + " vehicles to Postgres.");
     try {
-      SpreadsheetApp.getUi().alert(
-        "Sync Complete",
-        "Successfully synced " + successCount + " vehicles to Postgres.\nSkipped: " + skippedCount,
-        SpreadsheetApp.getUi().ButtonSet.OK
-      );
+      const activeSs = SpreadsheetApp.getActiveSpreadsheet();
+      if (activeSs) {
+        activeSs.toast("Successfully synced " + successCount + " vehicles to Postgres.", "Sync Complete", 5);
+      }
     } catch(e) {}
   } catch (err) {
     if (conn) {
@@ -720,11 +719,10 @@ function syncBatchInternal(limitRows, customStartRow) {
     }
     Logger.log("Sync Failed: " + err.message);
     try {
-      SpreadsheetApp.getUi().alert(
-        "Sync Failed",
-        "Error: " + err.message,
-        SpreadsheetApp.getUi().ButtonSet.OK
-      );
+      const activeSs = SpreadsheetApp.getActiveSpreadsheet();
+      if (activeSs) {
+        activeSs.toast("Error: " + err.message, "Sync Failed", 8);
+      }
     } catch(e) {}
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
@@ -863,11 +861,10 @@ function setupTriggers() {
 
   Logger.log("Automated triggers installed successfully.");
   try {
-    SpreadsheetApp.getUi().alert(
-      "Triggers Installed",
-      "Automated onEdit, onFormSubmit, and hourly multi-source sync triggers have been installed.",
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    const activeSs = SpreadsheetApp.getActiveSpreadsheet();
+    if (activeSs) {
+      activeSs.toast("Automated onEdit, onFormSubmit, and hourly multi-source sync triggers have been installed.", "Triggers Installed", 5);
+    }
   } catch(e) {}
 }
 
