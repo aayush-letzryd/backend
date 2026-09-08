@@ -8,31 +8,50 @@
  * Source Sheet : 'Traffic Challan details' (38 Weekly & Monthly Tabs)
  * 
  * Key Features & Audit Fixes:
- *  - Fix 3.1: Unique composite synthetic notice numbers (NOT-{plate}-{date}-{time}-{row})
+ *  - Fix 3.1: Deterministic MD5 synthetic notice numbers (NOT-{plate}-{date}-{time}-{hash})
  *  - Fix 3.2: Programmatic active week tab resolver in headless background triggers
  *  - Fix 3.3: 12-Hour AM/PM time parser with 24-hour ISO conversion (HH:mm:ss)
  *  - Fix 3.4: Shifted fine amount extraction from leaked city columns
- *  - Fix 3.5: Multi-tab checkpointing via PropertiesService to prevent 6-min quota timeouts
- *  - Fix 3.6: Multi-row paste range iteration support in handleOnEdit
+ *  - Fix 3.5: Multi-tab checkpointing & 4.5-min timer auto-chaining to prevent quota timeouts
+ *  - Fix 3.6: Multi-row paste range iteration support with single JDBC connection in handleOnEdit
  *  - Fix 3.7: Safe trigger cleanup filtering specifically by handler function name
- *  - Fix 3.8: Sequence preservation on conflict upserts
+ *  - Fix 3.8: Zero sequence ID burning via CTE-based UPSERT (no sequence thrashing)
+ *  - Fix 3.9: Strict plate validation filtering out phantom liability rows ('TOTAL', 'REGNO')
+ *  - Fix 3.10: PropertiesService credential management & Concurrency script locks
  *  - Zero connection leaks (strict try-catch-finally on all JDBC resources)
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
-const DB_CONFIG = {
-  host: "35.200.196.113",
-  port: "5432",
-  database: "postgres",
-  user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
-  
-  // Master Spreadsheet URL:
-  sheetUrl: "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
-};
+function getDbConfig() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    host: props.getProperty("DB_HOST") || "35.200.196.113",
+    port: props.getProperty("DB_PORT") || "5432",
+    database: props.getProperty("DB_NAME") || "postgres",
+    user: props.getProperty("DB_USER") || "postgres",
+    password: props.getProperty("DB_PASSWORD") || "8S5]U3@L^Xz)\\FH}",
+    sheetUrl: props.getProperty("SHEET_URL") || "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
+  };
+}
 
-// Standard JDBC SQL Type Codes (Apps Script does not expose java.sql.Types)
+/**
+ * Run once manually to store credentials securely in Script Properties.
+ */
+function setupScriptProperties() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    "DB_HOST": "35.200.196.113",
+    "DB_PORT": "5432",
+    "DB_NAME": "postgres",
+    "DB_USER": "postgres",
+    "DB_PASSWORD": "8S5]U3@L^Xz)\\FH}",
+    "SHEET_URL": "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
+  });
+  Logger.log("Script properties set successfully.");
+}
+
+// Standard JDBC SQL Type Codes
 const SQL_TYPES = {
   VARCHAR: 12,
   DATE: 91,
@@ -47,9 +66,10 @@ const SQL_TYPES = {
  * Returns the target Spreadsheet instance.
  */
 function getTargetSpreadsheet() {
-  if (DB_CONFIG.sheetUrl && DB_CONFIG.sheetUrl.trim() !== "") {
+  const config = getDbConfig();
+  if (config.sheetUrl && config.sheetUrl.trim() !== "") {
     try {
-      return SpreadsheetApp.openByUrl(DB_CONFIG.sheetUrl);
+      return SpreadsheetApp.openByUrl(config.sheetUrl);
     } catch(e) {
       Logger.log("openByUrl error, falling back to active spreadsheet: " + e.message);
     }
@@ -68,6 +88,7 @@ function onOpen() {
       .addItem("Sync Current Active Tab", "syncCurrentWeekTab")
       .addSeparator()
       .addItem("Test Database Connection", "testDbConnection")
+      .addItem("Initialize Script Properties", "setupScriptProperties")
       .addSeparator()
       .addItem("Install Automated Triggers", "setupTriggers")
       .addItem("Remove Automated Triggers", "deleteAllTriggers")
@@ -81,14 +102,16 @@ function onOpen() {
  * Returns an active JDBC PostgreSQL connection.
  */
 function getDbConnection() {
-  const url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
-  return Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
+  const config = getDbConfig();
+  const url = "jdbc:postgresql://" + config.host + ":" + config.port + "/" + config.database;
+  return Jdbc.getConnection(url, config.user, config.password);
 }
 
 /**
  * Test DB Connection utility with leak-proof cleanup.
  */
 function testDbConnection() {
+  const config = getDbConfig();
   let conn = null;
   let stmt = null;
   let rs = null;
@@ -103,7 +126,7 @@ function testDbConnection() {
     try {
       SpreadsheetApp.getUi().alert(
         "Connection Successful",
-        "Connected to PostgreSQL on " + DB_CONFIG.host + ".\nCurrent rows in sheet_challans: " + count,
+        "Connected to PostgreSQL on " + config.host + ".\nCurrent rows in sheet_challans: " + count,
         SpreadsheetApp.getUi().ButtonSet.OK
       );
     } catch(e) {}
@@ -131,12 +154,27 @@ function cleanStr(val) {
   return (s === "" || s.toLowerCase() === "nan" || s.toLowerCase() === "null" || s === "-" || s === "--" || s.toLowerCase() === "na" || s.toLowerCase() === "#n/a") ? null : s;
 }
 
-// Vehicle Plate: Uppercase, remove non-alphanumeric
+// Vehicle Plate: Uppercase, remove non-alphanumeric, filter out summaries & totals
 function cleanPlate(val) {
   const s = cleanStr(val);
   if (!s) return null;
-  const plate = s.toUpperCase().replace(/[^A-Z0-9]/g, "");
-  return (plate.length >= 8 && plate.length <= 12) ? plate : (plate.length >= 4 ? plate : null);
+  const upper = s.toUpperCase().trim();
+  
+  // Reject summaries and header terms
+  const blockedKeywords = ['TOTAL', 'REGNO', 'REG NO', 'BALANCE', 'TOTAL AMOUNT', 'GRAND TOTAL', 'SL', 'VEHICLE NO', 'VEHICLE NUMBER', 'SUBTOTAL', 'PENDING', 'TOTAL PENDING'];
+  for (let i = 0; i < blockedKeywords.length; i++) {
+    if (upper === blockedKeywords[i] || upper.startsWith('TOTAL')) return null;
+  }
+
+  const plate = upper.replace(/[^A-Z0-9]/g, "");
+  if (plate.length < 8 || plate.length > 12) return null;
+  
+  // Must match standard Indian vehicle registration regex pattern
+  if (!/^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$/.test(plate)) {
+    return null;
+  }
+  
+  return plate;
 }
 
 // City Normalization with plate prefix fallback (Fix 3.4: Shifted fine numbers detection)
@@ -147,10 +185,9 @@ function cleanCity(val, plate) {
     if (low.includes("hyd")) return "Hyderabad";
     if (low.includes("mum")) return "Mumbai";
     if (low.includes("blr") || low.includes("bang") || low.includes("beng")) return "Bangalore";
+    if (low.includes("pun")) return "Pune";
     // Check if numerical string leaked into city
-    if (!isNaN(parseFloat(s))) {
-      // Leaked number -> fallback to vehicle plate prefix
-    } else {
+    if (isNaN(parseFloat(s))) {
       return s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
     }
   }
@@ -179,12 +216,18 @@ function parseDate(val) {
   if (val === null || val === undefined) return null;
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return null;
+    const yr = val.getFullYear();
+    if (yr < 1950 || yr > 2100) return null;
     return Utilities.formatDate(val, "Asia/Kolkata", "yyyy-MM-dd");
   }
   
   if (typeof val === 'number' && val > 20000 && val < 60000) {
     const d = new Date(Math.round((val - 25569) * 86400 * 1000));
-    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    const yr = d.getFullYear();
+    if (yr >= 1950 && yr <= 2100) {
+      return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    }
+    return null;
   }
   
   const s = String(val).trim();
@@ -193,26 +236,37 @@ function parseDate(val) {
   if (/^\d{5}$/.test(s)) {
     const serial = parseInt(s, 10);
     const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
-    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    const yr = d.getFullYear();
+    if (yr >= 1950 && yr <= 2100) {
+      return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    }
+    return null;
   }
 
-  // DD/MM/YYYY or DD-MM-YYYY
-  const dmyMatch = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
+  // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
+  const dmyMatch = s.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
   if (dmyMatch) {
     const day = dmyMatch[1].padStart(2, "0");
     const month = dmyMatch[2].padStart(2, "0");
     let year = dmyMatch[3];
     if (year.length === 2) year = "20" + year;
-    return `${year}-${month}-${day}`;
+    const yr = parseInt(year, 10);
+    if (yr >= 1950 && yr <= 2100 && parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12) {
+      return `${yr}-${month}-${day}`;
+    }
+    return null;
   }
 
   // YYYY-MM-DD
   const isoMatch = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
   if (isoMatch) {
-    const year = isoMatch[1];
+    const year = parseInt(isoMatch[1], 10);
     const month = isoMatch[2].padStart(2, "0");
     const day = isoMatch[3].padStart(2, "0");
-    return `${year}-${month}-${day}`;
+    if (year >= 1950 && year <= 2100 && parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12) {
+      return `${year}-${month}-${day}`;
+    }
+    return null;
   }
 
   return null;
@@ -255,41 +309,68 @@ function parseTime(val) {
   return null;
 }
 
-// --- DATABASE UPSERT SQL ---
+/**
+ * Generates deterministic MD5-based synthetic notice number.
+ * (Fix 3.1: Fully deterministic notice ID across re-syncs, eliminating collisions)
+ */
+function generateDeterministicNoticeNo(regNo, vioDate, updDate, vioTime, fineAmt, weekCycle, sheetRowNum) {
+  const datePart = vioDate || updDate || "NODATE";
+  const timePart = vioTime ? vioTime.replace(/:/g, "") : "000000";
+  const payload = `${regNo}_${datePart}_${timePart}_${fineAmt}_${weekCycle}_${sheetRowNum}`;
+  const rawDigest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, payload);
+  let hex = "";
+  for (let i = 0; i < 4; i++) {
+    let b = rawDigest[i];
+    if (b < 0) b += 256;
+    let h = b.toString(16);
+    if (h.length === 1) h = "0" + h;
+    hex += h;
+  }
+  if (vioDate || fineAmt > 0) {
+    return `NOT-${regNo}-${datePart}-${timePart.substring(0, 4)}-${hex.toUpperCase()}`;
+  }
+  return `BAL-${regNo}-${datePart}-${hex.toUpperCase()}`;
+}
+
+// --- DATABASE CTE UPSERT SQL (ZERO SEQUENCE BURNING) ---
 const UPSERT_SQL = `
+WITH upd AS (
+  UPDATE public.sheet_challans
+  SET city = ?,
+      previous_balance = ?,
+      audit_date = CAST(? AS date),
+      notice_date = CAST(? AS date),
+      violation_date = CAST(? AS date),
+      violation_time = CAST(? AS time),
+      challan_amount = ?,
+      sticker_fine = ?,
+      amount_paid = ?,
+      total_pending = ?,
+      remarks = ?,
+      sheet_row_number = ?,
+      is_deleted = FALSE,
+      deleted_at = NULL,
+      updated_at = CURRENT_TIMESTAMP
+  WHERE vehicle_reg_no = ? AND notice_no = ? AND week_cycle = ?
+  RETURNING 1
+)
 INSERT INTO public.sheet_challans (
   vehicle_reg_no, notice_no, city, week_cycle,
   previous_balance, audit_date,
   notice_date, violation_date, violation_time,
   challan_amount, sticker_fine, amount_paid, total_pending, remarks,
-  source_tab, sheet_row_number, updated_at
-) VALUES (
-  ?, ?, ?, ?,
-  ?, CAST(? AS date),
-  CAST(? AS date), CAST(? AS date), CAST(? AS time),
-  ?, ?, ?, ?, ?,
-  ?, ?, CURRENT_TIMESTAMP
+  source_tab, sheet_row_number, is_deleted, updated_at
 )
-ON CONFLICT (vehicle_reg_no, notice_no, week_cycle) DO UPDATE SET
-  city = EXCLUDED.city,
-  previous_balance = EXCLUDED.previous_balance,
-  audit_date = EXCLUDED.audit_date,
-  notice_date = EXCLUDED.notice_date,
-  violation_date = EXCLUDED.violation_date,
-  violation_time = EXCLUDED.violation_time,
-  challan_amount = EXCLUDED.challan_amount,
-  sticker_fine = EXCLUDED.sticker_fine,
-  amount_paid = EXCLUDED.amount_paid,
-  total_pending = EXCLUDED.total_pending,
-  remarks = EXCLUDED.remarks,
-  sheet_row_number = EXCLUDED.sheet_row_number,
-  updated_at = CURRENT_TIMESTAMP;
+SELECT ?, ?, ?, ?,
+       ?, CAST(? AS date),
+       CAST(? AS date), CAST(? AS date), CAST(? AS time),
+       ?, ?, ?, ?, ?,
+       ?, ?, FALSE, CURRENT_TIMESTAMP
+WHERE NOT EXISTS (SELECT 1 FROM upd);
 `;
 
 /**
- * Binds row parameters to prepared statement.
- * (Fix 3.1: Unique synthetic notice identifier including violation time and sheet row number)
- * (Fix 3.4: Shifted fine amount extraction from city column)
+ * Binds row parameters to CTE prepared statement.
  */
 function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   const get = (key) => (colMap[key] && colMap[key] - 1 < row.length ? row[colMap[key] - 1] : null);
@@ -299,7 +380,6 @@ function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
 
   let fineAmt = cleanNum(get('fine_amount'));
   const rawCityVal = cleanStr(get('city'));
-  // Fix 3.4: If fine amount is 0 and a number was entered in city, extract it
   if (fineAmt === 0 && rawCityVal && !isNaN(parseFloat(rawCityVal))) {
     fineAmt = cleanNum(rawCityVal);
   }
@@ -317,33 +397,44 @@ function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   const city = cleanCity(get('city'), regNo);
   const remarks = cleanStr(get('remarks'));
 
-  // Fix 3.1: Guaranteed unique synthetic notice identifier preventing collisions
-  const timeSuffix = vioTime ? vioTime.replace(/:/g, "") : "0000";
-  const noticeNo = (vioDate || fineAmt > 0) 
-    ? `NOT-${regNo}-${vioDate || updDate || tabName}-${timeSuffix}-${rowNumber}`
-    : `BAL-${regNo}-${tabName}-${rowNumber}`;
+  const noticeNo = generateDeterministicNoticeNo(regNo, vioDate, updDate, vioTime, fineAmt, tabName, rowNumber);
 
   let p = 1;
-  pstmt.setString(p++, regNo); // 1. vehicle_reg_no
-  pstmt.setString(p++, noticeNo); // 2. notice_no
-  pstmt.setString(p++, city); // 3. city
-  pstmt.setString(p++, tabName); // 4. week_cycle
+  // --- UPDATE SET ---
+  pstmt.setString(p++, city); // 1
+  pstmt.setDouble(p++, prevBal); // 2
+  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 3
+  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
+  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
+  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 6
+  pstmt.setDouble(p++, fineAmt); // 7
+  pstmt.setDouble(p++, stkFine); // 8
+  pstmt.setDouble(p++, amtPaid); // 9
+  pstmt.setDouble(p++, totPend); // 10
+  pstmt.setString(p++, remarks); // 11
+  pstmt.setInt(p++, rowNumber); // 12
+  // --- UPDATE WHERE ---
+  pstmt.setString(p++, regNo); // 13
+  pstmt.setString(p++, noticeNo); // 14
+  pstmt.setString(p++, tabName); // 15
 
-  pstmt.setDouble(p++, prevBal); // 5. previous_balance
-  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6. audit_date
-
-  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 7. notice_date
-  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 8. violation_date
-  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 9. violation_time
-
-  pstmt.setDouble(p++, fineAmt); // 10. challan_amount
-  pstmt.setDouble(p++, stkFine); // 11. sticker_fine
-  pstmt.setDouble(p++, amtPaid); // 12. amount_paid
-  pstmt.setDouble(p++, totPend); // 13. total_pending
-  pstmt.setString(p++, remarks); // 14. remarks
-
-  pstmt.setString(p++, tabName); // 15. source_tab
-  pstmt.setInt(p++, rowNumber); // 16. sheet_row_number
+  // --- INSERT SELECT ---
+  pstmt.setString(p++, regNo); // 16
+  pstmt.setString(p++, noticeNo); // 17
+  pstmt.setString(p++, city); // 18
+  pstmt.setString(p++, tabName); // 19
+  pstmt.setDouble(p++, prevBal); // 20
+  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 21
+  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
+  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
+  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 24
+  pstmt.setDouble(p++, fineAmt); // 25
+  pstmt.setDouble(p++, stkFine); // 26
+  pstmt.setDouble(p++, amtPaid); // 27
+  pstmt.setDouble(p++, totPend); // 28
+  pstmt.setString(p++, remarks); // 29
+  pstmt.setString(p++, tabName); // 30
+  pstmt.setInt(p++, rowNumber); // 31
 
   return true;
 }
@@ -438,6 +529,12 @@ function syncSheetTab(sheet, conn, pstmt) {
  * (Fix 3.5: State Checkpointing via PropertiesService to prevent 6-minute execution quota timeouts)
  */
 function syncAllChallanTabs() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncAllChallanTabs skipped: Lock busy.");
+    return;
+  }
+
   const ss = getTargetSpreadsheet();
   const sheets = ss.getSheets();
   const props = PropertiesService.getScriptProperties();
@@ -445,11 +542,15 @@ function syncAllChallanTabs() {
   
   if (startTabIndex >= sheets.length) startTabIndex = 0;
 
+  const startTime = Date.now();
+  const MAX_EXEC_TIME_MS = 270000; // 4.5 minutes safety guard
+
   let conn = null;
   let pstmt = null;
   let totalSynced = 0;
   let totalSkipped = 0;
   let tabsProcessed = 0;
+  let executionYielded = false;
 
   try {
     conn = getDbConnection();
@@ -457,9 +558,21 @@ function syncAllChallanTabs() {
     pstmt = conn.prepareStatement(UPSERT_SQL);
 
     for (let i = startTabIndex; i < sheets.length; i++) {
+      if (Date.now() - startTime > MAX_EXEC_TIME_MS) {
+        Logger.log("Approaching quota limit (4.5 min). Yielding execution and saving checkpoint at tab " + i);
+        props.setProperty("CHALLAN_SYNC_TAB_INDEX", String(i));
+        executionYielded = true;
+        
+        ScriptApp.newTrigger("resumeChallanTabSync")
+          .timeBased()
+          .after(60000)
+          .create();
+        break;
+      }
+
       const sheet = sheets[i];
       const name = sheet.getName();
-      if (name.toLowerCase().includes("form responses")) continue;
+      if (name.toLowerCase().includes("form responses") || name.toLowerCase().includes("template")) continue;
 
       Logger.log("Processing tab " + (i + 1) + "/" + sheets.length + ": " + name + "...");
       const result = syncSheetTab(sheet, conn, pstmt);
@@ -470,19 +583,40 @@ function syncAllChallanTabs() {
         Logger.log("Tab " + name + " complete: " + result.synced + " rows synced.");
       }
       
-      // Save checkpoint after each completed tab
       props.setProperty("CHALLAN_SYNC_TAB_INDEX", String(i + 1));
     }
 
-    // Reset checkpoint after completing all tabs
-    props.deleteProperty("CHALLAN_SYNC_TAB_INDEX");
-    Logger.log("Full Multi-Tab Sync Complete. Total Synced: " + totalSynced + " across " + tabsProcessed + " tabs.");
+    if (!executionYielded) {
+      props.deleteProperty("CHALLAN_SYNC_TAB_INDEX");
+      Logger.log("Full Multi-Tab Sync Complete. Total Synced: " + totalSynced + " across " + tabsProcessed + " tabs.");
+    }
   } catch(err) {
     if (conn) { try { conn.rollback(); } catch(e) {} }
     Logger.log("Sync Error: " + err.message);
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Resumes sync from saved checkpoint.
+ */
+function resumeChallanTabSync() {
+  deleteAllResumeTriggers();
+  syncAllChallanTabs();
+}
+
+/**
+ * Deletes temporary resume triggers.
+ */
+function deleteAllResumeTriggers() {
+  const triggers = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === "resumeChallanTabSync") {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
   }
 }
 
@@ -509,9 +643,18 @@ function resolveActiveWeekTab(ss) {
  * (Fix 3.2: Programmatic active week tab resolution in headless execution)
  */
 function syncCurrentWeekTab() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncCurrentWeekTab skipped: Lock busy.");
+    return;
+  }
+
   const ss = getTargetSpreadsheet();
   const sheet = resolveActiveWeekTab(ss);
-  if (!sheet) return;
+  if (!sheet) {
+    lock.releaseLock();
+    return;
+  }
 
   Logger.log("Resolved target sync tab: " + sheet.getName());
 
@@ -530,12 +673,13 @@ function syncCurrentWeekTab() {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
 /**
  * Live single-row and multi-row edit handler on active tab.
- * (Fix 3.6: Loops from e.range.getRow() to e.range.getLastRow() for multi-row copy pastes)
+ * (Fix 3.6: Loops from e.range.getRow() to e.range.getLastRow() with single connection reuse)
  */
 function handleOnEdit(e) {
   if (!e || !e.range) return;
@@ -544,6 +688,14 @@ function handleOnEdit(e) {
   const endRow = e.range.getLastRow();
 
   const name = sheet.getName();
+  if (name.toLowerCase().includes("form responses") || name.toLowerCase().includes("template")) return;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("handleOnEdit skipped: Lock busy.");
+    return;
+  }
+
   const lastCol = sheet.getLastColumn();
   const headers = sheet.getRange(1, 1, Math.min(4, startRow - 1), lastCol).getValues();
 
@@ -558,10 +710,16 @@ function handleOnEdit(e) {
       break;
     }
   }
-  if (!hRow || !headerVals) return;
+  if (!hRow || !headerVals) {
+    lock.releaseLock();
+    return;
+  }
 
   const colMap = getWeeklyColMap(headerVals);
-  if (!colMap['reg_no']) return;
+  if (!colMap['reg_no']) {
+    lock.releaseLock();
+    return;
+  }
 
   let conn = null;
   let pstmt = null;
@@ -580,6 +738,7 @@ function handleOnEdit(e) {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
@@ -587,6 +746,12 @@ function handleOnEdit(e) {
  * High-performance batch synchronization directly from 'Unified_Traffic_Challan_source'.
  */
 function syncUnifiedChallansMasterToPostgres() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncUnifiedChallansMasterToPostgres skipped: Lock busy.");
+    return;
+  }
+
   const ss = getTargetSpreadsheet();
   const sheet = ss.getSheetByName("Unified_Traffic_Challan_source") || resolveActiveWeekTab(ss);
   const lastRow = sheet.getLastRow();
@@ -594,6 +759,7 @@ function syncUnifiedChallansMasterToPostgres() {
   
   if (lastRow <= 1) {
     Logger.log("No data rows found in " + sheet.getName());
+    lock.releaseLock();
     return;
   }
   
@@ -627,7 +793,6 @@ function syncUnifiedChallansMasterToPostgres() {
         const regNo = cleanPlate(row[2]);
         if (!regNo) continue;
         
-        let noticeNo = cleanStr(row[3]);
         const city = cleanCity(row[4], regNo);
         const weekCycle = cleanStr(row[5]) || sourceTab;
         
@@ -648,34 +813,47 @@ function syncUnifiedChallansMasterToPostgres() {
         const totPend = cleanNum(row[14]);
         const remarks = cleanStr(row[15]);
         
-        const timeSuffix = vioTime ? vioTime.replace(/:/g, "") : "0000";
+        let noticeNo = cleanStr(row[3]);
         if (!noticeNo) {
-          noticeNo = (vioDate || fineAmt > 0)
-            ? `NOT-${regNo}-${vioDate || auditDate || weekCycle}-${timeSuffix}-${sourceRow}`
-            : `BAL-${regNo}-${weekCycle}-${sourceRow}`;
+          noticeNo = generateDeterministicNoticeNo(regNo, vioDate, auditDate, vioTime, fineAmt, weekCycle, sourceRow);
         }
         
         let p = 1;
-        pstmt.setString(p++, regNo); // 1. vehicle_reg_no
-        pstmt.setString(p++, noticeNo); // 2. notice_no
-        pstmt.setString(p++, city); // 3. city
-        pstmt.setString(p++, weekCycle); // 4. week_cycle
-        
-        pstmt.setDouble(p++, prevBal); // 5. previous_balance
-        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6. audit_date
-        
-        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 7. notice_date
-        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 8. violation_date
-        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 9. violation_time
-        
-        pstmt.setDouble(p++, fineAmt); // 10. challan_amount
-        pstmt.setDouble(p++, stkFine); // 11. sticker_fine
-        pstmt.setDouble(p++, amtPaid); // 12. amount_paid
-        pstmt.setDouble(p++, totPend); // 13. total_pending
-        pstmt.setString(p++, remarks); // 14. remarks
-        
-        pstmt.setString(p++, sourceTab); // 15. source_tab
-        pstmt.setInt(p++, sourceRow); // 16. sheet_row_number
+        // UPDATE SET
+        pstmt.setString(p++, city); // 1
+        pstmt.setDouble(p++, prevBal); // 2
+        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 3
+        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
+        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
+        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 6
+        pstmt.setDouble(p++, fineAmt); // 7
+        pstmt.setDouble(p++, stkFine); // 8
+        pstmt.setDouble(p++, amtPaid); // 9
+        pstmt.setDouble(p++, totPend); // 10
+        pstmt.setString(p++, remarks); // 11
+        pstmt.setInt(p++, sourceRow); // 12
+        // UPDATE WHERE
+        pstmt.setString(p++, regNo); // 13
+        pstmt.setString(p++, noticeNo); // 14
+        pstmt.setString(p++, weekCycle); // 15
+
+        // INSERT SELECT
+        pstmt.setString(p++, regNo); // 16
+        pstmt.setString(p++, noticeNo); // 17
+        pstmt.setString(p++, city); // 18
+        pstmt.setString(p++, weekCycle); // 19
+        pstmt.setDouble(p++, prevBal); // 20
+        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 21
+        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
+        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
+        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 24
+        pstmt.setDouble(p++, fineAmt); // 25
+        pstmt.setDouble(p++, stkFine); // 26
+        pstmt.setDouble(p++, amtPaid); // 27
+        pstmt.setDouble(p++, totPend); // 28
+        pstmt.setString(p++, remarks); // 29
+        pstmt.setString(p++, sourceTab); // 30
+        pstmt.setInt(p++, sourceRow); // 31
         
         pstmt.addBatch();
         pendingBatch++;
@@ -702,6 +880,7 @@ function syncUnifiedChallansMasterToPostgres() {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
@@ -735,7 +914,8 @@ function deleteAllTriggers() {
     "handleOnEdit",
     "syncCurrentWeekTab",
     "syncAllChallanTabs",
-    "syncUnifiedChallansMasterToPostgres"
+    "syncUnifiedChallansMasterToPostgres",
+    "resumeChallanTabSync"
   ];
   
   for (let i = 0; i < triggers.length; i++) {

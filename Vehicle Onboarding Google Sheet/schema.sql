@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS public.sheet_vehicle_onboarding (
     -- Metadata, Traceability & Exception Queue Flags
     sheet_row_number INTEGER,
     chassis_review_flag BOOLEAN DEFAULT FALSE,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     

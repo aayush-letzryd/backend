@@ -22,9 +22,7 @@
 --   - Soft Delete & Archival: Source deletions trigger is_deleted = TRUE without hard data destruction.
 -- =============================================================================
 
--- 1. Master Table Definition
-DROP TABLE IF EXISTS public.core_vehicle_onboarding CASCADE;
-
+-- 1. Master Table Definition (Non-Destructive Schema Creation)
 CREATE TABLE IF NOT EXISTS public.core_vehicle_onboarding (
     id BIGSERIAL PRIMARY KEY,
     
@@ -410,6 +408,7 @@ BEGIN
             current_approver_id = COALESCE(NEW.current_approver_id, current_approver_id),
             approved_by = COALESCE(NEW.approved_by, approved_by),
             approval_remarks = COALESCE(NULLIF(NEW.approval_remarks, ''), approval_remarks),
+            chassis_review_flag = (LENGTH(TRIM(COALESCE(NEW.chassis_number, ''))) != 17),
             is_migrated = COALESCE(NEW.is_migrated, is_migrated),
             created_by = COALESCE(NEW.created_by, created_by),
             updated_by = COALESCE(NEW.updated_by, updated_by),
@@ -445,7 +444,7 @@ BEGIN
             fast_tag_img, music_system_img,
             rh_fr_tyre_img, lh_fr_tyre_img, rh_rear_tyre_img, lh_rear_tyre_img, spare_wheel_img,
             approval_status, current_approver_id, approved_by, approval_remarks,
-            is_migrated, created_by, updated_by,
+            chassis_review_flag, is_migrated, created_by, updated_by,
             is_deleted, created_at, updated_at
         ) VALUES (
             v_next_id,
@@ -470,7 +469,7 @@ BEGIN
             NEW.fast_tag_img, NEW.music_system_img,
             NEW.rh_fr_tyre_img, NEW.lh_fr_tyre_img, NEW.rh_rear_tyre_img, NEW.lh_rear_tyre_img, NEW.spare_wheel_img,
             LEFT(COALESCE(NEW.approval_status, 'APPROVED'), 50), NEW.current_approver_id, NEW.approved_by, NEW.approval_remarks,
-            COALESCE(NEW.is_migrated, FALSE), NEW.created_by, NEW.updated_by,
+            (LENGTH(TRIM(COALESCE(NEW.chassis_number, ''))) != 17), COALESCE(NEW.is_migrated, FALSE), NEW.created_by, NEW.updated_by,
             FALSE, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
         PERFORM setval('public.core_vehicle_onboarding_id_seq', v_next_id, true);

@@ -9,33 +9,52 @@
  * Key Features & Audit Fixes:
  *  - Fix 2.1: Multi-row paste range iteration support in handleOnEdit
  *  - Fix 2.2: Race-condition safe row targeting in handleOnFormSubmit
- *  - Fix 2.3: Strict regex date decomposition eliminating GAS V8 US date inversion bug
+ *  - Fix 2.3: Strict regex date decomposition with bounds checking (1950-2100)
  *  - Fix 2.4: In-memory batch deduplication by registration_no preventing SQLSTATE 21000
  *  - Fix 2.5: Zero-burn sequence preservation on periodic catch-up syncs
- *  - Fix 2.6: Raw Excel day serial integer parser (e.g. 45123) in parseDate
+ *  - Fix 2.6: Raw Excel day serial integer parser (e.g. 45123) with year sanity checks
  *  - Fix 2.7: URL isolation from key_quantity with integer count extraction
  *  - Fix 2.8: 17-character chassis number validation & exception queue routing
+ *  - Fix 2.9: Column D offset fix in multi-source consolidation (prevents duplicate re-appends)
+ *  - Fix 2.10: PropertiesService credential management & Concurrency locks
  *  - Complete connection leak prevention (try-catch-finally on all JDBC resources)
  *  - Zero Data Loss Guarantee (all 73 columns preserved with 100% fidelity)
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
-const DB_CONFIG = {
-  host: "35.200.196.113",
-  port: "5432",
-  database: "postgres",
-  user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
-  
-  // Target spreadsheet URL:
-  sheetUrl: "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
-  
-  // Target tab name:
-  sheetName: "Unified_Vehicle_onboarding_source"
-};
+// Secure credential resolver: reads from PropertiesService with hardcoded fallback
+function getDbConfig() {
+  const props = PropertiesService.getScriptProperties();
+  return {
+    host: props.getProperty("DB_HOST") || "35.200.196.113",
+    port: props.getProperty("DB_PORT") || "5432",
+    database: props.getProperty("DB_NAME") || "postgres",
+    user: props.getProperty("DB_USER") || "postgres",
+    password: props.getProperty("DB_PASSWORD") || "8S5]U3@L^Xz)\\FH}",
+    sheetUrl: props.getProperty("SHEET_URL") || "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
+    sheetName: props.getProperty("SHEET_NAME") || "Unified_Vehicle_onboarding_source"
+  };
+}
 
-// Standard JDBC SQL Type Codes (Apps Script does not expose java.sql.Types)
+/**
+ * Run once manually to store credentials securely in Script Properties.
+ */
+function setupScriptProperties() {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    "DB_HOST": "35.200.196.113",
+    "DB_PORT": "5432",
+    "DB_NAME": "postgres",
+    "DB_USER": "postgres",
+    "DB_PASSWORD": "8S5]U3@L^Xz)\\FH}",
+    "SHEET_URL": "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
+    "SHEET_NAME": "Unified_Vehicle_onboarding_source"
+  });
+  Logger.log("Script properties set successfully.");
+}
+
+// Standard JDBC SQL Type Codes
 const SQL_TYPES = {
   VARCHAR: 12,
   DATE: 91,
@@ -50,9 +69,10 @@ const SQL_TYPES = {
  * Returns the target Spreadsheet instance.
  */
 function getTargetSpreadsheet() {
-  if (DB_CONFIG.sheetUrl && DB_CONFIG.sheetUrl.trim() !== "") {
+  const config = getDbConfig();
+  if (config.sheetUrl && config.sheetUrl.trim() !== "") {
     try {
-      return SpreadsheetApp.openByUrl(DB_CONFIG.sheetUrl);
+      return SpreadsheetApp.openByUrl(config.sheetUrl);
     } catch(e) {
       Logger.log("openByUrl error, falling back to active spreadsheet: " + e.message);
     }
@@ -65,8 +85,9 @@ function getTargetSpreadsheet() {
  */
 function getTargetSheet(ss) {
   if (!ss) return null;
-  if (DB_CONFIG.sheetName && DB_CONFIG.sheetName.trim() !== "") {
-    const sheet = ss.getSheetByName(DB_CONFIG.sheetName);
+  const config = getDbConfig();
+  if (config.sheetName && config.sheetName.trim() !== "") {
+    const sheet = ss.getSheetByName(config.sheetName);
     if (sheet) return sheet;
   }
   return ss.getSheets()[0];
@@ -84,6 +105,7 @@ function onOpen() {
       .addItem("Sync Recent 50 Rows", "syncRecentVehicles")
       .addSeparator()
       .addItem("Test Database Connection", "testDbConnection")
+      .addItem("Initialize Script Properties", "setupScriptProperties")
       .addSeparator()
       .addItem("Install Automated Triggers", "setupTriggers")
       .addItem("Remove Automated Triggers", "deleteAllTriggers")
@@ -97,14 +119,16 @@ function onOpen() {
  * Returns an active JDBC PostgreSQL connection.
  */
 function getDbConnection() {
-  const url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
-  return Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
+  const config = getDbConfig();
+  const url = "jdbc:postgresql://" + config.host + ":" + config.port + "/" + config.database;
+  return Jdbc.getConnection(url, config.user, config.password);
 }
 
 /**
  * Test DB Connection utility with leak-proof cleanup.
  */
 function testDbConnection() {
+  const config = getDbConfig();
   let conn = null;
   let stmt = null;
   let rs = null;
@@ -119,7 +143,7 @@ function testDbConnection() {
     try {
       SpreadsheetApp.getUi().alert(
         "Connection Successful",
-        "Connected to PostgreSQL on " + DB_CONFIG.host + ".\nCurrent rows in sheet_vehicle_onboarding: " + count,
+        "Connected to PostgreSQL on " + config.host + ".\nCurrent rows in sheet_vehicle_onboarding: " + count,
         SpreadsheetApp.getUi().ButtonSet.OK
       );
     } catch(e) {}
@@ -177,6 +201,7 @@ function cleanCity(val) {
   if (low.includes("hyd")) return "Hyderabad";
   if (low.includes("mum")) return "Mumbai";
   if (low.includes("blr") || low.includes("bang") || low.includes("beng")) return "Bangalore";
+  if (low.includes("pun")) return "Pune";
   return s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
 }
 
@@ -191,11 +216,17 @@ function cleanMfgDate(val) {
   if (s === "" || s.toLowerCase() === "nan") return null;
   const myMatch = s.match(/^(\d{1,2})[\/\-](\d{4})$/);
   if (myMatch) {
-    return `${myMatch[1].padStart(2, "0")}/${myMatch[2]}`;
+    const yr = parseInt(myMatch[2], 10);
+    if (yr >= 1950 && yr <= 2100) {
+      return `${myMatch[1].padStart(2, "0")}/${myMatch[2]}`;
+    }
   }
   const isoMatch = s.match(/^(\d{4})[\/\-](\d{1,2})/);
   if (isoMatch) {
-    return `${isoMatch[2].padStart(2, "0")}/${isoMatch[1]}`;
+    const yr = parseInt(isoMatch[1], 10);
+    if (yr >= 1950 && yr <= 2100) {
+      return `${isoMatch[2].padStart(2, "0")}/${isoMatch[1]}`;
+    }
   }
   return cleanStr(val);
 }
@@ -252,20 +283,26 @@ function cleanBoolean(val) {
 
 /**
  * Multi-format Date Parser -> Returns YYYY-MM-DD or null
- * (Fix 2.3 & 2.6: Strict regex decomposition + Excel serial integer support, NO unvalidated new Date fallback)
+ * (Fix 2.3 & 2.6: Strict regex decomposition + Excel serial integer support + strict bounds checking 1950-2100)
  */
 function parseDate(val) {
   if (val === null || val === undefined) return null;
   
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return null;
+    const yr = val.getFullYear();
+    if (yr < 1950 || yr > 2100) return null;
     return Utilities.formatDate(val, "Asia/Kolkata", "yyyy-MM-dd");
   }
   
   // Excel Serial Integer (e.g. 45123)
   if (typeof val === 'number' && val > 20000 && val < 60000) {
     const d = new Date(Math.round((val - 25569) * 86400 * 1000));
-    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    const yr = d.getFullYear();
+    if (yr >= 1950 && yr <= 2100) {
+      return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    }
+    return null;
   }
   
   const s = String(val).trim();
@@ -275,7 +312,11 @@ function parseDate(val) {
   if (/^\d{5}$/.test(s)) {
     const serial = parseInt(s, 10);
     const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
-    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    const yr = d.getFullYear();
+    if (yr >= 1950 && yr <= 2100) {
+      return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+    }
+    return null;
   }
 
   // DD/MM/YYYY or DD-MM-YYYY or DD.MM.YYYY
@@ -283,25 +324,34 @@ function parseDate(val) {
   if (dmyMatch) {
     const day = dmyMatch[1].padStart(2, "0");
     const month = dmyMatch[2].padStart(2, "0");
-    const year = dmyMatch[3];
-    return `${year}-${month}-${day}`;
+    const year = parseInt(dmyMatch[3], 10);
+    if (year >= 1950 && year <= 2100 && parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12 && parseInt(day, 10) >= 1 && parseInt(day, 10) <= 31) {
+      return `${year}-${month}-${day}`;
+    }
+    return null;
   }
 
   // YYYY-MM-DD or YYYY/MM/DD
   const isoMatch = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})/);
   if (isoMatch) {
-    const year = isoMatch[1];
+    const year = parseInt(isoMatch[1], 10);
     const month = isoMatch[2].padStart(2, "0");
     const day = isoMatch[3].padStart(2, "0");
-    return `${year}-${month}-${day}`;
+    if (year >= 1950 && year <= 2100 && parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12 && parseInt(day, 10) >= 1 && parseInt(day, 10) <= 31) {
+      return `${year}-${month}-${day}`;
+    }
+    return null;
   }
 
   // MM/YYYY -> YYYY-MM-01
   const myMatch = s.match(/^(\d{1,2})[\/\-](\d{4})$/);
   if (myMatch) {
     const month = myMatch[1].padStart(2, "0");
-    const year = myMatch[2];
-    return `${year}-${month}-01`;
+    const year = parseInt(myMatch[2], 10);
+    if (year >= 1950 && year <= 2100 && parseInt(month, 10) >= 1 && parseInt(month, 10) <= 12) {
+      return `${year}-${month}-01`;
+    }
+    return null;
   }
 
   return null;
@@ -316,6 +366,8 @@ function parseTimestamp(val) {
   
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return null;
+    const yr = val.getFullYear();
+    if (yr < 1950 || yr > 2100) return null;
     return Utilities.formatDate(val, "Asia/Kolkata", "yyyy-MM-dd'T'HH:mm:ssXXX");
   }
   
@@ -327,23 +379,29 @@ function parseTimestamp(val) {
   if (dmyMatch) {
     const day = dmyMatch[1].padStart(2, "0");
     const month = dmyMatch[2].padStart(2, "0");
-    const year = dmyMatch[3];
-    const hour = dmyMatch[4].padStart(2, "0");
-    const min = dmyMatch[5].padStart(2, "0");
-    const sec = (dmyMatch[6] || "00").padStart(2, "0");
-    return `${year}-${month}-${day}T${hour}:${min}:${sec}+05:30`;
+    const year = parseInt(dmyMatch[3], 10);
+    if (year >= 1950 && year <= 2100) {
+      const hour = dmyMatch[4].padStart(2, "0");
+      const min = dmyMatch[5].padStart(2, "0");
+      const sec = (dmyMatch[6] || "00").padStart(2, "0");
+      return `${year}-${month}-${day}T${hour}:${min}:${sec}+05:30`;
+    }
+    return null;
   }
 
   // YYYY-MM-DD HH:mm:ss
   const isoMatch = s.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
   if (isoMatch) {
-    const year = isoMatch[1];
-    const month = isoMatch[2].padStart(2, "0");
-    const day = isoMatch[3].padStart(2, "0");
-    const hour = isoMatch[4].padStart(2, "0");
-    const min = isoMatch[5].padStart(2, "0");
-    const sec = (isoMatch[6] || "00").padStart(2, "0");
-    return `${year}-${month}-${day}T${hour}:${min}:${sec}+05:30`;
+    const year = parseInt(isoMatch[1], 10);
+    if (year >= 1950 && year <= 2100) {
+      const month = isoMatch[2].padStart(2, "0");
+      const day = isoMatch[3].padStart(2, "0");
+      const hour = isoMatch[4].padStart(2, "0");
+      const min = isoMatch[5].padStart(2, "0");
+      const sec = (isoMatch[6] || "00").padStart(2, "0");
+      return `${year}-${month}-${day}T${hour}:${min}:${sec}+05:30`;
+    }
+    return null;
   }
 
   return null;
@@ -610,7 +668,14 @@ function bindVehicleRow(pstmt, row, rowNumber) {
 function handleOnEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  if (sheet.getName() !== DB_CONFIG.sheetName) return;
+  const config = getDbConfig();
+  if (sheet.getName() !== config.sheetName) return;
+
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("handleOnEdit skipped: Another sync process holds the lock.");
+    return;
+  }
 
   const startRow = Math.max(2, e.range.getRow());
   const endRow = e.range.getLastRow();
@@ -632,6 +697,7 @@ function handleOnEdit(e) {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
@@ -645,8 +711,17 @@ function handleOnFormSubmit(e) {
   const sheet = getTargetSheet(ss);
   if (!sheet) return;
 
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("handleOnFormSubmit skipped: lock acquired by another process.");
+    return;
+  }
+
   const targetRow = (e && e.range) ? e.range.getRow() : sheet.getLastRow();
-  if (targetRow <= 1) return;
+  if (targetRow <= 1) {
+    lock.releaseLock();
+    return;
+  }
 
   const rowValues = sheet.getRange(targetRow, 1, 1, sheet.getLastColumn()).getValues()[0];
 
@@ -664,6 +739,7 @@ function handleOnFormSubmit(e) {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
@@ -693,10 +769,18 @@ function syncAllVehicles() {
  * (Fix 2.4: In-memory deduplication by registration_no to prevent SQLSTATE 21000 batch collision)
  */
 function syncBatchInternal(limitRows, customStartRow) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncBatchInternal skipped: Lock busy.");
+    return;
+  }
+
   const ss = getTargetSpreadsheet();
   const sheet = getTargetSheet(ss);
+  const config = getDbConfig();
   if (!sheet) {
-    Logger.log("Sheet not found: " + DB_CONFIG.sheetName);
+    Logger.log("Sheet not found: " + config.sheetName);
+    lock.releaseLock();
     return;
   }
 
@@ -704,6 +788,7 @@ function syncBatchInternal(limitRows, customStartRow) {
   const lastCol = sheet.getLastColumn();
   if (lastRow <= 1) {
     Logger.log("Sheet contains no data rows.");
+    lock.releaseLock();
     return;
   }
 
@@ -788,6 +873,7 @@ function syncBatchInternal(limitRows, customStartRow) {
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
+    lock.releaseLock();
   }
 }
 
@@ -804,10 +890,11 @@ function syncAllSourcesToUnifiedAndPostgres() {
     return;
   }
 
+  const config = getDbConfig();
   const assetSheet = ss.getSheetByName("src_asset_list");
   const docsSheet = ss.getSheetByName("src_master_docs");
   const pdiSheet = ss.getSheetByName("src_pdi_vehicle");
-  const unifiedSheet = ss.getSheetByName(DB_CONFIG.sheetName) || ss.insertSheet(DB_CONFIG.sheetName);
+  const unifiedSheet = ss.getSheetByName(config.sheetName) || ss.insertSheet(config.sheetName);
 
   if (!assetSheet) {
     Logger.log("Source tab src_asset_list not found. Falling back to direct unified sync.");
@@ -845,9 +932,10 @@ function syncAllSourcesToUnifiedAndPostgres() {
   }
 
   // 4. Read existing Unified Sheet to determine existing vehicles
+  // Column D (index 4 in 1-based getRange) is registration_no
   const existingUnifiedRegs = new Set();
   if (unifiedSheet.getLastRow() > 1) {
-    const unifiedRegs = unifiedSheet.getRange(2, 2, unifiedSheet.getLastRow() - 1, 1).getValues();
+    const unifiedRegs = unifiedSheet.getRange(2, 4, unifiedSheet.getLastRow() - 1, 1).getValues();
     for (let i = 0; i < unifiedRegs.length; i++) {
       const reg = cleanRegNo(unifiedRegs[i][0]);
       if (reg) existingUnifiedRegs.add(reg);
@@ -880,9 +968,9 @@ function syncAllSourcesToUnifiedAndPostgres() {
 
   if (rowsToAppend.length > 0) {
     unifiedSheet.getRange(unifiedSheet.getLastRow() + 1, 1, rowsToAppend.length, 73).setValues(rowsToAppend);
-    Logger.log("Appended " + rowsToAppend.length + " newly merged vehicles into " + DB_CONFIG.sheetName);
+    Logger.log("Appended " + rowsToAppend.length + " newly merged vehicles into " + config.sheetName);
   } else {
-    Logger.log("All source vehicles are already consolidated in " + DB_CONFIG.sheetName);
+    Logger.log("All source vehicles are already consolidated in " + config.sheetName);
   }
 
   // 5. Ingest / update all records to PostgreSQL

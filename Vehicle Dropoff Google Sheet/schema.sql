@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS public.sheet_dropoffs (
     -- Financial Liability (Supports Negative Liabilities & NULL for Pending/TBD)
     negative_balance NUMERIC(12, 2) DEFAULT 0.00,
     
-    -- Audit & System Timestamps
+    -- Soft-Delete & Audit Timestamps
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMPTZ,
     sync_status VARCHAR(20) DEFAULT 'SYNCED',
     created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
