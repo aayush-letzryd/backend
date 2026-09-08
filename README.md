@@ -52,7 +52,6 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
-<<<<<<< HEAD
 ### 5. [Traffic Challan Google Sheet](./Traffic%20Challan%20Google%20Sheet/)
 - **Description**: Real-time production data pipeline synchronizing master vehicle traffic challan violation events and weekly rolling balance ledgers across 38 tabs (36,039 records across 1,602 unique fleet vehicles) into `public.sheet_challans`.
 - **Key Files**:
@@ -108,15 +107,18 @@ This repository hosts production scripts, architecture specifications, database 
 - **Primary Features**:
   - Zero changes to source tables (`sheet_walkins`, `july_new_walkins`, `july_existing_walkins` remain untouched)
   - Native PostgreSQL triggers providing instant live synchronization (<10ms)
-  - 100% event log preservation (all walk-in records preserved with full fidelity)
+  - Gapless sequential primary key (`id` allocated via transactional advisory lock `pg_advisory_xact_lock` guaranteeing continuous 1..N IDs without sequence jumps)
+  - Non-destructive soft deletes (`is_deleted = TRUE`, `deleted_at = CURRENT_TIMESTAMP` upon source deletions, exposed via `public.active_core_walkin` view)
+  - 100% event log preservation (all walk-in records preserved with full fidelity and source attribution)
   - Functional standardization of cities (`Bengaluru`, `Hyderabad`, `Mumbai`) and 10-digit mobile numbers
   - Verbatim pass-through of names, remarks, and Aadhaar numbers without altering raw inputs
+  - Future-proof schema evolution guide and semi-structured metadata storage via `extra_attributes JSONB`
 
 ---
 
 ## Infrastructure Overview
 
-- **Primary Database Host**: `35.200.196.113:5432`
+- **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
 - **Database Engine**: PostgreSQL 14+
 - **Default Database**: `postgres`
 - **Architecture**: Decoupled ingestion layers utilizing Google Apps Script JDBC, FastAPI microservices, and PostgreSQL persistence.

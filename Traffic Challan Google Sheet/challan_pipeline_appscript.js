@@ -4,7 +4,7 @@
  * ==============================================================================
  * 
  * Target Table : public.sheet_challans
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * Source Sheet : 'Traffic Challan details' (38 Weekly & Monthly Tabs)
  * 
  * Features:
@@ -21,11 +21,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   // Master Spreadsheet URL:
   sheetUrl: "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"

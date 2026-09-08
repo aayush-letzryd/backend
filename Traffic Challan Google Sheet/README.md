@@ -1,6 +1,6 @@
 # LetzRyd Traffic Challan Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `35.200.196.113:5432`  
+Target Database: `YOUR_DB_HOST_HERE:5432`  
 Database Name: `postgres`  
 Target Table: `public.sheet_challans`  
 Downstream Master Table: `public.challans_final`  
@@ -50,7 +50,7 @@ flowchart TD
         OE --> S
     end
 
-    subgraph DatabaseLayer ["PostgreSQL Central Database (35.200.196.113:5432)"]
+    subgraph DatabaseLayer ["PostgreSQL Central Database (YOUR_DB_HOST_HERE:5432)"]
         S -->|JDBC PreparedStatement 250-Row Batches| DB[("public.sheet_challans<br>PK: (vehicle_reg_no, notice_no, week_cycle)<br>Indexed on reg_no, city, dates, pending")]
         DB --> F[("public.challans_final<br>(Deduplicated Police Fine Ledger for Hisaab)")]
     end
@@ -75,7 +75,7 @@ flowchart TD
 -- ==============================================================================
 -- LETZRYD TRAFFIC CHALLAN MASTER TABLE DDL
 -- Target Table: public.sheet_challans
--- Host: 35.200.196.113:5432 | DB: postgres | Schema: public
+-- Host: YOUR_DB_HOST_HERE:5432 | DB: postgres | Schema: public
 -- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS public.sheet_challans (
@@ -139,7 +139,7 @@ CREATE INDEX IF NOT EXISTS idx_challans_week_cycle ON public.sheet_challans(week
 ### Step 1: Database Setup
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
+psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
 ```
 
 ### Step 2: Google Apps Script Setup

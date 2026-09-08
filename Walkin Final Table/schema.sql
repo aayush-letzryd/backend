@@ -119,9 +119,9 @@ DECLARE
     v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
     v_clean_city VARCHAR(100);
-    v_f_name VARCHAR(100);
-    v_l_name VARCHAR(100);
-    v_full_name VARCHAR(255);
+    v_f_name TEXT;
+    v_l_name TEXT;
+    v_full_name TEXT;
     v_reason_cat VARCHAR(100);
     v_is_joined BOOLEAN;
     v_w_type VARCHAR(50);
@@ -145,14 +145,15 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
+        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
+        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
     END;
 
-    -- Verbatim name preservation
+    -- Verbatim name preservation with safe length bounds
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255);
+    IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
-    v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
+    v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -243,9 +244,9 @@ DECLARE
     v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
     v_clean_city VARCHAR(100);
-    v_f_name VARCHAR(100);
-    v_l_name VARCHAR(100);
-    v_full_name VARCHAR(255);
+    v_f_name TEXT;
+    v_l_name TEXT;
+    v_full_name TEXT;
     v_reason_cat VARCHAR(100);
     v_is_joined BOOLEAN;
     v_time_str VARCHAR(20);
@@ -271,10 +272,11 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
+        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
+        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
     END;
 
-    -- Verbatim name preservation
+    -- Verbatim name preservation with safe length bounds
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
@@ -282,8 +284,7 @@ BEGIN
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
-    v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
+    v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -296,11 +297,11 @@ BEGIN
 
     v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
     v_date := COALESCE(NEW.event_date, NEW.created_at::date, CURRENT_DATE);
-    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI'));
+    v_time_str := LEFT(COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI')), 20);
 
     SELECT 
-        COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'),
-        COALESCE(pu.email, pu.username, '')
+        LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
+        LEFT(COALESCE(pu.email, pu.username, ''), 255)
     INTO v_exec_name, v_exec_email
     FROM july_portal_users pu
     LEFT JOIN july_employees e ON e.employee_id = pu.employee_id
@@ -386,9 +387,9 @@ DECLARE
     v_next_id BIGINT;
     v_clean_phone VARCHAR(20);
     v_clean_city VARCHAR(100);
-    v_f_name VARCHAR(100);
-    v_l_name VARCHAR(100);
-    v_full_name VARCHAR(255);
+    v_f_name TEXT;
+    v_l_name TEXT;
+    v_full_name TEXT;
     v_reason_cat VARCHAR(100);
     v_time_str VARCHAR(20);
     v_date DATE;
@@ -413,10 +414,11 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
+        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
+        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
     END;
 
-    -- Verbatim name preservation
+    -- Verbatim name preservation with safe length bounds
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
@@ -424,8 +426,7 @@ BEGIN
     IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
-    v_l_name := SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2);
-    IF v_l_name = '' THEN v_l_name := NULL; ELSE v_l_name := LEFT(v_l_name, 100); END IF;
+    v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
 
     v_reason_cat := CASE 
         WHEN NEW.visiting_reason ILIKE '%new joining%' OR NEW.visiting_reason ILIKE '%onboarding%' OR NEW.visiting_reason ILIKE '%re-joining%' OR NEW.visiting_reason ILIKE '%adding new vehicle%' THEN 'ONBOARDING'
@@ -437,11 +438,11 @@ BEGIN
     END;
 
     v_date := COALESCE(NEW.event_date, NEW.created_at::date, CURRENT_DATE);
-    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI'));
+    v_time_str := LEFT(COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI')), 20);
 
     SELECT 
-        COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'),
-        COALESCE(pu.email, pu.username, '')
+        LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
+        LEFT(COALESCE(pu.email, pu.username, ''), 255)
     INTO v_exec_name, v_exec_email
     FROM july_portal_users pu
     LEFT JOIN july_employees e ON e.employee_id = pu.employee_id

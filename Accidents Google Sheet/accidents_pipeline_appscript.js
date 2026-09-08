@@ -6,7 +6,7 @@
  * Source Sheet : 'Accident vehicle report' (Raw Form Responses)
  * Target Sheet : 'sheet_accidents' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_accidents & public.core_accidents
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * 
  * Features:
  *  - Dual Ingestion: Populates standardized 'sheet_accidents' tab AND PostgreSQL database
@@ -24,11 +24,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Qp_JL4gbTgUXMLuEQaGaaYwHWTNwNnrIP4lNzKsWl50/edit",
   sourceSheetName: "Accident vehicle report",

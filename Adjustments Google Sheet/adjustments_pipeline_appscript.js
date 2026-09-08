@@ -6,7 +6,7 @@
  * Source Sheet : 'Adjustment-Form' (Raw Form Responses)
  * Target Sheet : 'sheet_adjustments' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_adjustments & public.core_adjustments
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * 
  * Features:
  *  - Dual Ingestion: Populates standardized 'sheet_adjustments' tab AND PostgreSQL database
@@ -25,11 +25,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
   sourceSheetName: "Adjustment-Form",

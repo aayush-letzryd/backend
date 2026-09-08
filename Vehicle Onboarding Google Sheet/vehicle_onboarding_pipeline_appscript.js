@@ -4,7 +4,7 @@
  * ==============================================================================
  * 
  * Target Table : public.sheet_vehicle_onboarding
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * Features:
  *  - Real-time live updates on cell edit (handleOnEdit) and form submit (handleOnFormSubmit)
  *  - Multi-row paste resilience (processes all pasted rows in a single batch)
@@ -26,11 +26,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   // Target spreadsheet URL:
   sheetUrl: "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",

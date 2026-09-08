@@ -4,7 +4,7 @@
 -- Target Database: postgres
 -- Target Schema  : public
 -- Target Table   : sheet_vehicle_onboarding
--- Host           : 35.200.196.113:5432
+-- Host           : YOUR_DB_HOST_HERE:5432
 -- Description    : Central master table storing real-time vehicle onboarding data
 --                  synced from Google Sheets (tab: Unified_Vehicle_onboarding_source).
 -- =============================================================================

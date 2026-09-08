@@ -5,7 +5,7 @@
 -- Target Schema  : public
 -- Source Tables  : sheet_driver_onboarding (Google Sheet) + july_form_onboarding (Portal Form)
 -- Master Table   : core_partner_onboarding
--- Host           : 35.200.196.113:5432
+-- Host           : YOUR_DB_HOST_HERE:5432
 -- Description    : Central table definitions, performance indexes, and automated
 --                  consolidation procedures for LetzRyd Driver-Partner Onboarding.
 -- =============================================================================

@@ -1,6 +1,6 @@
 # LetzRyd Vehicle Onboarding Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: `35.200.196.113:5432`  
+Target Database: `YOUR_DB_HOST_HERE:5432`  
 Database Name: `postgres`  
 Target Table: `public.sheet_vehicle_onboarding`  
 Source Spreadsheet: `Vehicle_Onboarding Table source`  
@@ -55,7 +55,7 @@ flowchart TD
         E3 --> S
     end
 
-    subgraph Database Layer ["PostgreSQL Central Database (35.200.196.113:5432)"]
+    subgraph Database Layer ["PostgreSQL Central Database (YOUR_DB_HOST_HERE:5432)"]
         S -->|JDBC PreparedStatement Upsert| DB[("public.sheet_vehicle_onboarding<br>PK: registration_no<br>73 Standardized Columns")]
     end
 ```
@@ -79,7 +79,7 @@ flowchart TD
 -- ==============================================================================
 -- LETZRYD VEHICLE ONBOARDING MASTER TABLE DDL
 -- Target Table: public.sheet_vehicle_onboarding
--- Host: 35.200.196.113:5432 | DB: postgres
+-- Host: YOUR_DB_HOST_HERE:5432 | DB: postgres
 -- ==============================================================================
 
 CREATE TABLE IF NOT EXISTS public.sheet_vehicle_onboarding (
@@ -200,7 +200,7 @@ CREATE INDEX IF NOT EXISTS idx_veh_onb_fitness ON public.sheet_vehicle_onboardin
 ### Step 1: Database Setup
 Execute [`schema.sql`](./schema.sql) in PostgreSQL:
 ```bash
-psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
+psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
 ```
 
 ### Step 2: Google Apps Script Setup

@@ -4,7 +4,7 @@
  * ==============================================================================
  * 
  * Target Table : public.sheet_dropoffs
- * Host         : 35.200.196.113:5432
+ * Host         : YOUR_DB_HOST_HERE:5432
  * Source Tab   : 'Unified_Dropoff_source'
  * 
  * Features:
@@ -20,11 +20,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   // Master Spreadsheet URL
   sheetUrl: "https://docs.google.com/spreadsheets/d/1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8/edit?usp=sharing",
@@ -252,10 +252,10 @@ function syncDropoffsToDatabase() {
       conn.commit();
     }
     
-    Logger.log(`✅ Success! Total ${totalProcessed} dropoff records synced to PostgreSQL.`);
+    Logger.log(`Success! Total ${totalProcessed} dropoff records synced to PostgreSQL.`);
   } catch (err) {
     if (conn) conn.rollback();
-    Logger.log(`❌ Ingestion Error: ${err.message}`);
+    Logger.log(`Ingestion Error: ${err.message}`);
     throw err;
   } finally {
     if (stmt) try { stmt.close(); } catch (e) {}
@@ -375,5 +375,5 @@ function setupTriggers() {
     .everyHours(1)
     .create();
     
-  Logger.log("✅ Live triggers installed successfully!");
+  Logger.log("Live triggers installed successfully!");
 }

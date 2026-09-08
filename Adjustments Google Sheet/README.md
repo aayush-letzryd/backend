@@ -32,7 +32,7 @@ graph TD
 
 ## Target Database Schema
 
-- **Host**: `35.200.196.113:5432`
+- **Host**: `YOUR_DB_HOST_HERE:5432`
 - **Database**: `postgres`
 - **Staging Table**: `public.sheet_adjustments`
 - **Master Table**: `public.core_adjustments`

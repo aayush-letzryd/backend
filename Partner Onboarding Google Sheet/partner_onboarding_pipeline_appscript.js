@@ -21,11 +21,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  password: "YOUR_DB_PASSWORD_HERE",
   
   // Source Spreadsheet with raw form responses ('Onboarding form_V2')
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1ix6iKa9nEh4li44ZRcpkAvEMLo4r94mT4VbwRCfNZIM/edit",

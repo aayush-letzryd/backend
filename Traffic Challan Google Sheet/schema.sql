@@ -1,7 +1,7 @@
 -- ==============================================================================
 -- LETZRYD TRAFFIC CHALLAN MASTER TABLE DDL
 -- Target Table: public.sheet_challans
--- Host: 35.200.196.113:5432 | DB: postgres | Schema: public
+-- Host: YOUR_DB_HOST_HERE:5432 | DB: postgres | Schema: public
 -- Source: 'Traffic Challan details' (All 38 weekly & monthly tabs)
 -- ==============================================================================
 
