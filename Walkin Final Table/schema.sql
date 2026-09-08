@@ -8,6 +8,9 @@
 --   3. public.july_existing_walkins (Portal visit logs for active partners)
 --
 -- Standardization Philosophy:
+--   - Clean Timestamps (No +05:30 offset):
+--       * walkin_timestamp, created_at, updated_at, deleted_at stored as clean
+--         TIMESTAMP WITHOUT TIME ZONE in Indian Standard Time (IST).
 --   - Functional Standardizations:
 --       * City: Standardized to canonical hub names ('Bengaluru', 'Hyderabad', 'Mumbai')
 --       * Phone Number: Cleaned to standard 10-digit mobile numbers for relational joins
@@ -36,10 +39,10 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     portal_existing_walkin_id INTEGER,  -- Pointer to july_existing_walkins.id
     walkin_type VARCHAR(50) NOT NULL,   -- 'NEW_CANDIDATE', 'EXISTING_PARTNER'
     
-    -- Temporal & Location
+    -- Temporal & Location (Clean IST Timestamps without +05:30)
     walkin_date DATE NOT NULL,
     walkin_time VARCHAR(20),
-    walkin_timestamp TIMESTAMP WITH TIME ZONE,
+    walkin_timestamp TIMESTAMP WITHOUT TIME ZONE,
     city VARCHAR(100) NOT NULL,
     operating_place VARCHAR(200),
     
@@ -80,12 +83,12 @@ CREATE TABLE IF NOT EXISTS public.core_walkin (
     
     -- Gapless Audit & Soft Delete
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    deleted_at TIMESTAMP WITH TIME ZONE,
+    deleted_at TIMESTAMP WITHOUT TIME ZONE,
     extra_attributes JSONB DEFAULT '{}'::jsonb,
     
-    -- Audit Timestamps
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    -- Audit Timestamps (Clean IST without +05:30)
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 );
 
 -- Partial Unique Indexes for Idempotency
@@ -126,16 +129,21 @@ DECLARE
     v_is_joined BOOLEAN;
     v_w_type VARCHAR(50);
     v_time_str VARCHAR(20);
+    v_ts TIMESTAMP WITHOUT TIME ZONE;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
-            deleted_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE sheet_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
+
+    -- Standardize timestamp to clean IST (without +05:30)
+    v_ts := NEW.submission_timestamp AT TIME ZONE 'Asia/Kolkata';
+    v_time_str := TO_CHAR(v_ts, 'HH24:MI');
 
     -- Functional standardization: Clean 10-digit mobile number
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.partner_number, ''), '\D', '', 'g'), 10);
@@ -145,13 +153,11 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
-        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
-    -- Verbatim name preservation with safe length bounds
+    -- Verbatim name preservation with defensive bounding
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.partner_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255);
-    IF v_full_name = '' THEN v_full_name := 'UNKNOWN'; END IF;
     v_f_name := LEFT(SPLIT_PART(v_full_name, ' ', 1), 100);
     v_l_name := NULLIF(LEFT(SUBSTRING(v_full_name FROM LENGTH(v_f_name) + 2), 100), '');
 
@@ -170,7 +176,6 @@ BEGIN
     END;
 
     v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
-    v_time_str := TO_CHAR(NEW.submission_timestamp AT TIME ZONE 'Asia/Kolkata', 'HH24:MI');
 
     IF TG_OP = 'INSERT' THEN
         -- Transactional gapless ID allocation
@@ -190,22 +195,24 @@ BEGIN
         ) VALUES (
             v_next_id,
             'GOOGLE_SHEET', 'sheet_walkins', NEW.id, NULL, NULL,
-            v_w_type, NEW.submission_timestamp::date, v_time_str, NEW.submission_timestamp, v_clean_city, NULL,
+            v_w_type, v_ts::date, v_time_str, v_ts, v_clean_city, NULL,
             v_full_name, v_f_name, v_l_name, v_clean_phone, 'Driver',
             NEW.dl_number, NULL, NULL, NULL,
             NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NEW.joined_date, 'Submitted',
             NULL, NULL, NULL, NULL,
             NEW.attending_executive, NULL, NEW.submitter_email, NEW.remarks, NULL,
-            NEW.sheet_row_number, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NEW.sheet_row_number, FALSE, NULL, 
+            COALESCE(NEW.created_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
+            COALESCE(NEW.updated_at AT TIME ZONE 'Asia/Kolkata', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'))
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
 
     ELSIF TG_OP = 'UPDATE' THEN
         UPDATE public.core_walkin SET
             walkin_type = v_w_type,
-            walkin_date = NEW.submission_timestamp::date,
+            walkin_date = v_ts::date,
             walkin_time = v_time_str,
-            walkin_timestamp = NEW.submission_timestamp,
+            walkin_timestamp = v_ts,
             city = v_clean_city,
             full_name = v_full_name,
             first_name = v_f_name,
@@ -223,7 +230,7 @@ BEGIN
             sheet_row_number = NEW.sheet_row_number,
             is_deleted = FALSE,
             deleted_at = NULL,
-            updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE sheet_walkin_id = NEW.id;
     END IF;
     RETURN NEW;
@@ -251,6 +258,7 @@ DECLARE
     v_is_joined BOOLEAN;
     v_time_str VARCHAR(20);
     v_date DATE;
+    v_ts TIMESTAMP WITHOUT TIME ZONE;
     v_exec_name VARCHAR(255);
     v_exec_email VARCHAR(255);
 BEGIN
@@ -258,13 +266,13 @@ BEGIN
         -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
-            deleted_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_new_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
 
-    -- Functional standardization: Clean 10-digit mobile number
+    -- Functional standardization: Clean 10-digit phone
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.person_number, ''), '\D', '', 'g'), 10);
     
     -- Functional standardization: Canonical cities
@@ -272,11 +280,9 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
-        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
-    -- Verbatim name preservation with safe length bounds
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
@@ -296,8 +302,9 @@ BEGIN
     END;
 
     v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
-    v_date := COALESCE(NEW.event_date, NEW.created_at::date, CURRENT_DATE);
-    v_time_str := LEFT(COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI')), 20);
+    v_ts := COALESCE(NEW.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+    v_date := COALESCE(NEW.event_date, v_ts::date);
+    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(v_ts, 'HH24:MI'));
 
     SELECT 
         LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
@@ -326,13 +333,13 @@ BEGIN
         ) VALUES (
             v_next_id,
             'PORTAL_NEW', 'july_new_walkins', NULL, NEW.id, NULL,
-            'NEW_CANDIDATE', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NEW.operating_place,
+            'NEW_CANDIDATE', v_date, v_time_str, v_ts, v_clean_city, NEW.operating_place,
             v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.interested_position, 'Driver'),
             NEW.dl_number, NEW.aadhaar_number, NEW.dl_image, NEW.aadhaar_image,
             NEW.visiting_reason, v_reason_cat, NEW.joined_status, v_is_joined, NULL, COALESCE(NEW.submission_status, 'Submitted'),
             NEW.lead_channel, NEW.lead_channel_details, NEW.referred_by_name, NEW.referred_by_phone,
             COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NEW.remarks, NULL,
-            NULL, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
 
@@ -366,7 +373,7 @@ BEGIN
             remarks = NEW.remarks,
             is_deleted = FALSE,
             deleted_at = NULL,
-            updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_new_walkin_id = NEW.id;
     END IF;
     RETURN NEW;
@@ -393,6 +400,7 @@ DECLARE
     v_reason_cat VARCHAR(100);
     v_time_str VARCHAR(20);
     v_date DATE;
+    v_ts TIMESTAMP WITHOUT TIME ZONE;
     v_exec_name VARCHAR(255);
     v_exec_email VARCHAR(255);
 BEGIN
@@ -400,13 +408,13 @@ BEGIN
         -- Soft delete to preserve gapless sequence and row identity
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
-            deleted_at = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_existing_walkin_id = OLD.id;
         RETURN OLD;
     END IF;
 
-    -- Functional standardization: Clean 10-digit mobile number
+    -- Functional standardization: Clean 10-digit phone
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.person_number, ''), '\D', '', 'g'), 10);
     
     -- Functional standardization: Canonical cities
@@ -414,11 +422,9 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('hyderabad', 'hyd') THEN 'Hyderabad'
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('mumbai', 'mum') THEN 'Mumbai'
-        WHEN NULLIF(TRIM(COALESCE(NEW.city, '')), '') IS NULL THEN 'Unknown'
-        ELSE LEFT(INITCAP(TRIM(NEW.city)), 100)
+        ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city, 'Unknown'))), 100)
     END;
 
-    -- Verbatim name preservation with safe length bounds
     v_full_name := LEFT(TRIM(REGEXP_REPLACE(COALESCE(NEW.person_name, ''), '\s+', ' ', 'g')), 255);
     IF v_full_name = '' THEN
         v_full_name := LEFT(TRIM(CONCAT(COALESCE(NEW.first_name, ''), ' ', COALESCE(NEW.last_name, ''))), 255);
@@ -437,8 +443,9 @@ BEGIN
         ELSE 'OTHER'
     END;
 
-    v_date := COALESCE(NEW.event_date, NEW.created_at::date, CURRENT_DATE);
-    v_time_str := LEFT(COALESCE(NEW.enquiry_time, TO_CHAR(COALESCE(NEW.created_at, CURRENT_TIMESTAMP), 'HH24:MI')), 20);
+    v_ts := COALESCE(NEW.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'));
+    v_date := COALESCE(NEW.event_date, v_ts::date);
+    v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(v_ts, 'HH24:MI'));
 
     SELECT 
         LEFT(COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'), 255),
@@ -467,13 +474,13 @@ BEGIN
         ) VALUES (
             v_next_id,
             'PORTAL_EXISTING', 'july_existing_walkins', NULL, NULL, NEW.id,
-            'EXISTING_PARTNER', v_date, v_time_str, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), v_clean_city, NULL,
+            'EXISTING_PARTNER', v_date, v_time_str, v_ts, v_clean_city, NULL,
             v_full_name, v_f_name, v_l_name, v_clean_phone, COALESCE(NEW.partner_type, 'Driver'),
             NULL, NULL, NULL, NULL,
             NEW.visiting_reason, v_reason_cat, 'Partner Visit', FALSE, NULL, COALESCE(NEW.submission_status, 'Submitted'),
             NULL, NULL, NULL, NULL,
             COALESCE(v_exec_name, 'Executive'), COALESCE(NEW.created_by, NEW.executive_id), v_exec_email, NULL, NEW.visit_notes,
-            NULL, FALSE, NULL, COALESCE(NEW.created_at, CURRENT_TIMESTAMP), COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            NULL, FALSE, NULL, v_ts, COALESCE(NEW.updated_at, v_ts)
         );
         PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
 
@@ -496,7 +503,7 @@ BEGIN
             visit_notes = NEW.visit_notes,
             is_deleted = FALSE,
             deleted_at = NULL,
-            updated_at = COALESCE(NEW.updated_at, CURRENT_TIMESTAMP)
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_existing_walkin_id = NEW.id;
     END IF;
     RETURN NEW;
