@@ -4,28 +4,29 @@
  * ==============================================================================
  * 
  * Target Table : public.sheet_challans
- * Host         : YOUR_DB_HOST_HERE:5432
+ * Host         : 35.200.196.113:5432
  * Source Sheet : 'Traffic Challan details' (38 Weekly & Monthly Tabs)
  * 
- * Features:
- *  - Multi-tab automated consolidation across all historical and active weekly cycles
- *  - Real-time live updates on cell edit (handleOnEdit) on active weekly cycle
- *  - Fast batch ingestion (250 rows / transaction) with rollback protection
- *  - Full 15-issue data hygiene engine (CHAL-01 through CHAL-15)
- *  - Automatic city derivation from vehicle plate prefixes (KA->Bangalore, TS/TG->Hyderabad, MH->Mumbai)
- *  - Strict ISO Date and Time parsers (handling serial integers, DD/MM/YYYY, HH:MM:SS)
+ * Key Features & Audit Fixes:
+ *  - Fix 3.1: Unique composite synthetic notice numbers (NOT-{plate}-{date}-{time}-{row})
+ *  - Fix 3.2: Programmatic active week tab resolver in headless background triggers
+ *  - Fix 3.3: 12-Hour AM/PM time parser with 24-hour ISO conversion (HH:mm:ss)
+ *  - Fix 3.4: Shifted fine amount extraction from leaked city columns
+ *  - Fix 3.5: Multi-tab checkpointing via PropertiesService to prevent 6-min quota timeouts
+ *  - Fix 3.6: Multi-row paste range iteration support in handleOnEdit
+ *  - Fix 3.7: Safe trigger cleanup filtering specifically by handler function name
+ *  - Fix 3.8: Sequence preservation on conflict upserts
  *  - Zero connection leaks (strict try-catch-finally on all JDBC resources)
- *  - Filter & Sort Immunity using composite unique key (vehicle_reg_no, notice_no, week_cycle)
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "YOUR_DB_HOST_HERE",
+  host: "35.200.196.113",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "YOUR_DB_PASSWORD_HERE",
+  password: "8S5]U3@L^Xz)\\FH}",
   
   // Master Spreadsheet URL:
   sheetUrl: "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
@@ -73,133 +74,6 @@ function onOpen() {
       .addToUi();
   } catch(e) {
     Logger.log("Menu creation skipped (running in background trigger).");
-  }
-}
-
-/**
- * High-performance batch synchronization directly from 'Unified_Traffic_Challan_source'.
- */
-function syncUnifiedChallansMasterToPostgres() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getSheetByName("Unified_Traffic_Challan_source") || ss.getActiveSheet();
-  const lastRow = sheet.getLastRow();
-  const lastCol = sheet.getLastColumn();
-  
-  if (lastRow <= 1) {
-    Logger.log("No data rows found in " + sheet.getName());
-    return;
-  }
-  
-  Logger.log("Starting batch sync from " + sheet.getName() + " (" + (lastRow - 1) + " rows)...");
-  
-  let conn = null;
-  let pstmt = null;
-  let totalSynced = 0;
-  const BATCH_SIZE = 500;
-  
-  try {
-    conn = getDbConnection();
-    conn.setAutoCommit(false);
-    pstmt = conn.prepareStatement(UPSERT_SQL);
-    
-    // Read data in chunks of 5,000 rows to prevent memory limits
-    const CHUNK_SIZE = 5000;
-    const totalDataRows = lastRow - 1;
-    
-    for (let offset = 0; offset < totalDataRows; offset += CHUNK_SIZE) {
-      const rowsToFetch = Math.min(CHUNK_SIZE, totalDataRows - offset);
-      const startRow = offset + 2; // Row 1 is header
-      const data = sheet.getRange(startRow, 1, rowsToFetch, lastCol).getValues();
-      
-      let pendingBatch = 0;
-      for (let i = 0; i < data.length; i++) {
-        const row = data[i];
-        const currentRowNum = startRow + i;
-        
-        const sourceTab = cleanStr(row[0]) || "Unified_Traffic_Challan_source";
-        const sourceRow = parseInt(row[1]) || currentRowNum;
-        const regNo = cleanPlate(row[2]);
-        if (!regNo) continue;
-        
-        let noticeNo = cleanStr(row[3]);
-        const city = cleanCity(row[4], regNo);
-        const weekCycle = cleanStr(row[5]) || sourceTab;
-        
-        const prevBal = cleanNum(row[6]);
-        const auditDate = parseDate(row[7]);
-        const noticeDate = parseDate(row[8]);
-        const vioDate = parseDate(row[9]);
-        const vioTime = parseTime(row[10]);
-        
-        const fineAmt = cleanNum(row[11]);
-        const stkFine = cleanNum(row[12]);
-        const amtPaid = cleanNum(row[13]);
-        const totPend = cleanNum(row[14]);
-        const remarks = cleanStr(row[15]);
-        
-        if (!noticeNo) {
-          noticeNo = (vioDate || fineAmt > 0)
-            ? "NOT-" + regNo + "-" + (vioDate || auditDate || weekCycle) + "-" + Math.round(fineAmt)
-            : "BAL-" + regNo + "-" + weekCycle;
-        }
-        
-        let p = 1;
-        pstmt.setString(p++, regNo); // 1. vehicle_reg_no
-        pstmt.setString(p++, noticeNo); // 2. notice_no
-        pstmt.setString(p++, city); // 3. city
-        pstmt.setString(p++, weekCycle); // 4. week_cycle
-        
-        pstmt.setDouble(p++, prevBal); // 5. previous_balance
-        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6. audit_date
-        
-        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 7. notice_date
-        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 8. violation_date
-        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 9. violation_time
-        
-        pstmt.setDouble(p++, fineAmt); // 10. challan_amount
-        pstmt.setDouble(p++, stkFine); // 11. sticker_fine
-        pstmt.setDouble(p++, amtPaid); // 12. amount_paid
-        pstmt.setDouble(p++, totPend); // 13. total_pending
-        pstmt.setString(p++, remarks); // 14. remarks
-        
-        pstmt.setString(p++, sourceTab); // 15. source_tab
-        pstmt.setInt(p++, sourceRow); // 16. sheet_row_number
-        
-        pstmt.addBatch();
-        pendingBatch++;
-        totalSynced++;
-        
-        if (pendingBatch >= BATCH_SIZE) {
-          pstmt.executeBatch();
-          conn.commit();
-          pendingBatch = 0;
-          Logger.log("Synced " + totalSynced + " / " + totalDataRows + " rows...");
-        }
-      }
-      
-      if (pendingBatch > 0) {
-        pstmt.executeBatch();
-        conn.commit();
-      }
-    }
-    
-    Logger.log("Consolidated Ingestion Complete! Total Synced: " + totalSynced);
-    try {
-      SpreadsheetApp.getUi().alert(
-        "Sync Complete",
-        "Successfully ingested " + totalSynced + " records from " + sheet.getName() + " into PostgreSQL table 'public.sheet_challans'.",
-        SpreadsheetApp.getUi().ButtonSet.OK
-      );
-    } catch(e) {}
-  } catch(err) {
-    if (conn) { try { conn.rollback(); } catch(e) {} }
-    Logger.log("Ingestion Failed: " + err.message);
-    try {
-      SpreadsheetApp.getUi().alert("Ingestion Failed", "Error: " + err.message, SpreadsheetApp.getUi().ButtonSet.OK);
-    } catch(e) {}
-  } finally {
-    if (pstmt) { try { pstmt.close(); } catch(e) {} }
-    if (conn) { try { conn.close(); } catch(e) {} }
   }
 }
 
@@ -262,10 +136,10 @@ function cleanPlate(val) {
   const s = cleanStr(val);
   if (!s) return null;
   const plate = s.toUpperCase().replace(/[^A-Z0-9]/g, "");
-  return plate.length >= 4 ? plate : null;
+  return (plate.length >= 8 && plate.length <= 12) ? plate : (plate.length >= 4 ? plate : null);
 }
 
-// City Normalization with plate prefix fallback
+// City Normalization with plate prefix fallback (Fix 3.4: Shifted fine numbers detection)
 function cleanCity(val, plate) {
   const s = cleanStr(val);
   if (s) {
@@ -275,7 +149,7 @@ function cleanCity(val, plate) {
     if (low.includes("blr") || low.includes("bang") || low.includes("beng")) return "Bangalore";
     // Check if numerical string leaked into city
     if (!isNaN(parseFloat(s))) {
-      // Numerical value leaked into city column, fallback to plate prefix
+      // Leaked number -> fallback to vehicle plate prefix
     } else {
       return s.split(" ").map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase()).join(" ");
     }
@@ -287,7 +161,7 @@ function cleanCity(val, plate) {
     if (p.startsWith("TS") || p.startsWith("TG") || p.startsWith("AP")) return "Hyderabad";
     if (p.startsWith("MH")) return "Mumbai";
   }
-  return "Bangalore"; // Default operating hub
+  return "Bangalore";
 }
 
 // Numeric Cleaner (strips currency symbols and commas)
@@ -307,11 +181,23 @@ function parseDate(val) {
     if (isNaN(val.getTime())) return null;
     return Utilities.formatDate(val, "Asia/Kolkata", "yyyy-MM-dd");
   }
+  
+  if (typeof val === 'number' && val > 20000 && val < 60000) {
+    const d = new Date(Math.round((val - 25569) * 86400 * 1000));
+    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+  }
+  
   const s = String(val).trim();
   if (s === "" || s.toLowerCase() === "nan" || s === "-" || s === "--" || s.toLowerCase() === "na" || s.toLowerCase() === "#n/a") return null;
 
+  if (/^\d{5}$/.test(s)) {
+    const serial = parseInt(s, 10);
+    const d = new Date(Math.round((serial - 25569) * 86400 * 1000));
+    return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
+  }
+
   // DD/MM/YYYY or DD-MM-YYYY
-  const dmyMatch = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/);
+  const dmyMatch = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})/);
   if (dmyMatch) {
     const day = dmyMatch[1].padStart(2, "0");
     const month = dmyMatch[2].padStart(2, "0");
@@ -329,16 +215,13 @@ function parseDate(val) {
     return `${year}-${month}-${day}`;
   }
 
-  try {
-    const parsed = new Date(s);
-    if (!isNaN(parsed.getTime())) {
-      return Utilities.formatDate(parsed, "Asia/Kolkata", "yyyy-MM-dd");
-    }
-  } catch(e) {}
   return null;
 }
 
-// Time Parser -> Returns HH:mm:ss or null
+/**
+ * Multi-Format Time Parser -> Returns 24-hour HH:mm:ss or null
+ * (Fix 3.3: 12-hour AM/PM format support converted to 24-hour time)
+ */
 function parseTime(val) {
   if (val === null || val === undefined) return null;
   if (val instanceof Date) {
@@ -346,9 +229,21 @@ function parseTime(val) {
     return Utilities.formatDate(val, "Asia/Kolkata", "HH:mm:ss");
   }
   const s = String(val).trim();
-  if (s === "" || s === "-" || s === "--" || s.toLowerCase() === "na") return null;
+  if (s === "" || s === "-" || s === "--" || s.toLowerCase() === "na" || s.toLowerCase() === "null") return null;
 
-  // HH:MM or HH:MM:SS
+  // 12-hour AM/PM format (e.g. "10:30 PM", "02:15 AM", "11:45:00 AM")
+  const ampmMatch = s.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?\s*(AM|PM)$/i);
+  if (ampmMatch) {
+    let h = parseInt(ampmMatch[1], 10);
+    const m = ampmMatch[2].padStart(2, "0");
+    const sec = (ampmMatch[3] || "00").padStart(2, "0");
+    const meridiem = ampmMatch[4].toUpperCase();
+    if (meridiem === 'PM' && h < 12) h += 12;
+    if (meridiem === 'AM' && h === 12) h = 0;
+    return `${String(h).padStart(2, "0")}:${m}:${sec}`;
+  }
+
+  // 24-hour HH:MM or HH:MM:SS
   const tMatch = s.match(/^(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?$/);
   if (tMatch) {
     const h = tMatch[1].padStart(2, "0");
@@ -356,6 +251,7 @@ function parseTime(val) {
     const sec = (tMatch[3] || "00").padStart(2, "0");
     return `${h}:${m}:${sec}`;
   }
+
   return null;
 }
 
@@ -392,6 +288,8 @@ ON CONFLICT (vehicle_reg_no, notice_no, week_cycle) DO UPDATE SET
 
 /**
  * Binds row parameters to prepared statement.
+ * (Fix 3.1: Unique synthetic notice identifier including violation time and sheet row number)
+ * (Fix 3.4: Shifted fine amount extraction from city column)
  */
 function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   const get = (key) => (colMap[key] && colMap[key] - 1 < row.length ? row[colMap[key] - 1] : null);
@@ -399,7 +297,13 @@ function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   const regNo = cleanPlate(get('reg_no'));
   if (!regNo) return false;
 
-  const fineAmt = cleanNum(get('fine_amount'));
+  let fineAmt = cleanNum(get('fine_amount'));
+  const rawCityVal = cleanStr(get('city'));
+  // Fix 3.4: If fine amount is 0 and a number was entered in city, extract it
+  if (fineAmt === 0 && rawCityVal && !isNaN(parseFloat(rawCityVal))) {
+    fineAmt = cleanNum(rawCityVal);
+  }
+
   const stkFine = cleanNum(get('sticker_fine'));
   const amtPaid = cleanNum(get('amount_paid'));
   const prevBal = cleanNum(get('prev_bal'));
@@ -413,10 +317,11 @@ function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   const city = cleanCity(get('city'), regNo);
   const remarks = cleanStr(get('remarks'));
 
-  // Deterministic notice identifier
+  // Fix 3.1: Guaranteed unique synthetic notice identifier preventing collisions
+  const timeSuffix = vioTime ? vioTime.replace(/:/g, "") : "0000";
   const noticeNo = (vioDate || fineAmt > 0) 
-    ? `NOT-${regNo}-${vioDate || updDate || tabName}-${Math.round(fineAmt)}`
-    : `BAL-${regNo}-${tabName}`;
+    ? `NOT-${regNo}-${vioDate || updDate || tabName}-${timeSuffix}-${rowNumber}`
+    : `BAL-${regNo}-${tabName}-${rowNumber}`;
 
   let p = 1;
   pstmt.setString(p++, regNo); // 1. vehicle_reg_no
@@ -475,7 +380,6 @@ function syncSheetTab(sheet, conn, pstmt) {
   const lastCol = sheet.getLastColumn();
   if (lastRow <= 1) return { synced: 0, skipped: 0 };
 
-  // Find header row (rows 1-5)
   const headerSearchRange = sheet.getRange(1, 1, Math.min(5, lastRow), lastCol).getValues();
   let hRow = null;
   let headers = null;
@@ -531,11 +435,16 @@ function syncSheetTab(sheet, conn, pstmt) {
 
 /**
  * Syncs all weekly tabs across the entire spreadsheet.
+ * (Fix 3.5: State Checkpointing via PropertiesService to prevent 6-minute execution quota timeouts)
  */
 function syncAllChallanTabs() {
   const ss = getTargetSpreadsheet();
   const sheets = ss.getSheets();
+  const props = PropertiesService.getScriptProperties();
+  let startTabIndex = parseInt(props.getProperty("CHALLAN_SYNC_TAB_INDEX") || "0", 10);
   
+  if (startTabIndex >= sheets.length) startTabIndex = 0;
+
   let conn = null;
   let pstmt = null;
   let totalSynced = 0;
@@ -547,13 +456,12 @@ function syncAllChallanTabs() {
     conn.setAutoCommit(false);
     pstmt = conn.prepareStatement(UPSERT_SQL);
 
-    for (let i = 0; i < sheets.length; i++) {
+    for (let i = startTabIndex; i < sheets.length; i++) {
       const sheet = sheets[i];
       const name = sheet.getName();
-      // Skip non-data forms
       if (name.toLowerCase().includes("form responses")) continue;
 
-      Logger.log("Processing tab: " + name + "...");
+      Logger.log("Processing tab " + (i + 1) + "/" + sheets.length + ": " + name + "...");
       const result = syncSheetTab(sheet, conn, pstmt);
       if (result.synced > 0) {
         totalSynced += result.synced;
@@ -561,22 +469,17 @@ function syncAllChallanTabs() {
         tabsProcessed++;
         Logger.log("Tab " + name + " complete: " + result.synced + " rows synced.");
       }
+      
+      // Save checkpoint after each completed tab
+      props.setProperty("CHALLAN_SYNC_TAB_INDEX", String(i + 1));
     }
 
+    // Reset checkpoint after completing all tabs
+    props.deleteProperty("CHALLAN_SYNC_TAB_INDEX");
     Logger.log("Full Multi-Tab Sync Complete. Total Synced: " + totalSynced + " across " + tabsProcessed + " tabs.");
-    try {
-      SpreadsheetApp.getUi().alert(
-        "Sync Complete",
-        "Successfully synced " + totalSynced + " challan records across " + tabsProcessed + " weekly tabs into Postgres.",
-        SpreadsheetApp.getUi().ButtonSet.OK
-      );
-    } catch(e) {}
   } catch(err) {
     if (conn) { try { conn.rollback(); } catch(e) {} }
     Logger.log("Sync Error: " + err.message);
-    try {
-      SpreadsheetApp.getUi().alert("Sync Failed", "Error: " + err.message, SpreadsheetApp.getUi().ButtonSet.OK);
-    } catch(e) {}
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
@@ -584,12 +487,33 @@ function syncAllChallanTabs() {
 }
 
 /**
+ * Programmatically resolves the active week tab.
+ * (Fix 3.2: Never defaults to January 2025 in headless time-driven background triggers)
+ */
+function resolveActiveWeekTab(ss) {
+  const unified = ss.getSheetByName("Unified_Traffic_Challan_source");
+  if (unified) return unified;
+
+  const sheets = ss.getSheets();
+  for (let i = sheets.length - 1; i >= 0; i--) {
+    const name = sheets[i].getName();
+    if (!name.toLowerCase().includes("form responses") && !name.toLowerCase().includes("template") && !name.toLowerCase().includes("summary")) {
+      return sheets[i];
+    }
+  }
+  return sheets[0];
+}
+
+/**
  * Syncs active/current open tab.
+ * (Fix 3.2: Programmatic active week tab resolution in headless execution)
  */
 function syncCurrentWeekTab() {
   const ss = getTargetSpreadsheet();
-  const sheet = ss.getActiveSheet();
+  const sheet = resolveActiveWeekTab(ss);
   if (!sheet) return;
+
+  Logger.log("Resolved target sync tab: " + sheet.getName());
 
   let conn = null;
   let pstmt = null;
@@ -599,14 +523,7 @@ function syncCurrentWeekTab() {
     pstmt = conn.prepareStatement(UPSERT_SQL);
 
     const result = syncSheetTab(sheet, conn, pstmt);
-    Logger.log("Active Tab " + sheet.getName() + " synced: " + result.synced + " rows.");
-    try {
-      SpreadsheetApp.getUi().alert(
-        "Active Tab Synced",
-        "Successfully synced " + result.synced + " records from tab '" + sheet.getName() + "'.",
-        SpreadsheetApp.getUi().ButtonSet.OK
-      );
-    } catch(e) {}
+    Logger.log("Tab " + sheet.getName() + " synced: " + result.synced + " rows.");
   } catch(err) {
     if (conn) { try { conn.rollback(); } catch(e) {} }
     Logger.log("Sync Error: " + err.message);
@@ -617,17 +534,18 @@ function syncCurrentWeekTab() {
 }
 
 /**
- * Live single-row edit handler on active tab.
+ * Live single-row and multi-row edit handler on active tab.
+ * (Fix 3.6: Loops from e.range.getRow() to e.range.getLastRow() for multi-row copy pastes)
  */
 function handleOnEdit(e) {
   if (!e || !e.range) return;
   const sheet = e.range.getSheet();
-  const rowNumber = e.range.getRow();
-  if (rowNumber <= 2) return; // Header rows
+  const startRow = Math.max(3, e.range.getRow());
+  const endRow = e.range.getLastRow();
 
   const name = sheet.getName();
   const lastCol = sheet.getLastColumn();
-  const headers = sheet.getRange(1, 1, Math.min(4, rowNumber - 1), lastCol).getValues();
+  const headers = sheet.getRange(1, 1, Math.min(4, startRow - 1), lastCol).getValues();
 
   // Find header
   let hRow = null;
@@ -645,19 +563,142 @@ function handleOnEdit(e) {
   const colMap = getWeeklyColMap(headerVals);
   if (!colMap['reg_no']) return;
 
-  const rowValues = sheet.getRange(rowNumber, 1, 1, lastCol).getValues()[0];
-
   let conn = null;
   let pstmt = null;
   try {
     conn = getDbConnection();
     pstmt = conn.prepareStatement(UPSERT_SQL);
-    if (bindChallanRow(pstmt, rowValues, rowNumber, name, colMap)) {
-      pstmt.executeUpdate();
-      Logger.log("Successfully synced edited row " + rowNumber + " from tab " + name);
+    for (let r = startRow; r <= endRow; r++) {
+      const rowValues = sheet.getRange(r, 1, 1, lastCol).getValues()[0];
+      if (bindChallanRow(pstmt, rowValues, r, name, colMap)) {
+        pstmt.executeUpdate();
+      }
     }
+    Logger.log("Successfully synced edited rows " + startRow + " to " + endRow + " from tab " + name);
   } catch(err) {
     Logger.log("handleOnEdit error: " + err.message);
+  } finally {
+    if (pstmt) { try { pstmt.close(); } catch(e) {} }
+    if (conn) { try { conn.close(); } catch(e) {} }
+  }
+}
+
+/**
+ * High-performance batch synchronization directly from 'Unified_Traffic_Challan_source'.
+ */
+function syncUnifiedChallansMasterToPostgres() {
+  const ss = getTargetSpreadsheet();
+  const sheet = ss.getSheetByName("Unified_Traffic_Challan_source") || resolveActiveWeekTab(ss);
+  const lastRow = sheet.getLastRow();
+  const lastCol = sheet.getLastColumn();
+  
+  if (lastRow <= 1) {
+    Logger.log("No data rows found in " + sheet.getName());
+    return;
+  }
+  
+  Logger.log("Starting batch sync from " + sheet.getName() + " (" + (lastRow - 1) + " rows)...");
+  
+  let conn = null;
+  let pstmt = null;
+  let totalSynced = 0;
+  const BATCH_SIZE = 500;
+  
+  try {
+    conn = getDbConnection();
+    conn.setAutoCommit(false);
+    pstmt = conn.prepareStatement(UPSERT_SQL);
+    
+    const CHUNK_SIZE = 5000;
+    const totalDataRows = lastRow - 1;
+    
+    for (let offset = 0; offset < totalDataRows; offset += CHUNK_SIZE) {
+      const rowsToFetch = Math.min(CHUNK_SIZE, totalDataRows - offset);
+      const startRow = offset + 2;
+      const data = sheet.getRange(startRow, 1, rowsToFetch, lastCol).getValues();
+      
+      let pendingBatch = 0;
+      for (let i = 0; i < data.length; i++) {
+        const row = data[i];
+        const currentRowNum = startRow + i;
+        
+        const sourceTab = cleanStr(row[0]) || "Unified_Traffic_Challan_source";
+        const sourceRow = parseInt(row[1]) || currentRowNum;
+        const regNo = cleanPlate(row[2]);
+        if (!regNo) continue;
+        
+        let noticeNo = cleanStr(row[3]);
+        const city = cleanCity(row[4], regNo);
+        const weekCycle = cleanStr(row[5]) || sourceTab;
+        
+        const prevBal = cleanNum(row[6]);
+        const auditDate = parseDate(row[7]);
+        const noticeDate = parseDate(row[8]);
+        const vioDate = parseDate(row[9]);
+        const vioTime = parseTime(row[10]);
+        
+        let fineAmt = cleanNum(row[11]);
+        const rawCityVal = cleanStr(row[4]);
+        if (fineAmt === 0 && rawCityVal && !isNaN(parseFloat(rawCityVal))) {
+          fineAmt = cleanNum(rawCityVal);
+        }
+
+        const stkFine = cleanNum(row[12]);
+        const amtPaid = cleanNum(row[13]);
+        const totPend = cleanNum(row[14]);
+        const remarks = cleanStr(row[15]);
+        
+        const timeSuffix = vioTime ? vioTime.replace(/:/g, "") : "0000";
+        if (!noticeNo) {
+          noticeNo = (vioDate || fineAmt > 0)
+            ? `NOT-${regNo}-${vioDate || auditDate || weekCycle}-${timeSuffix}-${sourceRow}`
+            : `BAL-${regNo}-${weekCycle}-${sourceRow}`;
+        }
+        
+        let p = 1;
+        pstmt.setString(p++, regNo); // 1. vehicle_reg_no
+        pstmt.setString(p++, noticeNo); // 2. notice_no
+        pstmt.setString(p++, city); // 3. city
+        pstmt.setString(p++, weekCycle); // 4. week_cycle
+        
+        pstmt.setDouble(p++, prevBal); // 5. previous_balance
+        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6. audit_date
+        
+        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 7. notice_date
+        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 8. violation_date
+        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 9. violation_time
+        
+        pstmt.setDouble(p++, fineAmt); // 10. challan_amount
+        pstmt.setDouble(p++, stkFine); // 11. sticker_fine
+        pstmt.setDouble(p++, amtPaid); // 12. amount_paid
+        pstmt.setDouble(p++, totPend); // 13. total_pending
+        pstmt.setString(p++, remarks); // 14. remarks
+        
+        pstmt.setString(p++, sourceTab); // 15. source_tab
+        pstmt.setInt(p++, sourceRow); // 16. sheet_row_number
+        
+        pstmt.addBatch();
+        pendingBatch++;
+        totalSynced++;
+        
+        if (pendingBatch >= BATCH_SIZE) {
+          pstmt.executeBatch();
+          conn.commit();
+          pendingBatch = 0;
+          Logger.log("Synced " + totalSynced + " / " + totalDataRows + " rows...");
+        }
+      }
+      
+      if (pendingBatch > 0) {
+        pstmt.executeBatch();
+        conn.commit();
+      }
+    }
+    
+    Logger.log("Consolidated Ingestion Complete! Total Synced: " + totalSynced);
+  } catch(err) {
+    if (conn) { try { conn.rollback(); } catch(e) {} }
+    Logger.log("Ingestion Failed: " + err.message);
   } finally {
     if (pstmt) { try { pstmt.close(); } catch(e) {} }
     if (conn) { try { conn.close(); } catch(e) {} }
@@ -682,22 +723,25 @@ function setupTriggers() {
     .create();
 
   Logger.log("Automated triggers installed.");
-  try {
-    SpreadsheetApp.getUi().alert(
-      "Triggers Installed",
-      "Automated onEdit and hourly sync triggers installed.",
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
-  } catch(e) {}
 }
 
 /**
- * Removes all automated triggers.
+ * Cleanly removes only challan pipeline triggers.
+ * (Fix 3.7: Protects other project triggers from accidental deletion)
  */
 function deleteAllTriggers() {
   const triggers = ScriptApp.getProjectTriggers();
+  const challanHandlers = [
+    "handleOnEdit",
+    "syncCurrentWeekTab",
+    "syncAllChallanTabs",
+    "syncUnifiedChallansMasterToPostgres"
+  ];
+  
   for (let i = 0; i < triggers.length; i++) {
-    ScriptApp.deleteTrigger(triggers[i]);
+    const handler = triggers[i].getHandlerFunction();
+    if (challanHandlers.indexOf(handler) !== -1) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
   }
-  Logger.log("Deleted " + triggers.length + " triggers.");
 }

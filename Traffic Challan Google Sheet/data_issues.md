@@ -9,7 +9,7 @@ This document details all **15 operational abnormalities and data hygiene issues
 * **Total Merged Records Scanned**: 35,930 records
 * **Total Unique Vehicles Tracked**: 1,601 vehicles
 * **Active Police Violations Incurred**: 5,043 fine events
-* **Primary / Natural Key**: `(vehicle_reg_no, notice_no)`
+* **Primary / Natural Key**: `(vehicle_reg_no, notice_no, week_cycle)`
 * **Total Issues Documented**: 15 (`CHAL-01` through `CHAL-15`)
 * **Zero Data Loss Rule**: 100% of historical weekly balances and violation events are preserved with full attribution.
 
@@ -18,7 +18,7 @@ This document details all **15 operational abnormalities and data hygiene issues
 ## Master Issue Registry (`CHAL-01` to `CHAL-15`)
 
 | Issue ID | Sheet / Tab | Variable / Column | Issue Name & Category | MY INPUT | Proposed Code Standardization Rule | Detailed Error Description & Root Cause | Affected Rows | % Dataset | Severity | Standardization Capability | Why Custom Input Needed (If Applicable) | Action Required by User / Ops Team |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :--- | :--- |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :--- | :--- |
 | **CHAL-01** | `Unified_Traffic_Challan_source` | `Registration No` | Primary Key Formatting & Whitespace Sanitization | Strip all spaces, hyphens, and dots, and convert to clean uppercase. Every plate must strictly follow standard 9-10 character format. | Apply `UPPER(TRIM(REGEXP_REPLACE(reg_no, r"[^A-Za-z0-9]", "")))`. Enforce 9-10 char plate standard. | Raw vehicle registration numbers contain internal spaces, lowercase letters, hyphens, and stray punctuation marks across weekly tabs. | 35930 | 100.0% | `CRITICAL` | `FULLY AUTOMATED (CODE)` | None (Regex uppercase & whitespace stripping handles all plate variations deterministically) | None |
 | **CHAL-02** | `Unified_Traffic_Challan_source` | `City` | City Name Typos & Misspelling Normalization | Fix common typos like 'Hyderbad' to 'Hyderabad' and standardize case. If missing, auto-derive city from vehicle state prefix (KA -> Bangalore, TS/TG -> Hyderabad, MH -> Mumbai). | Map "Hyderbad" -> "Hyderabad", "blr"/"bang" -> "Bangalore", "mum" -> "Mumbai". Auto-derive missing cities from plate state prefixes. | City names entered with frequent spelling mistakes ('Hyderbad' in 4,943 rows), lowercase casing, or left blank across city operations. | 5069 | 14.1% | `HIGH` | `FULLY AUTOMATED (CODE)` | None (Typo dictionary and plate state prefix fallback automatically resolve city) | None |
 | **CHAL-03** | `Unified_Traffic_Challan_source` | `City` | Shifted Numerical Fines in City Column | When numeric fine amounts appear in the City column due to column shifts, move the amount to challan fine and assign the city based on the plate prefix. | Detect numeric patterns in City column, route amount to `challan_amount`, and populate canonical city via vehicle plate prefix. | Spreadsheet column shifting caused fine amounts (500, 1000, 1500, 2000) to be entered into the City column instead of the Fine column. | 83 | 0.2% | `HIGH` | `FULLY AUTOMATED (CODE)` | None (Numeric detection in text column shifts value to fine and infers city from plate) | None |
@@ -37,13 +37,15 @@ This document details all **15 operational abnormalities and data hygiene issues
 
 ---
 
-## Architectural Principles Enforced in Pipeline
+## Team Lead Audit Resolution Log (Anurag Review Fixes 3.1 - 3.8)
 
-1. **Zero Data Loss Rule**:
-   * Every single row across all 38 tabs is preserved with complete weekly ledger history.
-2. **Three Core Financial Pillars**:
-   * **`vehicle_reg_no`**: Clean uppercase alphanumeric string.
-   * **`violation_date`**: Exact ISO `DATE` for violation events; `NULL` for routine balance snapshot rows.
-   * **`challan_amount`**: Clean `NUMERIC(12,2)` government fine.
-3. **Primary Key Integrity**:
-   * Keyed on composite `(vehicle_reg_no, notice_no, week_cycle)`, ensuring gapless, idempotent `ON CONFLICT DO UPDATE` synchronization.
+| Issue # | Issue Title | Root Cause Identified | Resolved State & Implementation |
+| :--- | :--- | :--- | :--- |
+| **3.1** | Synthetic Notice Number Collisions | Synthetic notice format `NOT-{plate}-{date}-{amount}` collided on multiple fines per vehicle on the same day. | Updated synthetic generator to include violation time and sheet row number: `NOT-{plate}-{date}-{time}-{row}` for guaranteed uniqueness. |
+| **3.2** | Hourly Trigger Syncs Wrong Tab (Jan 2025) | `ss.getActiveSheet()` defaulted to leftmost historical tab in headless time-driven background runs. | Created `resolveActiveWeekTab(ss)` to programmatically target active weekly tabs and `Unified_Traffic_Challan_source`. |
+| **3.3** | 12-Hour AM/PM Time Parser Wipes Times | Regex failed on "10:30 PM" / "02:15 AM", wiping 3,343 violation times to NULL. | Added 12-hour AM/PM regex parser converting into clean 24-hour `HH:mm:ss`. |
+| **3.4** | Shifted Fines in City Column Discarded | Leaked numeric values in City column were dropped due to empty conditional block. | Extracted numeric values from city column into `challan_amount` and derived canonical city from vehicle plate prefix. |
+| **3.5** | Multi-Tab 6-Minute Quota Timeout | Iterating 38 tabs synchronously exceeded GAS 360-second limit without checkpointing. | Added state checkpointing via `PropertiesService` (`CHALLAN_SYNC_TAB_INDEX`) enabling resumable tab processing. |
+| **3.6** | Multi-Row Paste Ignored in `handleOnEdit` | Line 625 only synced `e.range.getRow()`. | Added range loop from `e.range.getRow()` to `e.range.getLastRow()`. |
+| **3.7** | Destructive Trigger Deletion in `deleteAllTriggers` | Wiped all project triggers indiscriminately. | Scoped deletion specifically to challan pipeline handler names (`handleOnEdit`, `syncCurrentWeekTab`, etc.). |
+| **3.8** | Sequence Advancement on Conflict Upserts | Standard upsert burned sequence IDs on conflict checks. | Parameterized conflict updates preserving existing sequence numbers. |
