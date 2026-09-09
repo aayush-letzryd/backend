@@ -2,7 +2,7 @@
 ===============================================================================
 FLEET STATUS & INTERVAL LEDGER VERIFICATION SCRIPT
 Demonstrates the mathematical validity of the Vehicle Interval Pairing Engine
-on live PostgreSQL data.
+and audits all real-world edge cases on live PostgreSQL data.
 ===============================================================================
 """
 
@@ -28,7 +28,7 @@ def run_verification():
     print("--- 1. MASTER FLEET ASSET TOTALS ---")
     cur.execute("SELECT COUNT(*) FROM public.core_vehicle_onboarding WHERE is_deleted = FALSE;")
     total_vehicles = cur.fetchone()[0]
-    print(f"Total Onboarded Fleet (Denominator): {total_vehicles} vehicles")
+    print(f"Total Onboarded Fleet (Denominator): {total_vehicles} active vehicles")
 
     print("\n--- 2. RAW EVENT COUNTS ---")
     cur.execute("SELECT COUNT(*) FROM public.core_vehicle_allocation WHERE is_deleted = FALSE;")
@@ -81,35 +81,38 @@ def run_verification():
     print(f"Total Intervals Evaluated: {res[0]}")
     print(f"Closed Trips (Completed & Dropped Off): {res[1]}")
     print(f"Currently Active on Road (Open Allocations): {res[2]}")
+    print(f"Currently in Yard (RFD) / Workshop: {total_vehicles - res[2]} vehicles")
 
-    print("\n--- 4. SAMPLE ACTIVE VEHICLES ON ROAD TODAY ---")
+    print("\n--- 4. EDGE CASE AUDIT ON LIVE DATABASE ---")
+    # Edge Case 1: Pristine RFD Vehicles
+    cur.execute("""
+    SELECT COUNT(*) 
+    FROM public.core_vehicle_onboarding vo
+    WHERE vo.is_deleted = FALSE
+      AND NOT EXISTS (
+          SELECT 1 FROM public.core_vehicle_allocation a 
+          WHERE a.vehicle_number = vo.registration_no AND a.is_deleted = FALSE
+      );
+    """)
+    pristine_rfd = cur.fetchone()[0]
+    print(f" - Edge Case 1: Pristine RFD Vehicles (0 historical allocations): {pristine_rfd} cars")
+
+    # Edge Case 2: Same-Day Trips
     cur.execute("""
     WITH ranked_allocations AS (
         SELECT 
             a.id AS allocation_id,
             a.vehicle_number,
-            a.partner_id,
-            a.driver_name,
             a.allocation_date,
-            LEAD(a.allocation_date) OVER (
-                PARTITION BY a.vehicle_number 
-                ORDER BY a.allocation_date ASC, a.id ASC
-            ) AS next_allocation_date
+            LEAD(a.allocation_date) OVER (PARTITION BY a.vehicle_number ORDER BY a.allocation_date, a.id) AS next_allocation_date
         FROM public.core_vehicle_allocation a
         WHERE a.is_deleted = FALSE
     ),
-    paired_intervals AS (
-        SELECT 
-            ra.allocation_id,
-            ra.vehicle_number,
-            ra.partner_id,
-            ra.driver_name,
-            ra.allocation_date AS start_date,
-            d.id AS dropoff_id,
-            d.return_date AS end_date
+    paired AS (
+        SELECT ra.allocation_date, d.return_date
         FROM ranked_allocations ra
-        LEFT JOIN LATERAL (
-            SELECT d.id, d.return_date
+        JOIN LATERAL (
+            SELECT d.return_date
             FROM public.core_dropoffs d
             WHERE d.is_deleted = FALSE
               AND d.vehicle_number = ra.vehicle_number
@@ -119,15 +122,46 @@ def run_verification():
             LIMIT 1
         ) d ON TRUE
     )
-    SELECT vehicle_number, partner_id, driver_name, start_date
-    FROM paired_intervals
-    WHERE dropoff_id IS NULL
-    ORDER BY start_date DESC
-    LIMIT 5;
+    SELECT COUNT(*) FROM paired WHERE return_date = allocation_date;
     """)
-    active_samples = cur.fetchall()
-    for row in active_samples:
-        print(f" - Vehicle {row[0]}: Active with {row[1]} ({row[2]}) since {row[3]}")
+    same_day = cur.fetchone()[0]
+    print(f" - Edge Case 2: Same-Day Trips (Allocated and dropped off on same date): {same_day} trips")
+
+    # Edge Case 3: Consecutive Allocations without Intervening Drop-off
+    cur.execute("""
+    WITH ordered_allocs AS (
+        SELECT 
+            id, vehicle_number, partner_id, allocation_date,
+            LEAD(allocation_date) OVER (PARTITION BY vehicle_number ORDER BY allocation_date, id) AS next_alloc_date
+        FROM public.core_vehicle_allocation
+        WHERE is_deleted = FALSE
+    )
+    SELECT COUNT(*)
+    FROM ordered_allocs oa
+    WHERE oa.next_alloc_date IS NOT NULL
+      AND NOT EXISTS (
+          SELECT 1 FROM public.core_dropoffs d
+          WHERE d.vehicle_number = oa.vehicle_number
+            AND d.is_deleted = FALSE
+            AND d.return_date >= oa.allocation_date
+            AND d.return_date <= oa.next_alloc_date
+      );
+    """)
+    consec_allocs = cur.fetchone()[0]
+    print(f" - Edge Case 3: Capped Consecutive Allocations (No drop-off in between): {consec_allocs} instances")
+
+    # Edge Case 4: Orphan Drop-offs
+    cur.execute("""
+    SELECT COUNT(*)
+    FROM public.core_dropoffs d
+    WHERE d.is_deleted = FALSE
+      AND NOT EXISTS (
+          SELECT 1 FROM public.core_vehicle_allocation a
+          WHERE a.vehicle_number = d.vehicle_number AND a.is_deleted = FALSE
+      );
+    """)
+    orphan_dropoffs = cur.fetchone()[0]
+    print(f" - Edge Case 4: Orphan Dropoffs (No prior allocation on record): {orphan_dropoffs} instances")
 
     conn.close()
     print("\nVerification completed successfully.")
