@@ -125,18 +125,30 @@ SELECT
     ra.hub_name,
     ra.allocation_date AS trip_start_date,
     d.id AS dropoff_id,
-    COALESCE(d.return_date, ra.next_allocation_date) AS trip_end_date,
+    -- For IP Operators, Repair & Maintenance dropoffs do NOT truncate trip_end_date 
+    -- unless superseded by another allocation
+    CASE 
+        WHEN d.return_type = 'Repair and Maintenance' AND UPPER(ra.partner_id) LIKE '%IP%' 
+            THEN ra.next_allocation_date
+        ELSE COALESCE(d.return_date, ra.next_allocation_date)
+    END AS trip_end_date,
     d.return_type,
     d.negative_balance AS final_debt,
-    CASE 
-        WHEN d.id IS NOT NULL THEN 'CLOSED_TRIP'
-        WHEN ra.next_allocation_date IS NOT NULL THEN 'SUPERSEDED_BY_NEXT_ALLOCATION'
+    CASE
+        WHEN d.return_type = 'Repair and Maintenance' AND UPPER(ra.partner_id) LIKE '%IP%' AND ra.next_allocation_date IS NULL 
+            THEN 'OPERATOR_MAINTENANCE_ACTIVE'
+        WHEN d.id IS NOT NULL 
+            THEN 'CLOSED_TRIP'
+        WHEN ra.next_allocation_date IS NOT NULL 
+            THEN 'SUPERSEDED_BY_NEXT_ALLOCATION'
         ELSE 'CURRENTLY_ACTIVE'
     END AS trip_state,
-    CASE 
-        WHEN d.return_date IS NOT NULL THEN (d.return_date - ra.allocation_date)
-        WHEN ra.next_allocation_date IS NOT NULL THEN (ra.next_allocation_date - ra.allocation_date)
-        ELSE (CURRENT_DATE - ra.allocation_date)
+    CASE
+        WHEN d.return_date IS NOT NULL AND NOT (d.return_type = 'Repair and Maintenance' AND UPPER(ra.partner_id) LIKE '%IP%')
+            THEN d.return_date - ra.allocation_date
+        WHEN ra.next_allocation_date IS NOT NULL 
+            THEN ra.next_allocation_date - ra.allocation_date
+        ELSE CURRENT_DATE - ra.allocation_date
     END AS days_duration
 FROM ranked_allocations ra
 LEFT JOIN LATERAL (
@@ -225,9 +237,9 @@ WHERE vo.is_deleted = FALSE;
 -- 5. Daily Status Ledger Generation Stored Procedure
 -- Evaluates Maintenance (Priority 1), Trip Intervals (Priority 2), and RFD (Priority 3)
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(p_target_date DATE)
+CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(IN p_target_date date)
 LANGUAGE plpgsql
-AS $$
+AS $procedure$
 BEGIN
     INSERT INTO public.core_daily_vehicle_status (
         status_date,
@@ -255,34 +267,49 @@ BEGIN
         vo.registration_no AS vehicle_number,
         COALESCE(ti.city, vo.city, 'UNKNOWN') AS city,
         
-        -- Resolution: Maintenance > Active Allocation > RFD in Yard
+        -- Granular Status Taxonomy Matching Operations
         CASE 
-            WHEN cm.id IS NOT NULL THEN 'Maintenance'
-            WHEN ti.allocation_id IS NOT NULL THEN 'Active'
+            WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL 
+                THEN 'Same Day D&A'
+            WHEN alloc_today.id IS NOT NULL 
+                THEN 'Allocation'
+            WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery') 
+                THEN 'Drop Off'
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL 
+                THEN 'Maintenance'
+            WHEN ti.allocation_id IS NOT NULL 
+                THEN 'Active'
             ELSE 'RFD'
         END AS final_status,
         
+        -- Cohort Classification
         CASE 
-            WHEN cm.id IS NOT NULL THEN 'Off Road'
+            WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'On Road'
+            WHEN alloc_today.id IS NOT NULL THEN 'On Road'
+            WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery') THEN 'Off Road'
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'Off Road'
             WHEN ti.allocation_id IS NOT NULL THEN 'On Road'
             ELSE 'In Yard'
         END AS cohort,
         
-        -- Driver Assignment (NULL if in maintenance or yard)
+        -- Partner Assignment
         CASE 
-            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
+                CASE WHEN UPPER(ti.partner_id) LIKE '%IP%' THEN ti.partner_id ELSE NULL END
             WHEN ti.allocation_id IS NOT NULL THEN ti.partner_id
             ELSE NULL
         END AS partner_id,
         
         CASE 
-            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
+                CASE WHEN UPPER(ti.partner_id) LIKE '%IP%' THEN ti.driver_name ELSE NULL END
             WHEN ti.allocation_id IS NOT NULL THEN ti.driver_name
             ELSE NULL
         END AS partner_name,
         
         CASE 
-            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
+                CASE WHEN UPPER(ti.partner_id) LIKE '%IP%' THEN ti.driver_phone ELSE NULL END
             WHEN ti.allocation_id IS NOT NULL THEN ti.driver_phone
             ELSE NULL
         END AS partner_phone,
@@ -295,30 +322,36 @@ BEGIN
         ti.trip_end_date,
         cm.id AS maintenance_id,
         
-        -- Rent is ONLY charged on Active days
+        -- Rent Billing Rule
         CASE 
-            WHEN cm.id IS NOT NULL THEN FALSE
+            WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN TRUE
+            WHEN alloc_today.id IS NOT NULL THEN TRUE
+            WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery') THEN FALSE
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN FALSE
             WHEN ti.allocation_id IS NOT NULL THEN TRUE
             ELSE FALSE
         END AS billable_rent_day,
         
         CASE 
-            WHEN cm.id IS NOT NULL THEN 'WORKSHOP_MAINTENANCE'
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'WORKSHOP_MAINTENANCE'
+            WHEN drop_today.id IS NOT NULL THEN 'DROPOFF_INSPECTION'
             WHEN ti.allocation_id IS NULL THEN 'RFD_IN_YARD'
             ELSE NULL
         END AS rent_waived_reason,
         
         CASE 
-            WHEN cm.id IS NOT NULL THEN 'MAINTENANCE_OVERRIDE'
-            WHEN ti.dropoff_id IS NOT NULL THEN 'INTERVAL_MATCH'
-            WHEN ti.allocation_id IS NOT NULL THEN 'OPEN_ALLOCATION'
+            WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'SAME_DAY_HANDOVER'
+            WHEN alloc_today.id IS NOT NULL THEN 'ALLOCATION_EVENT'
+            WHEN drop_today.id IS NOT NULL THEN 'DROPOFF_EVENT'
+            WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'MAINTENANCE_PIPELINE'
+            WHEN ti.allocation_id IS NOT NULL THEN 'ACTIVE_INTERVAL'
             ELSE 'YARD_ROLLOVER'
         END AS source_origin,
         
         CURRENT_TIMESTAMP AS updated_at
     FROM public.core_vehicle_onboarding vo
     
-    -- Priority 1: Check Maintenance
+    -- Priority 1: Check Dedicated Maintenance Table
     LEFT JOIN LATERAL (
         SELECT id
         FROM public.core_maintenance
@@ -329,14 +362,49 @@ BEGIN
         ORDER BY start_date DESC
         LIMIT 1
     ) cm ON TRUE
+
+    -- Priority 2: Fallback Maintenance Detection (Repair & Maintenance dropoff without subsequent closure)
+    LEFT JOIN LATERAL (
+        SELECT id, return_date
+        FROM public.core_dropoffs
+        WHERE is_deleted = FALSE
+          AND vehicle_number = vo.registration_no
+          AND return_type = 'Repair and Maintenance'
+          AND return_date <= p_target_date
+          AND return_date >= p_target_date - INTERVAL '7 days'
+        ORDER BY return_date DESC, id DESC
+        LIMIT 1
+    ) rm_today ON TRUE
     
-    -- Priority 2: Check Active Trip Intervals
+    -- Priority 3: Allocation Event Today
+    LEFT JOIN LATERAL (
+        SELECT id, partner_id, driver_name, driver_phone, hub_name, car_model, city
+        FROM public.core_vehicle_allocation
+        WHERE is_deleted = FALSE
+          AND vehicle_number = vo.registration_no
+          AND allocation_date = p_target_date
+        ORDER BY id DESC
+        LIMIT 1
+    ) alloc_today ON TRUE
+
+    -- Priority 4: Dropoff Event Today
+    LEFT JOIN LATERAL (
+        SELECT id, return_type
+        FROM public.core_dropoffs
+        WHERE is_deleted = FALSE
+          AND vehicle_number = vo.registration_no
+          AND return_date = p_target_date
+        ORDER BY id DESC
+        LIMIT 1
+    ) drop_today ON TRUE
+
+    -- Priority 5: Active Trip Interval
     LEFT JOIN LATERAL (
         SELECT *
         FROM public.v_vehicle_trip_intervals ti
         WHERE ti.vehicle_number = vo.registration_no
           AND ti.trip_start_date <= p_target_date
-          AND (ti.trip_end_date IS NULL OR ti.trip_end_date >= p_target_date)
+          AND (ti.trip_end_date IS NULL OR ti.trip_end_date > p_target_date)
         ORDER BY ti.trip_start_date DESC
         LIMIT 1
     ) ti ON TRUE
@@ -361,4 +429,4 @@ BEGIN
         source_origin = EXCLUDED.source_origin,
         updated_at = CURRENT_TIMESTAMP;
 END;
-$$;
+$procedure$;
