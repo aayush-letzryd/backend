@@ -331,9 +331,162 @@ python verify_engine.py
 
 ### Live Database Output:
 * Total Onboarded Fleet: **1,623 active vehicles**
-* Total Trip Starts (Allocations): **7,269 records**
-* Total Completed Trips (Closed Drop-offs): **6,128 records**
-* Currently Active on Road (Open Allocations): **1,141 vehicles**
-* Currently in Yard (RFD) / Workshop: **482 vehicles** ($1,623 - 1,141$)
+* Total Trip Starts (Allocations): **7,273 records**
+* Total Completed Trips (Closed Drop-offs): **6,134 records**
+* Currently Active on Road (Open Allocations): **1,139 vehicles**
+* Currently in Yard (RFD) / Workshop: **484 vehicles** ($1,623 - 1,139$)
 * Pristine RFD Vehicles (0 historical allocations): **139 vehicles**
-* Same-Day Completed Trips: **1,093 trips**
+* Same-Day Completed Trips: **1,094 trips**
+
+---
+
+## 9. End-to-End Operational Runbook (Step-by-Step Knowledge Transfer)
+
+This step-by-step runbook explains how to operate, deploy, query, and maintain the vehicle status engine. Follow these steps sequentially:
+
+### Step 1: Verify Core Source Data (The Denominator & Event Sources)
+Before executing the status engine, confirm that the four underlying core tables are populated and consistent:
+1. **`public.core_vehicle_onboarding`**: This is the master asset denominator. Check the active fleet count:
+   ```sql
+   SELECT count(*) FROM public.core_vehicle_onboarding WHERE is_deleted = FALSE;
+   -- Expected: Exactly 1,623 active vehicles.
+   ```
+2. **`public.core_vehicle_allocation`**: Unified allocation events (trip starts).
+   ```sql
+   SELECT count(*) FROM public.core_vehicle_allocation WHERE is_deleted = FALSE;
+   -- Expected: 7,273 records.
+   ```
+3. **`public.core_dropoffs`**: Unified vehicle return events (trip ends).
+   ```sql
+   SELECT count(*) FROM public.core_dropoffs WHERE is_deleted = FALSE;
+   -- Expected: 6,297 records.
+   ```
+4. **`public.core_maintenance`**: Unified workshop repair events.
+
+> **Key Rule**: A vehicle cannot have an operational status unless it exists in `public.core_vehicle_onboarding`. If a vehicle appears in an allocation or drop-off sheet but is not onboarded, it will not be evaluated.
+
+---
+
+### Step 2: Deploy the Database Schema & Core Objects
+Deploy the complete schema file [`schema.sql`](file:///C:/Users/anura/RYD/backend_repo/temp_vehicle_status_architecture/schema.sql) onto the PostgreSQL database:
+```bash
+psql -h 35.200.196.113 -U postgres -d postgres -f schema.sql
+```
+
+This command deploys five core database objects:
+1. **`public.core_maintenance`**: Master table for workshop downtime intervals.
+2. **`public.core_daily_vehicle_status`**: Master daily attendance ledger (1 row per vehicle per calendar date).
+3. **`public.v_vehicle_trip_intervals`**: Mathematical view pairing allocations with drop-offs.
+4. **`public.v_current_live_fleet_status`**: Real-time view for immediate fleet operational queries.
+5. **`public.sp_generate_daily_vehicle_status`**: Stored procedure to generate daily attendance.
+
+---
+
+### Step 3: Query Real-Time Fleet Status ("What is happening right now?")
+To determine what every single vehicle in the fleet is doing at the present moment, query the live view:
+```sql
+SELECT 
+    live_status, 
+    live_cohort, 
+    count(*) AS vehicle_count,
+    round(count(*) * 100.0 / sum(count(*)) over (), 2) AS percentage
+FROM public.v_current_live_fleet_status
+GROUP BY live_status, live_cohort
+ORDER BY vehicle_count DESC;
+```
+
+**Expected Distribution**:
+- **`Active` / `On Road`**: ~1,139 vehicles (cars assigned to a driver on an active trip).
+- **`RFD` / `In Yard`**: ~484 vehicles (cars parked in hub yards ready for deployment).
+- **`Maintenance` / `Off Road`**: Vehicles currently undergoing workshop repairs.
+
+**To inspect a specific vehicle right now**:
+```sql
+SELECT vehicle_number, live_status, live_cohort, current_driver_id, current_driver_name, current_trip_started
+FROM public.v_current_live_fleet_status
+WHERE vehicle_number = 'MH03ES1169';
+```
+
+---
+
+### Step 4: Generate the Daily Attendance Ledger ("What was the status on Date X?")
+The daily ledger table `public.core_daily_vehicle_status` records the exact status of every car for each calendar day, serving as the single source of truth for weekly Hisaab and rent deductions.
+
+**To generate or refresh status for a single date**:
+```sql
+CALL public.sp_generate_daily_vehicle_status('2026-09-09');
+```
+
+**To verify the generated daily records**:
+```sql
+SELECT final_status, cohort, count(*)
+FROM public.core_daily_vehicle_status
+WHERE status_date = '2026-09-09'
+GROUP BY final_status, cohort
+ORDER BY count(*) DESC;
+-- The total count must equal exactly 1,623 rows (100% fleet coverage).
+```
+
+**To backfill historical dates (e.g. an entire month)**:
+Execute a simple SQL block to iterate over the desired date range:
+```sql
+DO $$
+DECLARE
+    curr_date DATE := '2026-08-01';
+    end_date DATE := '2026-08-31';
+BEGIN
+    WHILE curr_date <= end_date LOOP
+        RAISE NOTICE 'Generating fleet status for date: %', curr_date;
+        CALL public.sp_generate_daily_vehicle_status(curr_date);
+        curr_date := curr_date + INTERVAL '1 day';
+    END LOOP;
+END $$;
+```
+
+---
+
+### Step 5: Understand the Priority Precedence Engine
+When evaluating a vehicle on any given date, the engine applies three strict priority rules in sequential order:
+
+1. **Priority 1: Is the vehicle in a workshop?**
+   - Check `core_maintenance`: Does `start_date <= target_date AND (end_date IS NULL OR end_date >= target_date)`?
+   - If **YES**: Status is set to **`Maintenance`** (`cohort = 'Off Road'`). Rent is waived (`billable_rent_day = FALSE`, `rent_waived_reason = 'WORKSHOP_MAINTENANCE'`). Driver assignment is set to `NULL` for retail drivers, but preserved for `IP` operators.
+2. **Priority 2: Is the vehicle on an active trip?**
+   - Check `v_vehicle_trip_intervals`: Does `trip_start_date <= target_date AND (trip_end_date IS NULL OR trip_end_date > target_date)`?
+   - If **YES**: Status is set to **`Active`** (`cohort = 'On Road'`). Driver assignment is populated with `partner_id` and `driver_name`. Rent is billable (`billable_rent_day = TRUE`).
+3. **Priority 3: Default Yard State (Ready for Deployment)**
+   - If neither Priority 1 nor Priority 2 matches: The car is parked in a hub yard.
+   - Status is set to **`RFD`** (`cohort = 'In Yard'`). Driver assignment is `NULL`. Rent is waived (`billable_rent_day = FALSE`, `rent_waived_reason = 'RFD_IN_YARD'`).
+
+---
+
+### Step 6: Operator (`IP`) vs Retail Driver Handling
+A critical fleet business distinction exists between retail drivers and operators:
+- **Retail Drivers** (`LETZ<CITY><PHONE>`): Drive a single vehicle. When a retail driver drops off a car for repairs or return, the allocation interval terminates immediately, and the vehicle enters `Maintenance` or `RFD`.
+- **Operators** (`LETZ<CITY>IP<PHONE>`): Rent multiple vehicles concurrently and hire sub-drivers. When an operator sends a vehicle for "Repair and Maintenance", the operator retains custody of the asset.
+- **Engine Logic**: In `v_vehicle_trip_intervals`, if `return_type = 'Repair and Maintenance'` and `partner_id` contains `'IP'`, the trip interval is **NOT** truncated. The vehicle status on that day reflects `Maintenance` (`Off Road`), but the driver assignment remains credited to the `IP` operator until a new allocation supersedes it.
+
+---
+
+### Step 7: Automated Verification & Health Checks
+Run the verification script to confirm that the mathematical pairing logic and database integrity remain 100% accurate:
+```bash
+python verify_engine.py
+```
+
+**Verification Checklist**:
+- Total Denominator matches `core_vehicle_onboarding` (1,623).
+- Allocations ($7,273$) = Closed Trips ($6,134$) + Currently Active ($1,139$).
+- Active on Road ($1,139$) + Yard/Workshop ($484$) = Fleet Denominator ($1,623$).
+- Zero negative duration intervals ($trip\_end\_date \ge trip\_start\_date$).
+- Exactly 139 pristine RFD vehicles (brand new cars waiting for first driver).
+
+---
+
+### Step 8: Nightly Scheduled Operations
+To ensure the fleet attendance ledger is updated daily for finance and Hisaab reporting, schedule a nightly cron job at 23:59 IST (18:29 UTC):
+```bash
+# Example cron entry to generate attendance for the current day
+59 23 * * * psql -h 35.200.196.113 -U postgres -d postgres -c "CALL public.sp_generate_daily_vehicle_status(CURRENT_DATE);"
+```
+
