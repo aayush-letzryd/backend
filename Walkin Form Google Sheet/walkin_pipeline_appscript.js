@@ -540,6 +540,7 @@ function syncAllWalkins() {
       try { conn.rollback(); } catch (rbErr) {}
     }
     Logger.log("syncAllWalkins error: " + err.message);
+    throw err;
   } finally {
     if (stmt) { try { stmt.close(); } catch (e) {} }
     if (conn) { try { conn.close(); } catch (e) {} }
@@ -613,6 +614,7 @@ function syncRecentWalkins() {
         try { conn.rollback(); } catch (rbErr) {}
       }
       Logger.log("syncRecentWalkins error: " + err.message);
+      throw err;
     } finally {
       if (stmt) { try { stmt.close(); } catch (e) {} }
       if (conn) { try { conn.close(); } catch (e) {} }
