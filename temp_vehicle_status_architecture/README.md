@@ -12,7 +12,7 @@ In fleet management, the operational status of any vehicle on any given day is s
 2. **Drop-off Form (Trip End):** When the driver returns the keys to a hub.
 3. **Maintenance Event (Repair):** When the car enters or exits a workshop.
 
-$$\text{Vehicle Status} = \text{Allocation (Start)} + \text{Drop-off (End)} + \text{Maintenance (Repairs)}$$
+> **Formula:** `Vehicle Status = Allocation (Start) + Drop-off (End) + Maintenance (Repairs)`
 
 The operations team's Daily Status Tracker Google Sheet is **not an independent competing source of truth**; it is simply a downstream summary generated from the allocation and drop-off forms.
 
@@ -44,28 +44,31 @@ To determine the status of every vehicle on every calendar date, the engine read
                                        │
                                        ▼
        ┌─────────────────────────────────────────────────────────────────┐
-       │                   WORKSHOP & MAINTENANCE EVENTS                 │
-       │    Portal: public.july_maintenance_in / july_maintenance_out    │
-       │    Sheets: Extracted maintenance downtime rows                  │
+       │                 PILLAR 4: WORKSHOP & MAINTENANCE                │
+       │                     public.core_maintenance                     │
+       │  - Merges Portal Maintenance: july_maintenance_in / out         │
+       │  - Merges Sheet Maintenance: downtime rows from Daily Sheet     │
+       │  - Start Date, End Date, Workshop Name, In-Progress Status      │
        └───────────────────────────────┬─────────────────────────────────┘
                                        │
                                        ▼
        ┌─────────────────────────────────────────────────────────────────┐
-       │                     FINAL PRODUCTION ENGINE                     │
-       │               public.core_daily_vehicle_status                  │
-       │    1 Row per Vehicle per Calendar Date (Attendance Ledger)      │
+       │                  LAYER 3: MASTER ATTENDANCE LEDGER              │
+       │                  public.core_daily_vehicle_status               │
+       │    1 Row per Vehicle per Calendar Date (Single Source of Truth) │
+       │    Read by Hisaab for Billing & Operations for Live Status      │
        └─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Table Roles Breakdown
 
-| Role | Source Table(s) | Destination Table | Purpose |
+| Layer / Role | Source Table(s) | Destination Table | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Fleet Denominator** | `sheet_vehicle_onboarding`<br>`july_vehicle_onboarding` | `public.core_vehicle_onboarding` | Base catalog of all 1,623 cars |
+| **Fleet Denominator** | `sheet_vehicle_onboarding`<br>`july_vehicle_onboarding` | `public.core_vehicle_onboarding` | Base asset catalog of all 1,623 cars |
 | **Trip Starts** | `sheet_vehicle_allocations`<br>`july_allocation_form` | `public.core_vehicle_allocation` | Exact date, time, and driver of pickup |
 | **Trip Ends** | `sheet_dropoffs`<br>`july_vehicle_dropoffs` | `public.core_dropoffs` | Exact date, time, and return liabilities |
-| **Repairs** | `july_maintenance_in`<br>`july_maintenance_out` | Handled directly | Workshop downtime dates |
-| **Daily Calendar** | Engine Output | `public.core_daily_vehicle_status` | Master daily attendance ledger for Hisaab |
+| **Repairs & Workshop** | `july_maintenance_in` / `out`<br>`sheet_vehicle_status` (Maint rows) | `public.core_maintenance` | Unified workshop downtime (rent-waived periods) |
+| **Master Attendance Ledger** | All 3 Core Event Tables | `public.core_daily_vehicle_status` | 1 row per car per day: Single source of truth for Hisaab & Dashboards |
 
 ---
 
@@ -98,22 +101,24 @@ Trigger:  (Onboarding)      (Allocation Event)      (Drop-off)      (Allocation 
 
 ## 4. How the Pairing Engine Works (The Algorithm)
 
-For every vehicle $V$:
-1. Fetch all allocations ordered by date: $A_1, A_2, \dots, A_k$.
-2. For each allocation $A_i$, find the earliest drop-off $D_j$ such that:
-   $$\text{return\_date}(D_j) \ge \text{allocation\_date}(A_i)$$
-   and $D_j$ occurs before the next allocation $A_{i+1}$.
-3. This creates a **Trip Interval** $[A_i.\text{start}, D_j.\text{end}]$:
-   * **If $D_j$ exists:** The interval is a **Closed Trip**. The driver had the car from $A_i.\text{start}$ to $D_j.\text{end}$.
-   * **If $D_j$ is NULL:** The interval is an **Open Trip**. The driver has had the car since $A_i.\text{start}$ and is **currently on the road today**.
-4. **Yard Time:** Any calendar day falling between $D_j.\text{end}$ and $A_{i+1}.\text{start}$ is automatically resolved as **RFD in Yard**.
+For every vehicle:
+1. Fetch all allocations ordered by date: `Allocation 1, Allocation 2, ...`.
+2. For each allocation, find the earliest drop-off such that:
+   ```
+   dropoff.return_date >= allocation.allocation_date
+   ```
+   and the drop-off occurs before the vehicle's next allocation.
+3. This creates a **Trip Interval** `[trip_start_date, trip_end_date]`:
+   * **If a matching drop-off exists:** The interval is a **Closed Trip**. The driver had the car from `trip_start_date` to `trip_end_date`.
+   * **If no drop-off exists yet:** The interval is an **Open Trip**. The driver has had the car since `trip_start_date` and is **currently active on the road today**.
+4. **RFD (Ready for Deployment) Period:** As soon as a vehicle is dropped off, it is immediately **RFD (Ready for Deployment)** sitting in the hub. It remains in RFD with ₹0 rent until either a new allocation happens or a maintenance form is submitted.
 
 ### Real Live Numbers (Verified on PostgreSQL)
 * Total Onboarded Fleet: **1,623 vehicles**
 * Total Historical Allocations: **7,269 trip starts**
 * Closed Trips (Paired with Drop-off): **6,128 completed trips**
 * Currently Active on Road (Open Allocations): **1,141 vehicles**
-* Currently in Yard / Maintenance: **482 vehicles** ($1,623 - 1,141$)
+* Currently in Yard (RFD) / Maintenance: **482 vehicles** (1,623 total - 1,141 active)
 
 ---
 
@@ -132,7 +137,10 @@ For every vehicle $V$:
 
 ### Edge Case 3: Vehicle Dropped Off with Dues / Damage
 * **Scenario:** A driver returns a damaged car with ₹5,000 pending dues.
-* **Resolution:** `core_dropoffs` stores `negative_balance`, `damage_penalty`, and `total_liability`. The vehicle immediately transitions to `RFD` or `Maintenance`, while the driver's financial dues are routed to the Hisaab Settlement Ledger.
+* **Resolution:** 
+  * The moment the drop-off form is submitted, the vehicle immediately transitions to **RFD (Ready for Deployment)** in the hub with ₹0 driver rent.
+  * It remains RFD until a workshop executive submits a **Maintenance In** form. Once the maintenance form is submitted, the vehicle transitions from **RFD to Maintenance**. If no maintenance form is submitted, it remains RFD.
+  * The driver's financial dues (₹5,000) are routed directly to the Hisaab Settlement Ledger.
 
 ---
 
@@ -140,10 +148,11 @@ For every vehicle $V$:
 
 The complete SQL DDL, views, and stored procedures are in `schema.sql`:
 
-1. **`public.core_daily_vehicle_status`**: The master table storing 1 row per car per day.
-2. **`public.v_vehicle_trip_intervals`**: A view that pairs allocations with their corresponding drop-offs across the entire fleet.
-3. **`public.v_current_live_fleet_status`**: A real-time view giving operations an instant snapshot of all 1,623 cars right now.
-4. **`public.sp_generate_daily_vehicle_status(target_date)`**: A stored procedure that populates the daily ledger for any given date.
+1. **`public.core_maintenance`**: Merges Portal maintenance forms (`july_maintenance_in` / `out`) and Sheet maintenance records into a single workshop downtime table.
+2. **`public.core_daily_vehicle_status`**: The master table storing 1 row per car per day (the single source of truth for Hisaab).
+3. **`public.v_vehicle_trip_intervals`**: A view that pairs allocations with their corresponding drop-offs across the entire fleet.
+4. **`public.v_current_live_fleet_status`**: A real-time view giving operations an instant snapshot of all 1,623 cars right now.
+5. **`public.sp_generate_daily_vehicle_status(target_date)`**: A stored procedure that populates the daily ledger for any given date.
 
 ---
 

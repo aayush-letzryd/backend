@@ -1,12 +1,55 @@
 -- ============================================================================
 -- FLEET STATUS & INTERVAL LEDGER ENGINE SCHEMA
--- Master Target: public.core_daily_vehicle_status
--- Views: public.v_vehicle_trip_intervals, public.v_current_live_fleet_status
--- Procedure: public.sp_generate_daily_vehicle_status(target_date DATE)
+-- Master Targets: 
+--   1. public.core_maintenance (Merges Portal Maint In/Out + Sheet Maintenance)
+--   2. public.core_daily_vehicle_status (Master Daily Calendar for Hisaab)
+-- Views: 
+--   1. public.v_vehicle_trip_intervals (Pairs allocations with drop-offs)
+--   2. public.v_current_live_fleet_status (Real-time fleet state)
+-- Procedure: 
+--   public.sp_generate_daily_vehicle_status(target_date DATE)
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
--- 1. Master Daily Status Calendar Table
+-- 1. Core Maintenance Table (Layer 2: Dedicated Maintenance Events)
+-- Merges:
+--   - Portal: july_maintenance_in + july_maintenance_out
+--   - Google Sheets: Maintenance downtime rows from sheet_vehicle_status
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.core_maintenance (
+    id BIGSERIAL PRIMARY KEY,
+    vehicle_number VARCHAR(20) NOT NULL,
+    city VARCHAR(10) NOT NULL,
+    
+    -- Event Dates & Status
+    start_date DATE NOT NULL,
+    end_date DATE,                          -- NULL if vehicle is still in workshop
+    status VARCHAR(30) NOT NULL DEFAULT 'IN_PROGRESS', -- 'IN_PROGRESS', 'COMPLETED'
+    
+    -- Workshop & Damage Details
+    workshop_name VARCHAR(150),
+    job_card_number VARCHAR(100),
+    maintenance_reason TEXT,
+    estimated_cost NUMERIC(12, 2) DEFAULT 0.00,
+    actual_cost NUMERIC(12, 2) DEFAULT 0.00,
+    
+    -- Provenance & Source IDs
+    data_source VARCHAR(50) NOT NULL,       -- 'PORTAL_MAINTENANCE', 'SHEET_STATUS_EXTRACT'
+    portal_maintenance_in_id INTEGER,
+    portal_maintenance_out_id INTEGER,
+    sheet_status_row_id BIGINT,
+    
+    is_deleted BOOLEAN DEFAULT FALSE,
+    deleted_at TIMESTAMP WITHOUT TIME ZONE,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_cm_vehicle_dates ON public.core_maintenance (vehicle_number, start_date, end_date);
+CREATE INDEX IF NOT EXISTS idx_cm_status ON public.core_maintenance (status);
+
+-- ----------------------------------------------------------------------------
+-- 2. Master Daily Status Calendar Table (Layer 3: The Single Source for Hisaab)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.core_daily_vehicle_status (
     id BIGSERIAL PRIMARY KEY,
@@ -18,14 +61,14 @@ CREATE TABLE IF NOT EXISTS public.core_daily_vehicle_status (
     final_status VARCHAR(30) NOT NULL,      -- 'Active', 'RFD', 'Maintenance', 'Accidental', 'Impounded'
     cohort VARCHAR(20) NOT NULL,            -- 'On Road', 'In Yard', 'Off Road'
     
-    -- Active Driver Assignment (NULL if RFD / in yard)
+    -- Active Driver Assignment (NULL if RFD / In Yard / Maintenance)
     partner_id VARCHAR(50),
     partner_name VARCHAR(150),
     partner_phone VARCHAR(20),
     hub_name VARCHAR(100),
     car_model VARCHAR(100),
     
-    -- Active Interval Linkage
+    -- Active Event Linkages
     allocation_id BIGINT,
     allocation_date DATE,
     dropoff_id BIGINT,
@@ -37,7 +80,7 @@ CREATE TABLE IF NOT EXISTS public.core_daily_vehicle_status (
     rent_waived_reason VARCHAR(100),        -- 'RFD_IN_YARD', 'WORKSHOP_MAINTENANCE', 'ACCIDENT_DOWNTIME'
     
     -- Audit & Metadata
-    source_origin VARCHAR(50) NOT NULL,     -- 'INTERVAL_MATCH', 'OPEN_ALLOCATION', 'YARD_ROLLOVER', 'WORKSHOP_EVENT'
+    source_origin VARCHAR(50) NOT NULL,     -- 'INTERVAL_MATCH', 'OPEN_ALLOCATION', 'MAINTENANCE_OVERRIDE', 'YARD_ROLLOVER'
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
 
@@ -49,7 +92,7 @@ CREATE INDEX IF NOT EXISTS idx_cdvs_vehicle_date ON public.core_daily_vehicle_st
 CREATE INDEX IF NOT EXISTS idx_cdvs_status_date ON public.core_daily_vehicle_status (final_status, status_date);
 
 -- ----------------------------------------------------------------------------
--- 2. Master View: Continuous Vehicle Trip Intervals
+-- 3. Master View: Continuous Vehicle Trip Intervals
 -- Pairs every allocation with its subsequent drop-off event
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW public.v_vehicle_trip_intervals AS
@@ -110,8 +153,7 @@ LEFT JOIN LATERAL (
 ) d ON TRUE;
 
 -- ----------------------------------------------------------------------------
--- 3. Master View: Real-Time Live Fleet Snapshot (Current Moment)
--- Gives operations instant visibility into all 1,625 vehicles right now
+-- 4. Master View: Real-Time Live Fleet Snapshot (Current Moment)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW public.v_current_live_fleet_status AS
 WITH latest_allocations AS (
@@ -132,17 +174,14 @@ WITH latest_allocations AS (
     ORDER BY vehicle_number, trip_start_date DESC, allocation_id DESC
 ),
 active_maintenance AS (
-    SELECT DISTINCT ON (vehicle_reg_no)
+    SELECT DISTINCT ON (vehicle_number)
         id AS maintenance_id,
-        vehicle_reg_no,
-        job_card_date AS maintenance_date
-    FROM public.july_maintenance_in mi
-    WHERE NOT EXISTS (
-        SELECT 1 FROM public.july_maintenance_out mo 
-        WHERE mo.vehicle_reg_no = mi.vehicle_reg_no 
-          AND mo.created_at >= mi.created_at
-    )
-    ORDER BY vehicle_reg_no, job_card_date DESC
+        vehicle_number,
+        start_date AS maintenance_date
+    FROM public.core_maintenance
+    WHERE is_deleted = FALSE
+      AND (end_date IS NULL OR end_date >= CURRENT_DATE)
+    ORDER BY vehicle_number, start_date DESC
 )
 SELECT 
     vo.registration_no AS vehicle_number,
@@ -175,12 +214,12 @@ SELECT
     CURRENT_TIMESTAMP AS snapshot_at
 FROM public.core_vehicle_onboarding vo
 LEFT JOIN latest_allocations la ON vo.registration_no = la.vehicle_number
-LEFT JOIN active_maintenance m ON vo.registration_no = m.vehicle_reg_no
+LEFT JOIN active_maintenance m ON vo.registration_no = m.vehicle_number
 WHERE vo.is_deleted = FALSE;
 
 -- ----------------------------------------------------------------------------
--- 4. Daily Status Ledger Generation Stored Procedure
--- Populates core_daily_vehicle_status for any given calendar date
+-- 5. Daily Status Ledger Generation Stored Procedure
+-- Evaluates Maintenance (Priority 1), Trip Intervals (Priority 2), and RFD (Priority 3)
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(p_target_date DATE)
 LANGUAGE plpgsql
@@ -201,6 +240,7 @@ BEGIN
         allocation_date,
         dropoff_id,
         dropoff_date,
+        maintenance_id,
         billable_rent_day,
         rent_waived_reason,
         source_origin,
@@ -210,38 +250,83 @@ BEGIN
         p_target_date AS status_date,
         vo.registration_no AS vehicle_number,
         COALESCE(ti.city, vo.assigned_city, 'UNKNOWN') AS city,
+        
+        -- Resolution: Maintenance > Active Allocation > RFD in Yard
         CASE 
+            WHEN cm.id IS NOT NULL THEN 'Maintenance'
             WHEN ti.allocation_id IS NOT NULL THEN 'Active'
             ELSE 'RFD'
         END AS final_status,
+        
         CASE 
+            WHEN cm.id IS NOT NULL THEN 'Off Road'
             WHEN ti.allocation_id IS NOT NULL THEN 'On Road'
             ELSE 'In Yard'
         END AS cohort,
-        ti.partner_id,
-        ti.driver_name,
-        ti.driver_phone,
+        
+        -- Driver Assignment (NULL if in maintenance or yard)
+        CASE 
+            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN ti.allocation_id IS NOT NULL THEN ti.partner_id
+            ELSE NULL
+        END AS partner_id,
+        
+        CASE 
+            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN ti.allocation_id IS NOT NULL THEN ti.driver_name
+            ELSE NULL
+        END AS partner_name,
+        
+        CASE 
+            WHEN cm.id IS NOT NULL THEN NULL
+            WHEN ti.allocation_id IS NOT NULL THEN ti.driver_phone
+            ELSE NULL
+        END AS partner_phone,
+        
         COALESCE(ti.hub_name, vo.hub),
         COALESCE(ti.car_model, vo.vehicle_model),
         ti.allocation_id,
         ti.trip_start_date,
         ti.dropoff_id,
         ti.trip_end_date,
+        cm.id AS maintenance_id,
+        
+        -- Rent is ONLY charged on Active days
         CASE 
+            WHEN cm.id IS NOT NULL THEN FALSE
             WHEN ti.allocation_id IS NOT NULL THEN TRUE
             ELSE FALSE
         END AS billable_rent_day,
+        
         CASE 
+            WHEN cm.id IS NOT NULL THEN 'WORKSHOP_MAINTENANCE'
             WHEN ti.allocation_id IS NULL THEN 'RFD_IN_YARD'
             ELSE NULL
         END AS rent_waived_reason,
+        
         CASE 
+            WHEN cm.id IS NOT NULL THEN 'MAINTENANCE_OVERRIDE'
             WHEN ti.dropoff_id IS NOT NULL THEN 'INTERVAL_MATCH'
             WHEN ti.allocation_id IS NOT NULL THEN 'OPEN_ALLOCATION'
             ELSE 'YARD_ROLLOVER'
         END AS source_origin,
+        
         CURRENT_TIMESTAMP AS updated_at
     FROM public.core_vehicle_onboarding vo
+    
+    -- Priority 1: Check Maintenance
+    LEFT JOIN LATERAL (
+        SELECT id
+        FROM public.core_maintenance
+        WHERE is_deleted = FALSE
+          AND vehicle_number = vo.registration_no
+          AND start_date <= p_target_date
+          AND (end_date IS NULL OR end_date >= p_target_date)
+        ORDER BY start_date DESC
+        LIMIT 1
+    ) cm ON TRUE
+    
+    -- Priority 2: Check Active Trip Intervals
     LEFT JOIN LATERAL (
         SELECT *
         FROM public.v_vehicle_trip_intervals ti
@@ -251,6 +336,7 @@ BEGIN
         ORDER BY ti.trip_start_date DESC
         LIMIT 1
     ) ti ON TRUE
+    
     WHERE vo.is_deleted = FALSE
     ON CONFLICT (status_date, vehicle_number)
     DO UPDATE SET
@@ -265,6 +351,7 @@ BEGIN
         allocation_date = EXCLUDED.allocation_date,
         dropoff_id = EXCLUDED.dropoff_id,
         dropoff_date = EXCLUDED.dropoff_date,
+        maintenance_id = EXCLUDED.maintenance_id,
         billable_rent_day = EXCLUDED.billable_rent_day,
         rent_waived_reason = EXCLUDED.rent_waived_reason,
         source_origin = EXCLUDED.source_origin,
