@@ -134,6 +134,55 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 11. [Maintenance Google Sheet](./Maintenance%20Google%20Sheet/)
+- **Description**: Real-time and batch extraction engine isolating vehicle workshop and breakdown downtime records from `sheet_vehicle_status` into dedicated staging (`public.sheet_maintenance`) and master (`public.core_maintenance`) tables.
+- **Key Files**:
+  - [`schema.sql`](./Maintenance%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_maintenance`, composite unique constraint `(maintenance_date, vehicle_number)`, automated extraction trigger `trg_extract_maintenance_from_sheet_status`, and batch backfill procedure `sp_extract_all_sheet_maintenance()`.
+  - [`maintenance_pipeline_appscript.js`](./Maintenance%20Google%20Sheet/maintenance_pipeline_appscript.js): Production Google Apps Script engine featuring parameterized JDBC batching, live `handleOnEdit` trigger, 5-minute sliding window sync, placeholder stripping, and IP operator driver retention logic.
+  - [`data_issues.md`](./Maintenance%20Google%20Sheet/data_issues.md): Comprehensive data quality catalog (MAINT-01 through MAINT-10) documenting placeholder workshop names, missing job cards, duplicate daily entries, and status taxonomy drift.
+  - [`README.md`](./Maintenance%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document detailing decoupling rationale, trigger mechanics, data dictionary, and operational runbook.
+- **Target Tables**: `public.sheet_vehicle_status` -> `public.sheet_maintenance` -> `public.core_maintenance`
+
+---
+
+### 12. [Maintenance Final Table](./Maintenance%20Final%20Table/)
+- **Description**: Real-time unified master Single Source of Truth (`public.core_maintenance`) consolidating fleet workshop downtime and repair intervals across Google Sheets (`sheet_maintenance`) and the Web Portal (`july_maintenance_in` + `july_maintenance_out`).
+- **Key Files**:
+  - [`schema.sql`](./Maintenance%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_maintenance`, indexes, inward-outward interval pairing, and real-time triggers (`sync_core_maintenance_from_sheet`, `sync_core_maintenance_from_portal`).
+  - [`automation_script.py`](./Maintenance%20Final%20Table/automation_script.py): Production Python health check, verification, backfill, and interval repair engine (`--audit`, `--backfill`, `--verify-triggers`, `--repair-intervals`).
+  - [`data_issues.md`](./Maintenance%20Final%20Table/data_issues.md): Comprehensive data reconciliation catalog detailing open maintenance intervals, negative/inverted durations, multi-day gap resolution, and workshop cost discrepancies.
+  - [`README.md`](./Maintenance%20Final%20Table/README.md): Exhaustive Knowledge Transfer (KT) manual covering architecture, temporal calculation rules, trigger specifications, and operational runbook.
+- **Target Table**: `public.core_maintenance` (PostgreSQL)
+- **Primary Features**:
+  - Temporal interval pairing: couples inward vehicle entry with outward release into unified `[start_date, end_date]` intervals.
+  - Zero negative duration enforcement: strictly guarantees `end_date >= start_date`.
+  - Native real-time PostgreSQL triggers: bidirectional sync (<10ms) with soft-delete protection.
+  - Financial auditing: tracks estimated vs actual invoice costs and LetzRyd payable liabilities.
+
+---
+
+### 13. [Vehicle Status Google Sheet](./Vehicle%20Status%20Google%20Sheet/)
+- **Description**: Production ingestion pipeline synchronizing daily fleet operational status and attendance records directly from Google Sheets (`Daily Vehicle Status` in `Vehicle Status List V3.xlsx`) into PostgreSQL staging table `public.sheet_vehicle_status`.
+- **Key Files**:
+  - [`schema.sql`](./Vehicle%20Status%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_status`, natural unique constraint `(status_date, vehicle_number)`, 6 B-Tree performance indexes, and verification queries.
+  - [`vehicle_status_pipeline_appscript.js`](./Vehicle%20Status%20Google%20Sheet/vehicle_status_pipeline_appscript.js): Production Google Apps Script pipeline with chunked JDBC batching (200 rows), `LockService` concurrency locking, `PropertiesService` secrets, and zero-burn CTE upserts.
+  - [`data_issues.md`](./Vehicle%20Status%20Google%20Sheet/data_issues.md): Comprehensive data hygiene audit cataloging date format shifts, status casing variations, unallocated partner ID overloading, and OCR plate fixes.
+  - [`README.md`](./Vehicle%20Status%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) runbook covering 3-layer architecture, pipeline flow, column data dictionary, trigger installation, and operational queries.
+- **Target Table**: `public.sheet_vehicle_status` (PostgreSQL)
+
+---
+
+### 14. [Vehicle Status Final Table](./Vehicle%20Status%20Final%20Table/)
+- **Description**: Master operational fleet status architecture delivering the continuous daily attendance ledger (`public.core_daily_vehicle_status`), real-time live fleet snapshot (`public.v_current_live_fleet_status`), and mathematical interval pairing view (`public.v_vehicle_trip_intervals`).
+- **Key Files**:
+  - [`schema.sql`](./Vehicle%20Status%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_daily_vehicle_status`, views `v_vehicle_trip_intervals` and `v_current_live_fleet_status`, and stored procedure `sp_generate_daily_vehicle_status(target_date)`.
+  - [`automation_script.py`](./Vehicle%20Status%20Final%20Table/automation_script.py): Production Python health check and verification CLI (`--audit`, `--live`, `--generate-date`, `--backfill`).
+  - [`data_issues.md`](./Vehicle%20Status%20Final%20Table/data_issues.md): Technical catalog documenting all 10 real-world edge cases (Pristine RFD 139 cars, Same-day trips 1,094, Consecutive allocations 170, Orphan dropoffs 8, IP operator custody).
+  - [`README.md`](./Vehicle%20Status%20Final%20Table/README.md): Complete Knowledge Transfer (KT) runbook, mathematical pairing formalization, priority precedence rules, and nightly cron setup.
+- **Target Table**: `public.core_daily_vehicle_status` (Daily Ledger) & `public.v_current_live_fleet_status` (Live View)
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
