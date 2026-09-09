@@ -125,15 +125,17 @@ SELECT
     ra.hub_name,
     ra.allocation_date AS trip_start_date,
     d.id AS dropoff_id,
-    d.return_date AS trip_end_date,
+    COALESCE(d.return_date, ra.next_allocation_date) AS trip_end_date,
     d.return_type,
     d.negative_balance AS final_debt,
     CASE 
         WHEN d.id IS NOT NULL THEN 'CLOSED_TRIP'
+        WHEN ra.next_allocation_date IS NOT NULL THEN 'SUPERSEDED_BY_NEXT_ALLOCATION'
         ELSE 'CURRENTLY_ACTIVE'
     END AS trip_state,
     CASE 
         WHEN d.return_date IS NOT NULL THEN (d.return_date - ra.allocation_date)
+        WHEN ra.next_allocation_date IS NOT NULL THEN (ra.next_allocation_date - ra.allocation_date)
         ELSE (CURRENT_DATE - ra.allocation_date)
     END AS days_duration
 FROM ranked_allocations ra
@@ -188,10 +190,9 @@ active_maintenance AS (
 )
 SELECT 
     vo.registration_no AS vehicle_number,
-    vo.vehicle_make,
-    vo.vehicle_model,
-    vo.assigned_city AS city,
-    vo.hub AS default_hub,
+    vo.model AS vehicle_model,
+    vo.city,
+    vo.ownership,
     CASE 
         WHEN m.maintenance_id IS NOT NULL THEN 'Maintenance'
         WHEN la.trip_state = 'CURRENTLY_ACTIVE' THEN 'Active'
@@ -252,7 +253,7 @@ BEGIN
     SELECT 
         p_target_date AS status_date,
         vo.registration_no AS vehicle_number,
-        COALESCE(ti.city, vo.assigned_city, 'UNKNOWN') AS city,
+        COALESCE(ti.city, vo.city, 'UNKNOWN') AS city,
         
         -- Resolution: Maintenance > Active Allocation > RFD in Yard
         CASE 
@@ -286,8 +287,8 @@ BEGIN
             ELSE NULL
         END AS partner_phone,
         
-        COALESCE(ti.hub_name, vo.hub),
-        COALESCE(ti.car_model, vo.vehicle_model),
+        COALESCE(ti.hub_name, 'MAIN_HUB') AS hub_name,
+        COALESCE(ti.car_model, vo.model) AS car_model,
         ti.allocation_id,
         ti.trip_start_date,
         ti.dropoff_id,
