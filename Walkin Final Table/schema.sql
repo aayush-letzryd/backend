@@ -336,11 +336,11 @@ BEGIN
     END;
 
     SELECT 
-        COALESCE(pu.full_name, e.first_name || ' ' || COALESCE(e.last_name, ''), 'Executive'),
-        COALESCE(pu.email, e.email, '')
+        COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'),
+        COALESCE(pu.email, e.company_email, '')
     INTO v_exec_name, v_exec_email
     FROM public.july_portal_users pu
-    LEFT JOIN public.july_employees e ON e.id = pu.employee_id
+    LEFT JOIN public.july_employees e ON e.employee_id = pu.employee_id
     WHERE pu.portal_user_id = COALESCE(NEW.created_by, NEW.executive_id)
     LIMIT 1;
 
@@ -507,11 +507,11 @@ BEGIN
     END;
 
     SELECT 
-        COALESCE(pu.full_name, e.first_name || ' ' || COALESCE(e.last_name, ''), 'Executive'),
-        COALESCE(pu.email, e.email, '')
+        COALESCE(NULLIF(TRIM(CONCAT(e.first_name, ' ', e.last_name)), ''), pu.username, 'Executive'),
+        COALESCE(pu.email, e.company_email, '')
     INTO v_exec_name, v_exec_email
     FROM public.july_portal_users pu
-    LEFT JOIN public.july_employees e ON e.id = pu.employee_id
+    LEFT JOIN public.july_employees e ON e.employee_id = pu.employee_id
     WHERE pu.portal_user_id = COALESCE(NEW.created_by, NEW.executive_id)
     LIMIT 1;
 
@@ -599,3 +599,10 @@ DROP TRIGGER IF EXISTS trg_sync_core_walkin_from_portal_existing ON public.july_
 CREATE TRIGGER trg_sync_core_walkin_from_portal_existing
 AFTER INSERT OR UPDATE OR DELETE ON public.july_existing_walkins
 FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_portal_existing();
+
+-- -----------------------------------------------------------------------------
+-- 5. Active Filtered View (Excludes Soft-Deleted Records)
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW public.active_core_walkin AS
+SELECT * FROM public.core_walkin WHERE is_deleted = FALSE;
+
