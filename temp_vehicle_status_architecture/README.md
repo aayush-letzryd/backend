@@ -1,209 +1,203 @@
 # Vehicle Status & Daily Fleet Ledger Architecture
 
-## 1. Executive Summary & Objective
+## 1. Executive Summary & Core Philosophy
 
-This document outlines the end-to-end architecture and implementation blueprint for the **Vehicle Status Engine** and **Daily Fleet Ledger** (`core_daily_vehicle_status`). 
+This document provides the complete, production-ready architecture and implementation guide for the **Vehicle Status Engine** and **Daily Fleet Ledger** (`core_daily_vehicle_status`).
 
-The primary business objective is to create an automated, audit-proof single source of truth for:
-1. **Live Fleet Operations:** Knowing the exact operational state of every vehicle at any moment (On Road, Maintenance/Workshop, Ready for Deployment in Yard).
-2. **Automated Hisaab Settlements:** Accurately calculating daily driver rental liabilities, waiving rent during maintenance periods, and eliminating double-billing during intraday vehicle handovers.
+### The Fundamental Rule
+**Vehicle Status is NOT a form that anyone fills manually.** 
 
-This design supports all operational modes: whether the team uses **Google Sheets only**, **Web Portal forms only**, or a **hybrid of both**.
+In fleet management, the operational status of any vehicle on any given day is simply the mathematical result of three distinct events:
+1. **Allocation Form (Trip Start):** When a driver picks up the keys.
+2. **Drop-off Form (Trip End):** When the driver returns the keys to a hub.
+3. **Maintenance Event (Repair):** When the car enters or exits a workshop.
+
+> **Formula:** `Vehicle Status = Allocation (Start) + Drop-off (End) + Maintenance (Repairs)`
+
+The operations team's Daily Status Tracker Google Sheet is **not an independent competing source of truth**; it is simply a downstream summary generated from the allocation and drop-off forms.
 
 ---
 
-## 2. High-Level Architecture Diagram
+## 2. The 3 Data Pillars (Where Everything Comes From)
+
+To determine the status of every vehicle on every calendar date, the engine reads from 3 unified pillars:
 
 ```
-========================================================================================
-                          LAYER 1: INPUT DATA SOURCES
-========================================================================================
-       GOOGLE SHEETS PIPELINE                           WEB PORTAL PIPELINE
-  ┌──────────────────────────────┐              ┌──────────────────────────────────┐
-  │ • sheet_vehicle_allocations  │              │ • july_allocation_form           │
-  │ • sheet_dropoffs             │              │ • july_vehicle_dropoffs          │
-  │ • Daily Status Tracker Sheet │              │ • july_maintenance_in / out     │
-  └──────────────┬───────────────┘              └────────────────┬─────────────────┘
-                 │                                               │
-                 ▼                                               ▼
-========================================================================================
-                 LAYER 2: CORE TRANSACTIONAL EVENT TABLES (POSTGRESQL)
-========================================================================================
-  ┌──────────────────────────────────────────────────────────────────────────────────┐
-  │ 1. core_vehicle_allocation   <- Merges Sheet Allocations + Portal Allocations    │
-  │ 2. core_vehicle_dropoff      <- Merges Sheet Drop-offs + Portal Drop-offs        │
-  │ 3. core_vehicle_maintenance  <- Merges Portal In/Out + Sheet Maintenance Entries │
-  │ 4. sheet_vehicle_status      <- Raw Staging Ingestion of Daily Tracker Sheet     │
-  └────────────────────────────────────────┬─────────────────────────────────────────┘
-                                           │
-                                           ▼
-========================================================================================
-              LAYER 3: UNIFIED DAILY LEDGER & LIVE STATE (POSTGRESQL)
-========================================================================================
-  ┌──────────────────────────────────────────────────────────────────────────────────┐
-  │                          core_daily_vehicle_status                               │
-  │   - 1 row per vehicle per calendar date                                          │
-  │   - Final Operational Status (Active, Maintenance, RFD, Impounded)               │
-  │   - Assigned Driver ID & Driver Name                                             │
-  │   - Intraday Allocation & Drop-off Timestamps                                    │
-  │   - DM Name, City, Vehicle Model, Hub Location                                   │
-  └────────────────────────────────────────┬─────────────────────────────────────────┘
-                                           │
-                                           ▼
-========================================================================================
-                       DOWNSTREAM CONSUMERS & AUTOMATION
-========================================================================================
-  ┌────────────────────────────────────────┐    ┌───────────────────────────────────┐
-  │       AUTOMATED HISAAB ENGINE          │    │     LIVE OPERATIONS DASHBOARD     │
-  │ Direct SQL Settlement Queries          │    │ Real-time vehicle location & state│
-  └────────────────────────────────────────┘    └───────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│               PILLAR 1: MASTER ASSET REGISTRY (DENOMINATOR)            │
+│                       public.core_vehicle_onboarding                   │
+│  - Total physical fleet owned or leased (1,623 active vehicles)        │
+│  - Registration No, Model, Make, City, Default Hub                     │
+└───────────────────────────────────┬────────────────────────────────────┘
+                                    │
+       ┌────────────────────────────┴────────────────────────────┐
+       ▼                                                         ▼
+┌──────────────────────────────┐              ┌──────────────────────────────────┐
+│   PILLAR 2: TRIP STARTS      │              │      PILLAR 3: TRIP ENDS         │
+│  public.core_vehicle_        │              │     public.core_dropoffs         │
+│         allocation           │              │  - Return Date & Hub Location    │
+│  - Pickup Date & Driver ID   │              │  - Final Liabilities & Odometer  │
+│  - Merges Sheet + Portal     │              │  - Merges Sheet + Portal         │
+└──────────────┬───────────────┘              └──────────────────┬───────────────┘
+               │                                                 │
+               └───────────────────────┬─────────────────────────┘
+                                       │
+                                       ▼
+       ┌─────────────────────────────────────────────────────────────────┐
+       │                 PILLAR 4: WORKSHOP & MAINTENANCE                │
+       │                     public.core_maintenance                     │
+       │  - Merges Portal Maintenance: july_maintenance_in / out         │
+       │  - Merges Sheet Maintenance: downtime rows from Daily Sheet     │
+       │  - Start Date, End Date, Workshop Name, In-Progress Status      │
+       └───────────────────────────────┬─────────────────────────────────┘
+                                       │
+                                       ▼
+       ┌─────────────────────────────────────────────────────────────────┐
+       │                  LAYER 3: MASTER ATTENDANCE LEDGER              │
+       │                  public.core_daily_vehicle_status               │
+       │    1 Row per Vehicle per Calendar Date (Single Source of Truth) │
+       │    Read by Hisaab for Billing & Operations for Live Status      │
+       └─────────────────────────────────────────────────────────────────┘
 ```
 
----
+### Table Roles Breakdown
 
-## 3. The 3 Data Layers Explained
-
-### Layer 1: Input Sources
-Operational data enters through two parallel channels:
-1. **Google Sheets:**
-   * `sheet_vehicle_allocations`: Logs vehicle allocations.
-   * `sheet_dropoffs`: Logs vehicle returns and driver exits.
-   * `Daily Status Tracker Sheet`: Daily ops sheet recording fleet snapshot (vehicle, final status, cohort, partner ID, hub).
-2. **Web Portal:**
-   * `july_allocation_form`: Portal allocations.
-   * `july_vehicle_dropoffs`: Portal drop-offs.
-   * `july_maintenance_in` / `july_maintenance_out`: Portal workshop check-in/out logs.
-
-### Layer 2: Core Event Tables (Transactional History)
-Every physical action is permanently recorded as an event with microsecond timestamps:
-* `core_vehicle_allocation`: Built using the Walk-in pipeline pattern (merging `sheet_vehicle_allocations` and `july_allocation_form`).
-* `core_vehicle_dropoff`: Built by merging `sheet_dropoffs` and `july_vehicle_dropoffs`.
-* `core_vehicle_maintenance`: Built by combining portal maintenance entries with maintenance flags extracted from the daily tracker sheet.
-* `sheet_vehicle_status`: Exact staging copy of the daily tracker sheet.
-
-### Layer 3: The Daily Master Ledger (`core_daily_vehicle_status`)
-This table acts as the daily attendance register for the fleet. For every single calendar date and vehicle, it records:
-* Which driver was responsible for the vehicle.
-* What state the vehicle was in (On Road, Maintenance, In Yard / RFD).
-* What actions occurred during that day (e.g. dropped off in morning, re-allocated in afternoon).
+| Layer / Role | Source Table(s) | Destination Table | Purpose |
+| :--- | :--- | :--- | :--- |
+| **Fleet Denominator** | `sheet_vehicle_onboarding`<br>`july_vehicle_onboarding` | `public.core_vehicle_onboarding` | Base asset catalog of all 1,623 cars |
+| **Trip Starts** | `sheet_vehicle_allocations`<br>`july_allocation_form` | `public.core_vehicle_allocation` | Exact date, time, and driver of pickup |
+| **Trip Ends** | `sheet_dropoffs`<br>`july_vehicle_dropoffs` | `public.core_dropoffs` | Exact date, time, and return liabilities |
+| **Repairs & Workshop** | `july_maintenance_in` / `out`<br>`sheet_vehicle_status` (Maint rows) | `public.core_maintenance` | Unified workshop downtime (rent-waived periods) |
+| **Master Attendance Ledger** | All 3 Core Event Tables | `public.core_daily_vehicle_status` | 1 row per car per day: Single source of truth for Hisaab & Dashboards |
 
 ---
 
-## 4. Daily Data Flow & Precedence Rules
+## 3. The Continuous Vehicle Interval Model
 
-To prevent data corruption, race conditions, or conflicting entries between sheets and portal, the engine follows strict priority rules:
+Every vehicle in the fleet moves through a continuous timeline of time intervals:
 
-### Rule 1: Maintenance State Takes Highest Priority
-* If a vehicle has an active `july_maintenance_in` entry without a corresponding `july_maintenance_out`, OR if the Daily Tracker Sheet marks the vehicle as `Maintenance`:
-  * `final_status` = `'Maintenance'`
-  * `cohort` = `'Off Road'`
-  * `partner_id` = `NULL`
-  * Rent is automatically paused in Hisaab.
+```
+Timeline: Jan 01 ────────── Jan 10 ────────────── Jan 25 ────────── Jan 28 ──────────────►
+State:    [  RFD in Yard  ] [  Active with Ramesh ] [ RFD in Yard ] [ Active with Suresh ]
+Rent:     [    ₹0 Rent    ] [  Daily Rent Billed  ] [   ₹0 Rent   ] [ Daily Rent Billed  ]
+Trigger:  (Onboarding)      (Allocation Event)      (Drop-off)      (Allocation Event)
+```
 
-### Rule 2: Live Drop-offs Terminate Driver Liability
-* When a drop-off is recorded on date `D` (via sheet or portal):
-  * The driver assignment is marked as completed on date `D`.
-  * `dropoff_date` is recorded.
-  * Subsequent days are marked as `RFD` (Ready for Deployment) with `partner_id = NULL` until a new allocation occurs.
-
-### Rule 3: Allocation Assigns Driver Liability
-* When an allocation is recorded on date `D`:
-  * `partner_id`, `partner_name`, `partner_type`, and `plan_type` are populated from `core_vehicle_allocation`.
-  * `final_status` = `'Active'`
-  * `cohort` = `'On Road'`
-  * Hisaab applies daily rental charges to this partner starting from the allocation timestamp.
-
-### Rule 4: Daily Tracker Baseline Fallback
-* Every morning, the Daily Tracker Sheet syncs to set the initial daily baseline.
-* Any intraday event (Allocation, Drop-off, Maintenance) arriving later in the day updates the daily status row immediately.
+### The 3 Operational States
+1. **Active (On Road):**
+   * The vehicle is currently assigned to a partner.
+   * `final_status = 'Active'`, `cohort = 'On Road'`, `partner_id` is populated.
+   * **Hisaab Action:** Daily rental liability is billed to the partner.
+2. **RFD (Ready for Deployment in Yard):**
+   * The vehicle is parked in a LetzRyd hub or yard waiting for a new driver.
+   * `final_status = 'RFD'`, `cohort = 'In Yard'`, `partner_id = NULL`.
+   * **Hisaab Action:** ₹0 rent charged.
+3. **Maintenance (In Workshop):**
+   * The vehicle is undergoing repairs, bodywork, or servicing.
+   * `final_status = 'Maintenance'`, `cohort = 'Off Road'`.
+   * **Hisaab Action:** Rent is waived so drivers are never penalized for downtime.
 
 ---
 
-## 5. Handling Intraday Transitions (Morning vs. Afternoon Changes)
+## 4. How the Pairing Engine Works (The Algorithm)
 
-A common fleet scenario occurs when a vehicle changes state twice on the same day:
-* **Example:** On 09-Sept at 10:00 AM, Driver A drops off the vehicle. At 3:00 PM, Driver B takes allocation of the same vehicle.
+For every vehicle:
+1. Fetch all allocations ordered by date: `Allocation 1, Allocation 2, ...`.
+2. For each allocation, find the earliest drop-off such that:
+   ```
+   dropoff.return_date >= allocation.allocation_date
+   ```
+   and the drop-off occurs before the vehicle's next allocation.
+3. This creates a **Trip Interval** `[trip_start_date, trip_end_date]`:
+   * **If a matching drop-off exists:** The interval is a **Closed Trip**. The driver had the car from `trip_start_date` to `trip_end_date`.
+   * **If no drop-off exists yet:** The interval is an **Open Trip**. The driver has had the car since `trip_start_date` and is **currently active on the road today**.
+4. **RFD (Ready for Deployment) Period:** As soon as a vehicle is dropped off, it is immediately **RFD (Ready for Deployment)** sitting in the hub. It remains in RFD with ₹0 rent until either a new allocation happens or a maintenance form is submitted.
 
-### How the Architecture Handles This:
-1. **Permanent Action Audit Log:**
-   * `core_vehicle_dropoff` permanently preserves Driver A's return at `10:00 AM`.
-   * `core_vehicle_allocation` permanently preserves Driver B's handover at `03:00 PM`.
-2. **Daily Ledger Representation (`core_daily_vehicle_status`):**
-   * The daily record stores both timestamps:
-     * `dropoff_date` = `2026-09-09 10:00:00` (Driver A)
-     * `allocation_date` = `2026-09-09 15:00:00` (Driver B)
-     * `partner_id` = Driver B (Current active driver at close of day)
-3. **Hisaab Billing Impact:**
-   * Hisaab reads both events. Depending on company settlement policy (half-day billing or handover rules), Driver A is billed for morning usage and Driver B for afternoon/evening usage with zero ambiguity.
-
----
-
-## 6. How All Three Operational Scenarios are Solved
-
-| Scenario | Operational Reality | Database Resolution |
-| :--- | :--- | :--- |
-| **Case 1: Sheets Only** | Ops continues entering data only into Google Sheets. | `core_vehicle_allocation` and `core_vehicle_dropoff` ingest the sheets. Maintenance is extracted from `sheet_vehicle_status`. Everything functions smoothly without portal dependency. |
-| **Case 2: Portal Only** | Ops stops using sheets and transitions 100% to the portal. | Portal Allocation, Drop-off, and Maintenance In/Out populate Layer 2 directly. Database triggers generate `core_daily_vehicle_status` autonomously with zero spreadsheets. |
-| **Case 3: Mixed Mode (Both)** | Some hubs use portal, others use sheets; or allocations happen in portal while maintenance is marked in sheet. | Layer 2 unifies both sources into clean core tables. The latest timestamp and highest priority rule wins. Neither door interferes with the other. |
+### Real Live Numbers (Verified on PostgreSQL)
+* Total Onboarded Fleet: **1,623 vehicles**
+* Total Historical Allocations: **7,269 trip starts**
+* Closed Trips (Paired with Drop-off): **6,128 completed trips**
+* Currently Active on Road (Open Allocations): **1,141 vehicles**
+* Currently in Yard (RFD) / Maintenance: **482 vehicles** (1,623 total - 1,141 active)
 
 ---
 
-## 7. PostgreSQL Target Schema Definition
+## 5. Handling Real-World Edge Cases
 
+### Edge Case 1: Same-Day Drop-off
+* **Scenario:** Driver picks up a car at 9:00 AM and returns it at 6:00 PM on the same date.
+* **Resolution:** `start_date = end_date`. The trip duration is 0 days (or partial day). Hisaab can charge a half-day or 1-day rental based on company policy.
+
+### Edge Case 2: Intraday Handover (Same Car, Two Drivers on Same Day)
+* **Scenario:** Driver Ramesh drops off car KA05... at 10:00 AM. Driver Suresh is allocated the same car at 2:00 PM.
+* **Resolution:** 
+  * Allocation for Suresh has an exact timestamp later than Ramesh's drop-off.
+  * In the daily status table, Suresh is recorded as the ending active driver for that calendar date.
+  * Hisaab bills Ramesh up to his drop-off hour and starts Suresh's billing from 2:00 PM onward.
+
+### Edge Case 3: Vehicle Dropped Off with Dues / Damage
+* **Scenario:** A driver returns a damaged car with ₹5,000 pending dues.
+* **Resolution:** 
+  * The moment the drop-off form is submitted, the vehicle immediately transitions to **RFD (Ready for Deployment)** in the hub with ₹0 driver rent.
+  * It remains RFD until a workshop executive submits a **Maintenance In** form. Once the maintenance form is submitted, the vehicle transitions from **RFD to Maintenance**. If no maintenance form is submitted, it remains RFD.
+  * The driver's financial dues (₹5,000) are routed directly to the Hisaab Settlement Ledger.
+
+---
+
+## 6. Target Database Schema & Code
+
+The complete SQL DDL, views, and stored procedures are in `schema.sql`:
+
+1. **`public.core_maintenance`**: Merges Portal maintenance forms (`july_maintenance_in` / `out`) and Sheet maintenance records into a single workshop downtime table.
+2. **`public.core_daily_vehicle_status`**: The master table storing 1 row per car per day (the single source of truth for Hisaab).
+3. **`public.v_vehicle_trip_intervals`**: A view that pairs allocations with their corresponding drop-offs across the entire fleet.
+4. **`public.v_current_live_fleet_status`**: A real-time view giving operations an instant snapshot of all 1,623 cars right now.
+5. **`public.sp_generate_daily_vehicle_status(target_date)`**: A stored procedure that populates the daily ledger for any given date.
+
+---
+
+## 7. Downstream Systems & Integrations
+
+### 1. Automated Hisaab Settlements Engine
 ```sql
--- Target Master Table: public.core_daily_vehicle_status
-CREATE TABLE IF NOT EXISTS public.core_daily_vehicle_status (
-    id BIGSERIAL PRIMARY KEY,
-    status_date DATE NOT NULL,
-    vehicle_number VARCHAR(20) NOT NULL,
-    city VARCHAR(10) NOT NULL,
-    
-    -- Operational Status
-    final_status VARCHAR(30) NOT NULL,      -- Active, RFD, Maintenance, Accidental, Impounded
-    cohort VARCHAR(20) NOT NULL,            -- On Road, Off Road
-    
-    -- Partner & Driver Information
-    partner_id VARCHAR(50),                 -- Driver Code / ID
-    partner_name VARCHAR(150),
-    partner_type VARCHAR(30),               -- Individual, Operator
-    dm_name VARCHAR(100),                   -- Duty Manager / Fleet Manager
-    vehicle_model VARCHAR(100),
-    
-    -- Event Lifecycle Timestamps
-    allocation_timestamp TIMESTAMP WITHOUT TIME ZONE,
-    dropoff_timestamp TIMESTAMP WITHOUT TIME ZONE,
-    maintenance_in_timestamp TIMESTAMP WITHOUT TIME ZONE,
-    maintenance_out_timestamp TIMESTAMP WITHOUT TIME ZONE,
-    
-    -- Provenance & Metadata
-    source_origin VARCHAR(50) NOT NULL,     -- DAILY_SHEET, PORTAL_EVENT, CORE_MERGE
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+-- Query to calculate driver weekly rent dues:
+SELECT 
+    partner_id,
+    partner_name,
+    COUNT(*) AS total_days_billed,
+    COUNT(*) * 800 AS rental_due_inr
+FROM public.core_daily_vehicle_status
+WHERE partner_id = 'LETZBLR9008528502'
+  AND status_date BETWEEN '2026-09-01' AND '2026-09-07'
+  AND billable_rent_day = TRUE
+GROUP BY partner_id, partner_name;
+```
 
-    CONSTRAINT uq_daily_vehicle_status UNIQUE (status_date, vehicle_number)
-);
+### 2. Traffic Challans Driver Attribution
+When a traffic challan arrives for vehicle `KA05AQ4847` on `2026-09-06 14:30:00`:
+```sql
+-- Instantly find which driver had the car at that exact moment:
+SELECT partner_id, partner_name, partner_phone
+FROM public.v_vehicle_trip_intervals
+WHERE vehicle_number = 'KA05AQ4847'
+  AND '2026-09-06' BETWEEN trip_start_date AND COALESCE(trip_end_date, CURRENT_DATE);
+```
 
--- Indexes for Query & Hisaab Performance
-CREATE INDEX IF NOT EXISTS idx_cdvs_date_partner ON public.core_daily_vehicle_status (status_date, partner_id);
-CREATE INDEX IF NOT EXISTS idx_cdvs_vehicle_date ON public.core_daily_vehicle_status (vehicle_number, status_date);
-CREATE INDEX IF NOT EXISTS idx_cdvs_status ON public.core_daily_vehicle_status (final_status, status_date);
+### 3. Live Operations Dashboard
+```sql
+-- Real-time count of Yard vs Road:
+SELECT live_status, live_cohort, COUNT(*) 
+FROM public.v_current_live_fleet_status
+GROUP BY live_status, live_cohort;
 ```
 
 ---
 
-## 8. Implementation Roadmap
+## 8. Verification & Health Check
 
-1. **Phase 1: Ingest Daily Tracker Sheet**
-   * Create `public.sheet_vehicle_status` staging table.
-   * Write Google Apps Script / Python ETL to ingest the live Daily Tracker Sheet daily.
-2. **Phase 2: Build `core_vehicle_allocation`**
-   * Merge `sheet_vehicle_allocations` (7,122 rows) and `july_allocation_form` (301 rows).
-   * Install row-level PostgreSQL triggers following the Walk-in blueprint.
-3. **Phase 3: Build `core_vehicle_dropoff`**
-   * Merge `sheet_dropoffs` and `july_vehicle_dropoffs`.
-   * Install row-level PostgreSQL triggers.
-4. **Phase 4: Build `core_daily_vehicle_status` Engine**
-   * Create the daily ledger table.
-   * Configure reconciliation triggers to overlay live allocation/drop-off/maintenance events on top of daily sheet snapshots.
-5. **Phase 5: Connect Hisaab Settlement Engine**
-   * Point all Hisaab billing queries to `core_daily_vehicle_status`.
+A Python verification script is included in this directory:
+```bash
+# Run the verification script against the database:
+python verify_engine.py
+```
+This tests the live pairing of allocations, drop-offs, and open trips on PostgreSQL and outputs real-time fleet numbers.

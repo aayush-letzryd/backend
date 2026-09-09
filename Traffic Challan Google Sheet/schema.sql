@@ -28,9 +28,11 @@ CREATE TABLE IF NOT EXISTS public.sheet_challans (
     total_pending NUMERIC(12, 2) DEFAULT 0.00,
     remarks TEXT,
     
-    -- Pipeline Traceability Metadata
+    -- Pipeline Traceability & Soft-Delete Metadata
     source_tab VARCHAR(100),
     sheet_row_number INTEGER,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMP WITH TIME ZONE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     
