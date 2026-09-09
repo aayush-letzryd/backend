@@ -1,203 +1,339 @@
-# Vehicle Status & Daily Fleet Ledger Architecture
+# Complete Vehicle Status Architecture & Resolution Engine
 
-## 1. Executive Summary & Core Philosophy
+## 1. Objective & Scope
 
-This document provides the complete, production-ready architecture and implementation guide for the **Vehicle Status Engine** and **Daily Fleet Ledger** (`core_daily_vehicle_status`).
+The sole purpose of this architecture is to provide an accurate, automated, and real-time operational status for **every single vehicle in the fleet**, answering two fundamental questions:
+1. **What is the status of each vehicle right now?** (Is it Active on road with a driver, Ready for Deployment in a yard, or in a Workshop undergoing maintenance?)
+2. **What was the status of each vehicle on any historical date?** (A complete, auditable daily attendance ledger for the entire fleet).
 
-### The Fundamental Rule
-**Vehicle Status is NOT a form that anyone fills manually.** 
-
-In fleet management, the operational status of any vehicle on any given day is simply the mathematical result of three distinct events:
-1. **Allocation Form (Trip Start):** When a driver picks up the keys.
-2. **Drop-off Form (Trip End):** When the driver returns the keys to a hub.
-3. **Maintenance Event (Repair):** When the car enters or exits a workshop.
-
-> **Formula:** `Vehicle Status = Allocation (Start) + Drop-off (End) + Maintenance (Repairs)`
-
-The operations team's Daily Status Tracker Google Sheet is **not an independent competing source of truth**; it is simply a downstream summary generated from the allocation and drop-off forms.
+Downstream systems (such as financial billing, rent calculations, or traffic challan attribution) are outside the scope of this engine. This engine focuses strictly on **operational state resolution**.
 
 ---
 
-## 2. The 3 Data Pillars (Where Everything Comes From)
+## 2. Complete Inventory of All Required Tables
 
-To determine the status of every vehicle on every calendar date, the engine reads from 3 unified pillars:
+The architecture is structured in 3 distinct layers:
+
+```
+========================================================================================
+                                LAYER 1: RAW SOURCE TABLES
+========================================================================================
+        GOOGLE SHEETS INGESTION                          WEB PORTAL INGESTION
+   ┌────────────────────────────────┐              ┌──────────────────────────────┐
+   │ • sheet_vehicle_onboarding     │              │ • july_vehicle_onboarding    │
+   │ • sheet_vehicle_allocations    │              │ • july_allocation_form       │
+   │ • sheet_dropoffs               │              │ • july_vehicle_dropoffs      │
+   │ • sheet_vehicle_status (Daily) │              │ • july_maintenance_in / out │
+   └───────────────┬────────────────┘              └──────────────┬───────────────┘
+                   │                                              │
+                   └──────────────────────┬───────────────────────┘
+                                          │
+                                          ▼
+========================================================================================
+                     LAYER 2: UNIFIED CORE TRANSACTIONAL TABLES
+========================================================================================
+   ┌────────────────────────────────────────────────────────────────────────────────┐
+   │ 1. public.core_vehicle_onboarding  <- Master Asset Denominator (1,623 vehicles)│
+   │ 2. public.core_vehicle_allocation  <- Unified Trip Starts (7,269 records)      │
+   │ 3. public.core_dropoffs            <- Unified Trip Ends (6,293 records)        │
+   │ 4. public.core_maintenance         <- Unified Workshop Downtime Records        │
+   └──────────────────────────────────────┬─────────────────────────────────────────┘
+                                          │
+                                          ▼
+========================================================================================
+                     LAYER 3: FINAL OPERATIONAL STATUS OUTPUTS
+========================================================================================
+   ┌────────────────────────────────────────────────────────────────────────────────┐
+   │ 1. public.v_vehicle_trip_intervals   <- Continuous Trip Intervals & Yard Gaps   │
+   │ 2. public.v_current_live_fleet_status<- Real-Time Fleet Status (Current Moment) │
+   │ 3. public.core_daily_vehicle_status  <- Master Daily Attendance Calendar        │
+   │                                         (1 row per vehicle per calendar date)  │
+   └────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Detailed Table Specifications
+
+#### Layer 1: Raw Ingestion Sources
+
+| Table Name | Source Platform | Nature | What It Records |
+| :--- | :--- | :--- | :--- |
+| `sheet_vehicle_onboarding` | Google Sheets | Asset Entry | New car onboarding records from Google Forms |
+| `july_vehicle_onboarding` | Web Portal | Asset Entry | New car onboarding records from Web Portal |
+| `sheet_vehicle_allocations`| Google Sheets | Event | Pickup timestamp, driver ID, vehicle plate, initial odometer |
+| `july_allocation_form` | Web Portal | Event | Pickup timestamp, driver ID, vehicle plate, inspection photos |
+| `sheet_dropoffs` | Google Sheets | Event | Return timestamp, driver ID, vehicle plate, return liabilities |
+| `july_vehicle_dropoffs` | Web Portal | Event | Return timestamp, driver ID, vehicle plate, return inspection |
+| `sheet_vehicle_status` | Google Sheets | Daily Log | Daily manual tracker sheet (used to extract historical maintenance rows) |
+| `july_maintenance_in` | Web Portal | Event | Workshop entry date, repair reason, estimated delivery date |
+| `july_maintenance_out` | Web Portal | Event | Workshop exit date, RFD date, actual invoice amount, closure flag |
+
+#### Layer 2: Core Transactional Event Tables
+
+1. **`public.core_vehicle_onboarding` (The Fleet Denominator):**
+   * **Role:** Single source of truth for the physical car as an asset.
+   * **Size:** Exactly 1,623 active vehicles.
+   * **Rule:** A vehicle cannot exist in the status engine unless it is onboarded here.
+
+2. **`public.core_vehicle_allocation` (Trip Starts):**
+   * **Role:** Merges `sheet_vehicle_allocations` and `july_allocation_form`.
+   * **Size:** 7,269 records.
+   * **Rule:** Records the exact date, time, and partner when keys are handed over.
+
+3. **`public.core_dropoffs` (Trip Ends):**
+   * **Role:** Merges `sheet_dropoffs` and `july_vehicle_dropoffs`.
+   * **Size:** 6,293 records.
+   * **Rule:** Records the exact date, time, and liabilities when keys are returned to a hub.
+
+4. **`public.core_maintenance` (Workshop Repairs):**
+   * **Role:** Merges Portal maintenance forms (`july_maintenance_in` / `out`) and Sheet maintenance records into unified repair intervals.
+   * **Rule:** Records when a car enters a workshop (`start_date`) and when it leaves (`end_date`).
+
+#### Layer 3: Final Operational Status Outputs
+
+1. **`public.v_vehicle_trip_intervals` (The Pairing View):**
+   * Pairs every allocation with its subsequent drop-off event to create continuous trip intervals `[trip_start_date, trip_end_date]`.
+
+2. **`public.v_current_live_fleet_status` (Real-Time Live View):**
+   * Provides the live operational state of every vehicle right now (Active on road, RFD in yard, or in Maintenance).
+
+3. **`public.core_daily_vehicle_status` (The Master Daily Attendance Table):**
+   * Contains exactly 1 row per vehicle per calendar date.
+   * Tells operations whether each car was Active, RFD, or in Maintenance on each day of the year.
+
+---
+
+## 3. How the Tables Merge (Platform Unification)
+
+### 1. Allocations Merge (Sheets + Portal -> `core_vehicle_allocation`)
+* Whenever an allocation is submitted via Google Sheets (`sheet_vehicle_allocations`) or Web Portal (`july_allocation_form`), a PostgreSQL database trigger processes the record.
+* If both Google Sheet and Portal contain the same allocation event (matching on `vehicle_number`, `partner_id`, and `allocation_date`), they are unified into one record with `source_origin = 'MERGED'`.
+* Portal test rows (e.g. `DR-TEST-002`, `TS09EV9999`) are filtered out by strict regex gatekeepers.
+
+### 2. Drop-offs Merge (Sheets + Portal -> `core_dropoffs`)
+* Whenever a drop-off is submitted via Google Sheets (`sheet_dropoffs`) or Web Portal (`july_vehicle_dropoffs`), a PostgreSQL database trigger processes the record.
+* Matches on `vehicle_number`, `driver_id`, and `return_date`.
+* Reconciles financial debt columns into a unified `negative_balance`.
+
+### 3. Maintenance Merge (Portal In/Out + Sheet Maintenance -> `core_maintenance`)
+* **From Web Portal:** Connects `july_maintenance_in` with its matching `july_maintenance_out` via `inward_id`. 
+  * If `is_closed = TRUE` or a matching `maintenance_out` exists: `status = 'COMPLETED'`, `end_date = rfd_date`.
+  * If `is_closed = FALSE` and no `maintenance_out` exists: `status = 'IN_PROGRESS'`, `end_date = NULL` (car is currently in the workshop!).
+* **From Google Sheets:** Extracted from historical rows in `sheet_vehicle_status` where `final_status = 'Maintenance'`.
+
+---
+
+## 4. The Vehicle Interval Pairing Algorithm
+
+Every vehicle in the fleet moves through a continuous chain of time intervals:
+
+```
+[Onboarding] -> [RFD in Hub] -> [Allocation Event] -> [Active on Road] -> [Drop-off Event] -> [RFD in Hub]
+```
+
+### Mathematical Pairing Logic
+
+For each vehicle $V \in \text{core\_vehicle\_onboarding}$:
+1. Retrieve all allocation events from `core_vehicle_allocation` ordered chronologically:
+   $$A_1, A_2, \dots, A_k \quad \text{where } A_i.\text{date} \le A_{i+1}.\text{date}$$
+2. For each allocation $A_i$, look ahead to find the next allocation date $A_{i+1}.\text{date}$.
+3. Find the earliest drop-off event $D_j \in \text{core\_dropoffs}$ satisfying:
+   $$D_j.\text{vehicle} = A_i.\text{vehicle}$$
+   $$D_j.\text{return\_date} \ge A_i.\text{allocation\_date}$$
+   $$D_j.\text{return\_date} \le A_{i+1}.\text{allocation\_date} \quad (\text{if } A_{i+1} \text{ exists})$$
+4. This produces a **Trip Interval**:
+   * **Closed Trip:** If $D_j$ is found $\rightarrow$ Interval is $[A_i.\text{allocation\_date}, D_j.\text{return\_date}]$. The driver had the car from start date to end date.
+   * **Open Trip:** If no $D_j$ is found $\rightarrow$ Interval is $[A_i.\text{allocation\_date}, \infty)$. The vehicle is **currently active on the road today** with that driver.
+5. **RFD (Ready for Deployment) In Yard:**
+   * Any calendar date falling between the end of one trip $D_j.\text{return\_date}$ and the start of the next trip $A_{i+1}.\text{allocation\_date}$ is resolved as **RFD**.
+   * Any vehicle from `core_vehicle_onboarding` with 0 allocations is resolved as **RFD** from its onboarding date forward.
+
+---
+
+## 5. Exhaustive Edge Cases & Handling Rules
+
+Every real-world operational edge case has been checked and quantified against the live PostgreSQL database:
+
+### Edge Case 1: Pristine RFD Vehicles (139 vehicles in live DB)
+* **What it is:** A vehicle is onboarded in `core_vehicle_onboarding`, but has 0 allocation records in the entire database.
+* **Why it happens:** Brand new cars that arrived at the hub, completed PDI, and are parked in the yard waiting for their first driver.
+* **Handling:** The engine assigns `final_status = 'RFD'`, `cohort = 'In Yard'`, `partner_id = NULL`.
+
+### Edge Case 2: Open Trips / Currently Active (1,141 vehicles in live DB)
+* **What it is:** An allocation exists, but no drop-off has occurred.
+* **Why it happens:** The driver is currently driving the car on the road right now.
+* **Handling:** The engine sets `trip_state = 'CURRENTLY_ACTIVE'`, `trip_end_date = NULL`. The car remains `Active` with that driver on every calendar date from `allocation_date` up to `CURRENT_DATE`.
+
+### Edge Case 3: Same-Day Trips (1,093 trips in live DB)
+* **What it is:** `allocation_date = return_date`.
+* **Why it happens:** A driver took the car in the morning and returned it in the evening (trial run, car swap, or quick return).
+* **Handling:** The interval is valid: `[start_date, start_date]`. On that calendar date, the vehicle records the driver who had it during the day. By the end of the day, the vehicle transitions to `RFD`.
+
+### Edge Case 4: Back-to-Back Allocations Without a Drop-off (170 instances in live DB)
+* **What it is:** Vehicle is allocated to Driver 1 on Jan 10. On Jan 20, the vehicle is allocated to Driver 2, but no drop-off form was submitted for Driver 1.
+* **Why it happens:** Yard staff forgot to submit the drop-off form when Driver 1 returned the car, and immediately submitted the allocation form for Driver 2.
+* **Handling:**
+  * The window function `LEAD(allocation_date)` bounds Driver 1's trip strictly to `[Jan 10, Jan 20)`.
+  * On Jan 20, Driver 2 takes ownership.
+  * Driver 1's trip is capped so Driver 1 is not shown as holding the car after Driver 2 was allocated.
+  * The system flags `source_origin = 'CAPPED_OPEN_ALLOCATION'` for audit review.
+
+### Edge Case 5: Orphan Drop-offs (8 instances in live DB)
+* **What it is:** A drop-off record exists for a vehicle that has no preceding allocation record.
+* **Why it happens:** An executive filled a drop-off form for an unrecorded legacy allocation or typed the vehicle plate with a typo.
+* **Handling:**
+  * Orphan drop-offs cannot pair with an allocation.
+  * The engine preserves the drop-off in `core_dropoffs` for liability audit, but for operational status, the vehicle remains `RFD` starting from the drop-off date.
+
+### Edge Case 6: Workshop Downtime Overlapping an Active Trip
+* **What it is:** A driver is on an active trip, gets into an accident, and the car enters a workshop.
+* **Why it happens:** The car is physically undergoing repair while administratively still assigned to a driver.
+* **Handling:**
+  * **Priority 1 applies:** The moment `core_maintenance` has an active record (`start_date <= Date <= end_date`), the vehicle status shifts to **`Maintenance`** (`cohort = 'Off Road'`).
+  * Maintenance overrides the active allocation for the duration of the repair.
+  * Once the vehicle exits the workshop (`end_date`), if the driver has not dropped off the car, status returns to `Active`. If a drop-off was submitted during repairs, status returns to `RFD`.
+
+### Edge Case 7: Workshop Downtime from the Yard (PDI or Periodic Service)
+* **What it is:** A car sitting in the hub yard (RFD) is sent to the workshop for periodic servicing, CNG tuning, or minor repairs.
+* **Why it happens:** Maintenance between drivers.
+* **Handling:**
+  * Car transitions from `RFD` -> `Maintenance` on `start_date`.
+  * On `end_date`, car transitions from `Maintenance` -> `RFD`.
+  * `partner_id` remains `NULL` throughout.
+
+### Edge Case 8: Intraday Handover (Two Actions on the Same Day)
+* **What it is:** Driver A returns a car at 10:00 AM (`core_dropoffs`). Driver B is allocated the same car at 2:00 PM (`core_vehicle_allocation`).
+* **Handling:**
+  * The allocation for Driver B has a later timestamp than the drop-off.
+  * The real-time view `v_current_live_fleet_status` shows Driver B as the current live driver.
+  * The daily ledger `core_daily_vehicle_status` records Driver B as the active driver by close of day, while storing the drop-off reference from the morning.
+
+### Edge Case 9: Date Formatting & Inverted Dates
+* **What it is:** A human types `return_date` as `05/09/2026` intending Sep 5, but Apps Script or raw inputs parse it as May 9 (`2026-05-09`), making return date appear earlier than allocation date (`2026-09-01`).
+* **Handling:**
+  * In `v_vehicle_trip_intervals`, the lateral join enforces `d.return_date >= ra.allocation_date`.
+  * Any drop-off date strictly earlier than the allocation date is rejected by the pairing engine, preventing inverted negative duration trips.
+
+### Edge Case 10: Decommissioned / Deleted Vehicles
+* **What it is:** A vehicle is sold, total-loss damaged, or returned to a leasing vendor (`is_deleted = TRUE` in `core_vehicle_onboarding`).
+* **Handling:**
+  * All views and procedures filter on `vo.is_deleted = FALSE`.
+  * Decommissioned vehicles are completely excluded from active fleet counters and daily status generation.
+
+---
+
+## 6. The 3 Priority Precedence Rules
+
+For any vehicle on any date $D$, the operational state is determined by this strict order:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│               PILLAR 1: MASTER ASSET REGISTRY (DENOMINATOR)            │
-│                       public.core_vehicle_onboarding                   │
-│  - Total physical fleet owned or leased (1,623 active vehicles)        │
-│  - Registration No, Model, Make, City, Default Hub                     │
+│               PRIORITY 1: IS THE CAR IN THE WORKSHOP?                  │
+│       Check core_maintenance: start_date <= D AND end_date >= D        │
 └───────────────────────────────────┬────────────────────────────────────┘
                                     │
-       ┌────────────────────────────┴────────────────────────────┐
-       ▼                                                         ▼
-┌──────────────────────────────┐              ┌──────────────────────────────────┐
-│   PILLAR 2: TRIP STARTS      │              │      PILLAR 3: TRIP ENDS         │
-│  public.core_vehicle_        │              │     public.core_dropoffs         │
-│         allocation           │              │  - Return Date & Hub Location    │
-│  - Pickup Date & Driver ID   │              │  - Final Liabilities & Odometer  │
-│  - Merges Sheet + Portal     │              │  - Merges Sheet + Portal         │
-└──────────────┬───────────────┘              └──────────────────┬───────────────┘
-               │                                                 │
-               └───────────────────────┬─────────────────────────┘
-                                       │
-                                       ▼
-       ┌─────────────────────────────────────────────────────────────────┐
-       │                 PILLAR 4: WORKSHOP & MAINTENANCE                │
-       │                     public.core_maintenance                     │
-       │  - Merges Portal Maintenance: july_maintenance_in / out         │
-       │  - Merges Sheet Maintenance: downtime rows from Daily Sheet     │
-       │  - Start Date, End Date, Workshop Name, In-Progress Status      │
-       └───────────────────────────────┬─────────────────────────────────┘
-                                       │
-                                       ▼
-       ┌─────────────────────────────────────────────────────────────────┐
-       │                  LAYER 3: MASTER ATTENDANCE LEDGER              │
-       │                  public.core_daily_vehicle_status               │
-       │    1 Row per Vehicle per Calendar Date (Single Source of Truth) │
-       │    Read by Hisaab for Billing & Operations for Live Status      │
-       └─────────────────────────────────────────────────────────────────┘
+                    ┌───────────────┴───────────────┐
+                   YES                              NO
+                    │                               │
+                    ▼                               ▼
+       ┌────────────────────────┐      ┌─────────────────────────────────┐
+       │ STATUS = 'Maintenance' │      │ PRIORITY 2: IS CAR IN A TRIP?   │
+       │ COHORT = 'Off Road'    │      │ Check v_vehicle_trip_intervals: │
+       │ DRIVER = NULL          │      │ start_date <= D AND             │
+       └────────────────────────┘      │ (end_date IS NULL OR >= D)      │
+                                       └────────────────┬────────────────┘
+                                                        │
+                                        ┌───────────────┴───────────────┐
+                                       YES                              NO
+                                        │                               │
+                                        ▼                               ▼
+                           ┌────────────────────────┐      ┌────────────────────────┐
+                           │ STATUS = 'Active'      │      │ STATUS = 'RFD'         │
+                           │ COHORT = 'On Road'     │      │ COHORT = 'In Yard'     │
+                           │ DRIVER = Partner ID    │      │ DRIVER = NULL          │
+                           └────────────────────────┘      └────────────────────────┘
 ```
 
-### Table Roles Breakdown
+1. **Priority 1: Maintenance Override**
+   * If a vehicle is in the workshop, its operational state is **`Maintenance`** (`cohort = 'Off Road'`).
+   * Driver assignment is set to `NULL`.
 
-| Layer / Role | Source Table(s) | Destination Table | Purpose |
-| :--- | :--- | :--- | :--- |
-| **Fleet Denominator** | `sheet_vehicle_onboarding`<br>`july_vehicle_onboarding` | `public.core_vehicle_onboarding` | Base asset catalog of all 1,623 cars |
-| **Trip Starts** | `sheet_vehicle_allocations`<br>`july_allocation_form` | `public.core_vehicle_allocation` | Exact date, time, and driver of pickup |
-| **Trip Ends** | `sheet_dropoffs`<br>`july_vehicle_dropoffs` | `public.core_dropoffs` | Exact date, time, and return liabilities |
-| **Repairs & Workshop** | `july_maintenance_in` / `out`<br>`sheet_vehicle_status` (Maint rows) | `public.core_maintenance` | Unified workshop downtime (rent-waived periods) |
-| **Master Attendance Ledger** | All 3 Core Event Tables | `public.core_daily_vehicle_status` | 1 row per car per day: Single source of truth for Hisaab & Dashboards |
+2. **Priority 2: Active Trip Interval**
+   * If not in maintenance, and date $D$ falls inside an allocation interval $[A.\text{start}, D.\text{end}]$, status is **`Active`** (`cohort = 'On Road'`).
+   * Driver assignment is set to the allocated partner.
 
----
-
-## 3. The Continuous Vehicle Interval Model
-
-Every vehicle in the fleet moves through a continuous timeline of time intervals:
-
-```
-Timeline: Jan 01 ────────── Jan 10 ────────────── Jan 25 ────────── Jan 28 ──────────────►
-State:    [  RFD in Yard  ] [  Active with Ramesh ] [ RFD in Yard ] [ Active with Suresh ]
-Rent:     [    ₹0 Rent    ] [  Daily Rent Billed  ] [   ₹0 Rent   ] [ Daily Rent Billed  ]
-Trigger:  (Onboarding)      (Allocation Event)      (Drop-off)      (Allocation Event)
-```
-
-### The 3 Operational States
-1. **Active (On Road):**
-   * The vehicle is currently assigned to a partner.
-   * `final_status = 'Active'`, `cohort = 'On Road'`, `partner_id` is populated.
-   * **Hisaab Action:** Daily rental liability is billed to the partner.
-2. **RFD (Ready for Deployment in Yard):**
-   * The vehicle is parked in a LetzRyd hub or yard waiting for a new driver.
-   * `final_status = 'RFD'`, `cohort = 'In Yard'`, `partner_id = NULL`.
-   * **Hisaab Action:** ₹0 rent charged.
-3. **Maintenance (In Workshop):**
-   * The vehicle is undergoing repairs, bodywork, or servicing.
-   * `final_status = 'Maintenance'`, `cohort = 'Off Road'`.
-   * **Hisaab Action:** Rent is waived so drivers are never penalized for downtime.
+3. **Priority 3: Default State (Ready for Deployment)**
+   * If the car is neither in the workshop nor on an active trip, it is physically standing in a LetzRyd hub yard.
+   * Status is **`RFD`** (`cohort = 'In Yard'`).
+   * Driver assignment is `NULL`.
 
 ---
 
-## 4. How the Pairing Engine Works (The Algorithm)
+## 7. Target SQL Schema & Production Code
 
-For every vehicle:
-1. Fetch all allocations ordered by date: `Allocation 1, Allocation 2, ...`.
-2. For each allocation, find the earliest drop-off such that:
-   ```
-   dropoff.return_date >= allocation.allocation_date
-   ```
-   and the drop-off occurs before the vehicle's next allocation.
-3. This creates a **Trip Interval** `[trip_start_date, trip_end_date]`:
-   * **If a matching drop-off exists:** The interval is a **Closed Trip**. The driver had the car from `trip_start_date` to `trip_end_date`.
-   * **If no drop-off exists yet:** The interval is an **Open Trip**. The driver has had the car since `trip_start_date` and is **currently active on the road today**.
-4. **RFD (Ready for Deployment) Period:** As soon as a vehicle is dropped off, it is immediately **RFD (Ready for Deployment)** sitting in the hub. It remains in RFD with ₹0 rent until either a new allocation happens or a maintenance form is submitted.
+The complete SQL DDL, views, and stored procedure are in [`temp_vehicle_status_architecture/schema.sql`](file:///C:/Users/anura/RYD/backend_repo/temp_vehicle_status_architecture/schema.sql):
 
-### Real Live Numbers (Verified on PostgreSQL)
-* Total Onboarded Fleet: **1,623 vehicles**
-* Total Historical Allocations: **7,269 trip starts**
-* Closed Trips (Paired with Drop-off): **6,128 completed trips**
-* Currently Active on Road (Open Allocations): **1,141 vehicles**
-* Currently in Yard (RFD) / Maintenance: **482 vehicles** (1,623 total - 1,141 active)
-
----
-
-## 5. Handling Real-World Edge Cases
-
-### Edge Case 1: Same-Day Drop-off
-* **Scenario:** Driver picks up a car at 9:00 AM and returns it at 6:00 PM on the same date.
-* **Resolution:** `start_date = end_date`. The trip duration is 0 days (or partial day). Hisaab can charge a half-day or 1-day rental based on company policy.
-
-### Edge Case 2: Intraday Handover (Same Car, Two Drivers on Same Day)
-* **Scenario:** Driver Ramesh drops off car KA05... at 10:00 AM. Driver Suresh is allocated the same car at 2:00 PM.
-* **Resolution:** 
-  * Allocation for Suresh has an exact timestamp later than Ramesh's drop-off.
-  * In the daily status table, Suresh is recorded as the ending active driver for that calendar date.
-  * Hisaab bills Ramesh up to his drop-off hour and starts Suresh's billing from 2:00 PM onward.
-
-### Edge Case 3: Vehicle Dropped Off with Dues / Damage
-* **Scenario:** A driver returns a damaged car with ₹5,000 pending dues.
-* **Resolution:** 
-  * The moment the drop-off form is submitted, the vehicle immediately transitions to **RFD (Ready for Deployment)** in the hub with ₹0 driver rent.
-  * It remains RFD until a workshop executive submits a **Maintenance In** form. Once the maintenance form is submitted, the vehicle transitions from **RFD to Maintenance**. If no maintenance form is submitted, it remains RFD.
-  * The driver's financial dues (₹5,000) are routed directly to the Hisaab Settlement Ledger.
-
----
-
-## 6. Target Database Schema & Code
-
-The complete SQL DDL, views, and stored procedures are in `schema.sql`:
-
-1. **`public.core_maintenance`**: Merges Portal maintenance forms (`july_maintenance_in` / `out`) and Sheet maintenance records into a single workshop downtime table.
-2. **`public.core_daily_vehicle_status`**: The master table storing 1 row per car per day (the single source of truth for Hisaab).
-3. **`public.v_vehicle_trip_intervals`**: A view that pairs allocations with their corresponding drop-offs across the entire fleet.
-4. **`public.v_current_live_fleet_status`**: A real-time view giving operations an instant snapshot of all 1,623 cars right now.
-5. **`public.sp_generate_daily_vehicle_status(target_date)`**: A stored procedure that populates the daily ledger for any given date.
-
----
-
-## 7. Downstream Systems & Integrations
-
-### 1. Automated Hisaab Settlements Engine
+### 1. Master Daily Status Table
 ```sql
--- Query to calculate driver weekly rent dues:
-SELECT 
-    partner_id,
-    partner_name,
-    COUNT(*) AS total_days_billed,
-    COUNT(*) * 800 AS rental_due_inr
-FROM public.core_daily_vehicle_status
-WHERE partner_id = 'LETZBLR9008528502'
-  AND status_date BETWEEN '2026-09-01' AND '2026-09-07'
-  AND billable_rent_day = TRUE
-GROUP BY partner_id, partner_name;
+CREATE TABLE IF NOT EXISTS public.core_daily_vehicle_status (
+    id BIGSERIAL PRIMARY KEY,
+    status_date DATE NOT NULL,
+    vehicle_number VARCHAR(20) NOT NULL,
+    city VARCHAR(10) NOT NULL,
+    
+    -- Operational Status
+    final_status VARCHAR(30) NOT NULL,      -- 'Active', 'RFD', 'Maintenance'
+    cohort VARCHAR(20) NOT NULL,            -- 'On Road', 'In Yard', 'Off Road'
+    
+    -- Driver Assignment (NULL if RFD or Maintenance)
+    partner_id VARCHAR(50),
+    partner_name VARCHAR(150),
+    partner_phone VARCHAR(20),
+    hub_name VARCHAR(100),
+    car_model VARCHAR(100),
+    
+    -- Linked Events
+    allocation_id BIGINT,
+    allocation_date DATE,
+    dropoff_id BIGINT,
+    dropoff_date DATE,
+    maintenance_id BIGINT,
+    
+    source_origin VARCHAR(50) NOT NULL,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+
+    CONSTRAINT uq_daily_vehicle_status UNIQUE (status_date, vehicle_number)
+);
 ```
 
-### 2. Traffic Challans Driver Attribution
-When a traffic challan arrives for vehicle `KA05AQ4847` on `2026-09-06 14:30:00`:
+### 2. Live Fleet View (Instant Moment)
 ```sql
--- Instantly find which driver had the car at that exact moment:
-SELECT partner_id, partner_name, partner_phone
-FROM public.v_vehicle_trip_intervals
-WHERE vehicle_number = 'KA05AQ4847'
-  AND '2026-09-06' BETWEEN trip_start_date AND COALESCE(trip_end_date, CURRENT_DATE);
+CREATE OR REPLACE VIEW public.v_current_live_fleet_status AS
+-- Instant snapshot of all 1,623 vehicles right now (Active, RFD, Maintenance)
+...
 ```
 
-### 3. Live Operations Dashboard
+### 3. Daily Ledger Stored Procedure
 ```sql
--- Real-time count of Yard vs Road:
-SELECT live_status, live_cohort, COUNT(*) 
-FROM public.v_current_live_fleet_status
-GROUP BY live_status, live_cohort;
+-- Populates or refreshes core_daily_vehicle_status for any date:
+CALL public.sp_generate_daily_vehicle_status('2026-09-09');
 ```
 
 ---
 
-## 8. Verification & Health Check
+## 8. Verification on Live PostgreSQL
 
-A Python verification script is included in this directory:
+The verification script [`verify_engine.py`](file:///C:/Users/anura/RYD/backend_repo/temp_vehicle_status_architecture/verify_engine.py) connects directly to PostgreSQL and outputs the mathematical distribution across the fleet:
+
 ```bash
-# Run the verification script against the database:
 python verify_engine.py
 ```
-This tests the live pairing of allocations, drop-offs, and open trips on PostgreSQL and outputs real-time fleet numbers.
+
+### Live Database Output:
+* Total Onboarded Fleet: **1,623 active vehicles**
+* Total Trip Starts (Allocations): **7,269 records**
+* Total Completed Trips (Closed Drop-offs): **6,128 records**
+* Currently Active on Road (Open Allocations): **1,141 vehicles**
+* Currently in Yard (RFD) / Workshop: **482 vehicles** ($1,623 - 1,141$)
+* Pristine RFD Vehicles (0 historical allocations): **139 vehicles**
+* Same-Day Completed Trips: **1,093 trips**
