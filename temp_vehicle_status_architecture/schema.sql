@@ -146,7 +146,10 @@ LEFT JOIN LATERAL (
     FROM public.core_dropoffs d
     WHERE d.is_deleted = FALSE
       AND d.vehicle_number = ra.vehicle_number
-      AND d.return_date >= ra.allocation_date
+      AND (
+          (d.return_date > ra.allocation_date)
+          OR (d.return_date = ra.allocation_date AND (d.driver_id = ra.partner_id OR ra.partner_id IS NULL))
+      )
       AND (ra.next_allocation_date IS NULL OR d.return_date <= ra.next_allocation_date)
     ORDER BY d.return_date ASC, d.id ASC
     LIMIT 1
