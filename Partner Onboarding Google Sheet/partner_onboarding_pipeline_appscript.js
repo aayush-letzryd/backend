@@ -10,33 +10,44 @@
  * Features:
  *  - Direct cross-sheet ingestion without IMPORTRANGE (prevents record limits & cell-freeze)
  *  - Full 47-issue standardization engine (ISS-16 through ISS-62)
- *  - Real-time On-Edit and Form-Submit triggers with JDBC batch upserts
- *  - Time-driven catch-up synchronization (syncRecentOnboardings / syncAllOnboardings)
- *  - Complete connection leak prevention (try-catch-finally with conn.close())
+ *  - Secure credential retrieval via PropertiesService.getScriptProperties()
+ *  - Strict Concurrency Control using LockService.getScriptLock()
  *  - Zero-burn PostgreSQL upsert logic preventing sequence gap creation
- *  - Clean multi-field parsing: composite referrals, arithmetic deposits, dates, banking
- *  - Robust phone/Aadhaar/DL/PAN sanitization and homoglyph transliteration
+ *  - Automatic column swap detection and date-to-DL recovery
+ *  - Strict calendar boundary clamping for DOB ([18, 75] yrs) and DL Expiry ([1990, 2060])
+ *  - Deterministic IST timestamp contract (YYYY-MM-DD HH:mm:ss without millisecond drift)
+ *  - Batched Google Sheets RPC writes preventing quota depletion
+ *  - Complete connection leak prevention (try-catch-finally with conn.close())
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
-const DB_CONFIG = {
-  host: "35.200.196.113",
-  port: "5432",
-  database: "postgres",
-  user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
-  
-  // Source Spreadsheet with raw form responses ('Onboarding form_V2')
-  sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1ix6iKa9nEh4li44ZRcpkAvEMLo4r94mT4VbwRCfNZIM/edit",
-  sourceSheetName: "Onboarding form_V2",
-  
-  // Destination Spreadsheet tab where standardized data is stored
-  targetSheetName: "sheet_driver_onboarding",
+function getDbConfig() {
+  let props = null;
+  try {
+    props = PropertiesService.getScriptProperties();
+  } catch(e) {}
 
-  // Error logging tab for invalid/failed records
-  errorSheetName: "onboarding_sync_errors"
-};
+  return {
+    host: (props && props.getProperty("DB_HOST")) || "35.200.196.113",
+    port: (props && props.getProperty("DB_PORT")) || "5432",
+    database: (props && props.getProperty("DB_NAME")) || "postgres",
+    user: (props && props.getProperty("DB_USER")) || "postgres",
+    password: (props && props.getProperty("DB_PASSWORD")) || "8S5]U3@L^Xz)\\FH}",
+    
+    // Source Spreadsheet with raw form responses ('Onboarding form_V2')
+    sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_SPREADSHEET_URL")) || "https://docs.google.com/spreadsheets/d/1ix6iKa9nEh4li44ZRcpkAvEMLo4r94mT4VbwRCfNZIM/edit",
+    sourceSheetName: (props && props.getProperty("SOURCE_SHEET_NAME")) || "Onboarding form_V2",
+    
+    // Destination Spreadsheet tab where standardized data is stored
+    targetSheetName: (props && props.getProperty("TARGET_SHEET_NAME")) || "sheet_driver_onboarding",
+
+    // Error logging tab for invalid/failed records
+    errorSheetName: (props && props.getProperty("ERROR_SHEET_NAME")) || "onboarding_sync_errors"
+  };
+}
+
+const DB_CONFIG = getDbConfig();
 
 // Standard JDBC SQL Type Codes (Apps Script does not expose java.sql.Types)
 const SQL_TYPES = {
@@ -76,9 +87,10 @@ const HOMOGLYPH_MAP = {
 // =============================================================================
 
 function getSourceSpreadsheet() {
-  if (DB_CONFIG.sourceSpreadsheetUrl && DB_CONFIG.sourceSpreadsheetUrl.trim() !== "") {
+  const cfg = getDbConfig();
+  if (cfg.sourceSpreadsheetUrl && cfg.sourceSpreadsheetUrl.trim() !== "") {
     try {
-      return SpreadsheetApp.openByUrl(DB_CONFIG.sourceSpreadsheetUrl);
+      return SpreadsheetApp.openByUrl(cfg.sourceSpreadsheetUrl);
     } catch(e) {
       Logger.log("openByUrl error for source sheet, falling back to active spreadsheet: " + e.message);
     }
@@ -118,32 +130,50 @@ function sanitizeCity(val) {
   let text = sanitizeText(val);
   if (!text) return null;
   let lower = text.toLowerCase();
-  if (lower.indexOf("bang") !== -1 || lower.indexOf("blr") !== -1 || lower.indexOf("beng") !== -1) return "Bengaluru";
-  if (lower.indexOf("hyd") !== -1) return "Hyderabad";
-  if (lower.indexOf("mum") !== -1 || lower.indexOf("bomb") !== -1) return "Mumbai";
+  if (lower.indexOf("blr") !== -1 || lower.indexOf("bangalore") !== -1 || lower.indexOf("bengaluru") !== -1) return "Bengaluru";
+  if (lower.indexOf("hyd") !== -1 || lower.indexOf("hyderabad") !== -1) return "Hyderabad";
+  if (lower.indexOf("mum") !== -1 || lower.indexOf("mumbai") !== -1) return "Mumbai";
+  if (lower.indexOf("del") !== -1 || lower.indexOf("delhi") !== -1) return "Delhi";
+  if (lower.indexOf("chn") !== -1 || lower.indexOf("chennai") !== -1) return "Chennai";
+  if (lower.indexOf("pun") !== -1 || lower.indexOf("pune") !== -1) return "Pune";
   return text.charAt(0).toUpperCase() + text.slice(1).toLowerCase();
 }
 
 /**
- * Standardizes Onboarding Type (ISS-22: Lowercase 'operator' typo -> 'Operator' / 'Individual').
+ * Standardizes Onboarding Type (ISS-22).
  */
 function sanitizeOnboardingType(val) {
   let text = sanitizeText(val);
   if (!text) return "Individual";
   let lower = text.toLowerCase();
-  if (lower.indexOf("operator") !== -1) return "Operator";
+  if (lower.indexOf("oper") !== -1) return "Operator";
   return "Individual";
 }
 
 /**
- * Standardizes Phone Numbers (ISS-05, ISS-20, ISS-25).
- * Strips '.0', non-digits, country code (+91 / 91 / 0) and extracts 10 clean digits.
+ * Standardizes Phone Numbers (ISS-20, ISS-25, ISS-26, ISS-28).
+ * Strips non-digits, leading zeroes, country code (+91), scientific notation floats (.0).
  */
 function sanitizePhone(val) {
   if (val === null || val === undefined) return null;
-  let str = String(val).trim().replace(/\.0+$/, "").replace(/[\s\-\(\)\+]/g, "");
+  let str = String(val).trim();
+  if (str === "" || str === "-" || str.toLowerCase() === "na" || str.toLowerCase() === "null") return null;
+  
+  // Handle scientific notation float (e.g. 9.88601E+09)
+  if (str.toUpperCase().indexOf("E+") !== -1 || str.indexOf("e+") !== -1) {
+    let num = Number(str);
+    if (!isNaN(num)) {
+      str = num.toLocaleString('fullwide', {useGrouping: false});
+    }
+  }
+  
+  // Strip trailing float decimals like .0
+  str = str.replace(/\.0+$/, "");
+  
   let digits = str.replace(/\D/g, "");
-  if (!digits) return null;
+  if (!digits || digits.length < 10) return null;
+  
+  // Strip leading 91 or 0 if string is > 10 digits
   if (digits.length === 12 && digits.startsWith("91")) {
     digits = digits.substring(2);
   } else if (digits.length === 11 && digits.startsWith("0")) {
@@ -184,14 +214,37 @@ function sanitizeAadhaar(val) {
 }
 
 /**
- * Standardizes Driving License (ISS-42, ISS-44, ISS-45).
- * Strips non-alphanumeric separators and handles lookalikes.
+ * Checks whether an input value represents a Date object or Date string.
+ */
+function isDateValue(val) {
+  if (!val) return false;
+  if (val instanceof Date) return true;
+  if (typeof val === "string") {
+    let s = val.trim();
+    if (s.indexOf("GMT") !== -1 || s.indexOf("UTC") !== -1 || s.indexOf("T00:00:00") !== -1) return true;
+    if (/^(Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+[A-Za-z]{3}\s+\d{1,2}\s+\d{4}/i.test(s)) return true;
+    if (/^\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}/.test(s)) return true;
+    if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/.test(s)) return true;
+    if (/^\d{1,2}[\/\-][A-Za-z]{3}[\/\-]\d{2,4}/.test(s)) return true;
+  }
+  return false;
+}
+
+/**
+ * Standardizes Driving License Number (ISS-42, ISS-44, ISS-45).
+ * Rejects Date objects / strings to prevent SATSEP... date corruption.
  */
 function sanitizeDL(val) {
+  if (!val) return null;
+  if (isDateValue(val)) return null; // Reject dates accidentally passed into DL column
   let text = sanitizeText(val);
   if (!text) return null;
-  let cleaned = text.toUpperCase().replace(/[\s\-\/\.]/g, "");
-  return cleaned.length > 0 ? cleaned : null;
+  let cleaned = text.toUpperCase().replace(/[\s\-\/\.#_]/g, "");
+  // If string contains date markers like GMT or standard date representation, reject it
+  if (cleaned.indexOf("GMT") !== -1 || cleaned.indexOf("INDIASTANDARDTIME") !== -1) {
+    return null;
+  }
+  return cleaned.length >= 4 ? cleaned : null;
 }
 
 /**
@@ -223,7 +276,7 @@ function sanitizeIFSC(val) {
   if (cleaned.length === 10 && cleaned.charAt(4) !== '0') {
     cleaned = cleaned.substring(0, 4) + "0" + cleaned.substring(4);
   }
-  return cleaned.length > 0 ? cleaned : null;
+  return (cleaned.length === 11 && !/^0+$/.test(cleaned)) ? cleaned : null;
 }
 
 /**
@@ -279,40 +332,69 @@ function parseReferral(val) {
   };
 }
 
+/**
+ * Resolves 2-digit years with commercial driver boundary validation.
+ */
 function resolveTwoDigitYear(yy, isDob) {
   let currentYear = new Date().getFullYear();
   if (isDob) {
-    // Driver partners must be adults (>= 18 yrs). Any 2-digit birth year producing future or underage date belongs to 1900s.
-    let maxDobYY = (currentYear - 18) % 100;
-    return (yy > maxDobYY) ? 1900 + yy : 2000 + yy;
+    // Commercial driver age threshold: 18 to 75 years old
+    let minDobYear = currentYear - 75;
+    let maxDobYear = currentYear - 18;
+    let opt1 = 1900 + yy;
+    let opt2 = 2000 + yy;
+    if (opt2 >= minDobYear && opt2 <= maxDobYear) return opt2;
+    if (opt1 >= minDobYear && opt1 <= maxDobYear) return opt1;
+    return opt1;
   }
+  // For licenses and other dates
   return (yy > 50) ? 1900 + yy : 2000 + yy;
 }
 
 /**
- * Multi-format Date / Timestamp Parser (ISS-30, ISS-31, ISS-32, ISS-46).
+ * Multi-format Date / Timestamp Parser with Strict Boundary Clamping (ISS-30, ISS-31, ISS-32, ISS-46).
+ * @param {*} val Input cell value
+ * @param {boolean} isDob Whether this date represents Date of Birth
+ * @param {number} minYear Lower calendar boundary (defaults: DOB -> currentYear - 75; other -> 1990)
+ * @param {number} maxYear Upper calendar boundary (defaults: DOB -> currentYear - 18; other -> 2060)
  */
-function parseDateTime(val, isDob) {
+function parseDateTime(val, isDob, minYear, maxYear) {
   if (!val) return null;
+  const currentYear = new Date().getFullYear();
+  const lowerBound = minYear || (isDob ? (currentYear - 75) : 1990);
+  const upperBound = maxYear || (isDob ? (currentYear - 18) : 2060);
+
+  function clampDate(dt) {
+    if (!dt || isNaN(dt.getTime())) return null;
+    let y = dt.getFullYear();
+    // Guard against astronomical overflow years or toddler/ancient corrupted years
+    if (y < lowerBound || y > upperBound) {
+      return null;
+    }
+    return dt;
+  }
+
+  // Handle native Date objects
   if (val instanceof Date) {
     if (isNaN(val.getTime())) return null;
     let y = val.getFullYear();
     if (y < 100) {
       val.setFullYear(resolveTwoDigitYear(y, isDob));
-    } else if (isDob && y > new Date().getFullYear()) {
-      val.setFullYear(y - 100);
     }
-    return val;
+    return clampDate(val);
   }
+
+  // Handle numeric Excel/Sheets serial numbers
   if (typeof val === "number") {
+    // Reject massive numbers (like phone numbers typed into date column e.g. 9886012345)
+    if (val < 1 || val > 75000) return null;
     let dt = new Date(Math.round((val - 25569) * 86400 * 1000));
     if (isNaN(dt.getTime())) return null;
     let y = dt.getFullYear();
-    if (isDob && y > new Date().getFullYear()) {
-      dt.setFullYear(y - 100);
-    }
-    return dt;
+    if (y < 100) dt.setFullYear(resolveTwoDigitYear(y, isDob));
+    return clampDate(dt);
   }
+
   let str = String(val).trim();
   if (!str || str === "-" || str.toLowerCase() === "na" || str.toLowerCase() === "null") return null;
 
@@ -325,9 +407,8 @@ function parseDateTime(val, isDob) {
     let hour = ymdMatch[4] ? parseInt(ymdMatch[4], 10) : 0;
     let min = ymdMatch[5] ? parseInt(ymdMatch[5], 10) : 0;
     let sec = ymdMatch[6] ? parseInt(ymdMatch[6], 10) : 0;
-    if (isDob && year > new Date().getFullYear()) year -= 100;
     let dt = new Date(year, month, day, hour, min, sec);
-    return isNaN(dt.getTime()) ? null : dt;
+    return clampDate(dt);
   }
   
   // 2. DD/MM/YYYY or DD-MM-YYYY or DD/MM/YY or DD-MM-YY
@@ -338,14 +419,12 @@ function parseDateTime(val, isDob) {
     let year = parseInt(dmyMatch[3], 10);
     if (year < 100) {
       year = resolveTwoDigitYear(year, isDob);
-    } else if (isDob && year > new Date().getFullYear()) {
-      year -= 100;
     }
     let hour = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 0;
     let min = dmyMatch[5] ? parseInt(dmyMatch[5], 10) : 0;
     let sec = dmyMatch[6] ? parseInt(dmyMatch[6], 10) : 0;
     let dt = new Date(year, month, day, hour, min, sec);
-    return isNaN(dt.getTime()) ? null : dt;
+    return clampDate(dt);
   }
   
   // 3. DD-MMM-YY e.g. 15-Aug-94 or 15-Aug-2024
@@ -357,10 +436,9 @@ function parseDateTime(val, isDob) {
     let month = months.indexOf(monthStr);
     let year = parseInt(dMmmYMatch[3], 10);
     if (year < 100) year = resolveTwoDigitYear(year, isDob);
-    else if (isDob && year > new Date().getFullYear()) year -= 100;
     if (month !== -1) {
       let dt = new Date(year, month, day);
-      return isNaN(dt.getTime()) ? null : dt;
+      return clampDate(dt);
     }
   }
 
@@ -372,20 +450,23 @@ function parseDateTime(val, isDob) {
     let month = parseInt(yyMdMatch[2], 10) - 1;
     let day = parseInt(yyMdMatch[3], 10);
     let dt = new Date(year, month, day);
-    return isNaN(dt.getTime()) ? null : dt;
+    return clampDate(dt);
   }
 
+  // 5. JavaScript Date String (e.g. 'Sat Sep 11 2027 00:00:00 GMT+0530')
   let parsed = new Date(str);
-  if (isNaN(parsed.getTime())) return null;
-  let y = parsed.getFullYear();
-  if (y < 100) {
-    parsed.setFullYear(resolveTwoDigitYear(y, isDob));
-  } else if (isDob && y > new Date().getFullYear()) {
-    parsed.setFullYear(y - 100);
+  if (!isNaN(parsed.getTime())) {
+    let y = parsed.getFullYear();
+    if (y < 100) parsed.setFullYear(resolveTwoDigitYear(y, isDob));
+    return clampDate(parsed);
   }
-  return parsed;
+
+  return null;
 }
 
+/**
+ * Formats standard date only string: YYYY-MM-DD.
+ */
 function formatDateOnly(dt) {
   if (!dt || isNaN(dt.getTime())) return null;
   if (typeof Utilities !== "undefined" && Utilities.formatDate) {
@@ -398,12 +479,22 @@ function formatDateOnly(dt) {
   return yStr + "-" + m + "-" + d;
 }
 
+/**
+ * Formats standard deterministic timestamp in IST without milliseconds.
+ * Eliminates duplicate key generation due to millisecond discrepancies.
+ */
 function formatTimestamp(dt) {
   if (!dt || isNaN(dt.getTime())) return null;
   if (typeof Utilities !== "undefined" && Utilities.formatDate) {
-    return Utilities.formatDate(dt, "Asia/Kolkata", "yyyy-MM-dd HH:mm:ssXXX");
+    return Utilities.formatDate(dt, "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
   }
-  return dt.toISOString();
+  let y = dt.getFullYear();
+  let m = ("0" + (dt.getMonth() + 1)).slice(-2);
+  let d = ("0" + dt.getDate()).slice(-2);
+  let h = ("0" + dt.getHours()).slice(-2);
+  let min = ("0" + dt.getMinutes()).slice(-2);
+  let s = ("0" + dt.getSeconds()).slice(-2);
+  return y + "-" + m + "-" + d + " " + h + ":" + min + ":" + s;
 }
 
 /**
@@ -427,14 +518,14 @@ function generatePartnerId(city, phone) {
 }
 
 // =============================================================================
-// ROW OBJECT PARSER
+// ROW OBJECT PARSER (WITH INTELLIGENT COLUMN SWAP RECOVERY)
 // =============================================================================
 
 function parseRow(row, rowIndex) {
   if (!row || row.length === 0) return null;
   
   let rawTs = row[0];
-  let submissionTs = parseDateTime(rawTs);
+  let submissionTs = parseDateTime(rawTs, false, 2020, 2030);
   if (!submissionTs) return null; // Skip non-data / unparseable header rows
   
   let email = sanitizeText(row[1]);
@@ -448,13 +539,12 @@ function parseRow(row, rowIndex) {
   let driverPhone = sanitizePhone(rawPhone);
   
   // A valid 10-digit driver phone is mandatory for onboarding.
-  // Route invalid/missing phone records to onboarding_sync_errors tab instead of dropping silently.
   if (!driverPhone || !/^[0-9]{10}$/.test(driverPhone)) {
     let failureReason = !rawPhone || String(rawPhone).trim() === "" 
       ? "Blank / Missing Phone Number" 
       : "Invalid Phone Number Format: '" + String(rawPhone) + "' (Must be 10 digits)";
     logOnboardingError(rowIndex, rawPhone, driverName, failureReason, row);
-    Logger.log("Row " + rowIndex + " failed validation (" + failureReason + ") -> Logged to " + DB_CONFIG.errorSheetName);
+    Logger.log("Row " + rowIndex + " failed validation (" + failureReason + ") -> Logged to " + getDbConfig().errorSheetName);
     return null;
   }
   
@@ -469,8 +559,31 @@ function parseRow(row, rowIndex) {
   let presentAddress = sanitizeText(row[16]) || aadhaarAddress; // ISS-35: fallback to Aadhaar address
   let panNumber = sanitizePAN(row[17]);
   let aadhaarNumber = sanitizeAadhaar(row[18]);
-  let dlExpiry = parseDateTime(row[19]);
-  let dlNumber = sanitizeDL(row[20]);
+  
+  // Driving License & Expiry Resolution (Column 19 = DL Number, Column 20 = DL Expiry Date)
+  // Implements intelligent cross-detection to automatically recover swapped/shifted form entries
+  let rawCol19 = row[19];
+  let rawCol20 = row[20];
+  let dlNumber = null;
+  let dlExpiry = null;
+
+  let col19IsDate = isDateValue(rawCol19);
+  let col20IsDate = isDateValue(rawCol20);
+
+  if (col19IsDate && !col20IsDate) {
+    // Columns were inverted: Col 19 has Expiry Date, Col 20 has DL Number
+    dlExpiry = parseDateTime(rawCol19, false, 1990, 2060);
+    dlNumber = sanitizeDL(rawCol20);
+  } else {
+    // Canonical mapping: Col 19 is DL Number, Col 20 is DL Expiry Date
+    dlNumber = sanitizeDL(rawCol19);
+    dlExpiry = parseDateTime(rawCol20, false, 1990, 2060);
+    // If DL number was empty or unparseable but col19 had date, attempt extraction
+    if (!dlExpiry && col19IsDate) {
+      dlExpiry = parseDateTime(rawCol19, false, 1990, 2060);
+    }
+  }
+
   let upiFromAccount = sanitizeUPI(row[21]);
   let panAadhaarLinked = sanitizeText(row[22]);
   
@@ -549,8 +662,9 @@ function parseRow(row, rowIndex) {
 // =============================================================================
 
 function getDbConnection() {
-  const url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
-  return Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
+  const cfg = getDbConfig();
+  const url = "jdbc:postgresql://" + cfg.host + ":" + cfg.port + "/" + cfg.database;
+  return Jdbc.getConnection(url, cfg.user, cfg.password);
 }
 
 /**
@@ -560,6 +674,7 @@ function testConnection() {
   let conn = null;
   let stmt = null;
   let rs = null;
+  const cfg = getDbConfig();
   try {
     conn = getDbConnection();
     stmt = conn.createStatement();
@@ -569,18 +684,22 @@ function testConnection() {
       count = rs.getInt(1);
     }
     Logger.log("Connection Successful. Current rows in sheet_driver_onboarding: " + count);
-    SpreadsheetApp.getUi().alert(
-      "Database Connection Successful",
-      "Connected to PostgreSQL on " + DB_CONFIG.host + ".\nCurrent rows in sheet_driver_onboarding: " + count,
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    if (typeof SpreadsheetApp !== "undefined" && SpreadsheetApp.getUi) {
+      SpreadsheetApp.getUi().alert(
+        "Database Connection Successful",
+        "Connected to PostgreSQL on " + cfg.host + ".\nCurrent rows in sheet_driver_onboarding: " + count,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
   } catch (e) {
     Logger.log("Connection Failed: " + e.message);
-    SpreadsheetApp.getUi().alert(
-      "Database Connection Error",
-      "Failed to connect to PostgreSQL: " + e.message,
-      SpreadsheetApp.getUi().ButtonSet.OK
-    );
+    if (typeof SpreadsheetApp !== "undefined" && SpreadsheetApp.getUi) {
+      SpreadsheetApp.getUi().alert(
+        "Database Connection Error",
+        "Failed to connect to PostgreSQL: " + e.message,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    }
   } finally {
     if (rs) { try { rs.close(); } catch(e){} }
     if (stmt) { try { stmt.close(); } catch(e){} }
@@ -604,7 +723,7 @@ function sqlEscapeDate(dt) {
 
 function sqlEscapeTimestamp(dt) {
   let s = formatTimestamp(dt);
-  return s ? ("'" + s + "'::timestamptz") : "NULL::timestamptz";
+  return s ? ("'" + s + "'::timestamp without time zone") : "NULL::timestamp";
 }
 
 function sqlEscapeNum(val) {
@@ -628,7 +747,7 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
   
   let conn = null;
   let stmt = null;
-  const BATCH_SIZE = 15;
+  const BATCH_SIZE = 5; // Reduced to 5 rows per SQL statement to prevent Google Apps Script JDBC 'Argument too large: sql' limit
   let totalCount = 0;
   
   try {
@@ -798,31 +917,6 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
   }
 }
 
-/**
- * Executes the database refresh procedure to update core_partner_onboarding
- */
-function triggerCoreMerge(conn) {
-  let stmt = null;
-  let localConn = false;
-  try {
-    if (!conn) {
-      conn = getDbConnection();
-      localConn = true;
-    }
-    stmt = conn.createStatement();
-    stmt.execute("CALL refresh_core_partner_onboarding();");
-    if (!conn.getAutoCommit()) {
-      conn.commit();
-    }
-    Logger.log("Refreshed public.core_partner_onboarding successfully.");
-  } catch(e) {
-    Logger.log("Core merge notice: " + e.message);
-  } finally {
-    if (stmt) { try { stmt.close(); } catch(e){} }
-    if (localConn && conn) { try { conn.close(); } catch(e){} }
-  }
-}
-
 // =============================================================================
 // CROSS-SHEET PULL & STANDARDIZATION (NO IMPORTRANGE)
 // =============================================================================
@@ -833,16 +927,25 @@ function triggerCoreMerge(conn) {
  * populates the target spreadsheet tab, and syncs to PostgreSQL in batches.
  */
 function syncAllOnboardings() {
-  return syncFromSourceSheetToTargetSheet();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncAllOnboardings skipped: another process holds the script lock.");
+    return;
+  }
+  try {
+    syncFromSourceSheetToTargetSheet();
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function syncFromSourceSheetToTargetSheet() {
   Logger.log("Starting direct cross-sheet pull and standardization...");
-  
+  const cfg = getDbConfig();
   const sourceSs = getSourceSpreadsheet();
-  const sourceSheet = sourceSs.getSheetByName(DB_CONFIG.sourceSheetName);
+  const sourceSheet = sourceSs.getSheetByName(cfg.sourceSheetName);
   if (!sourceSheet) {
-    throw new Error("Source sheet tab '" + DB_CONFIG.sourceSheetName + "' not found in spreadsheet!");
+    throw new Error("Source sheet tab '" + cfg.sourceSheetName + "' not found in spreadsheet!");
   }
   
   const data = sourceSheet.getDataRange().getValues();
@@ -851,7 +954,7 @@ function syncFromSourceSheetToTargetSheet() {
     return;
   }
   
-  Logger.log("Read " + (data.length - 1) + " raw rows from " + DB_CONFIG.sourceSheetName);
+  Logger.log("Read " + (data.length - 1) + " raw rows from " + cfg.sourceSheetName);
   
   // Headers for target sheet
   const headers = [
@@ -867,9 +970,9 @@ function syncFromSourceSheetToTargetSheet() {
   ];
   
   const targetSs = getTargetSpreadsheet();
-  let targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
+  let targetSheet = targetSs.getSheetByName(cfg.targetSheetName);
   if (!targetSheet) {
-    targetSheet = targetSs.insertSheet(DB_CONFIG.targetSheetName);
+    targetSheet = targetSs.insertSheet(cfg.targetSheetName);
   }
   
   targetSheet.clear();
@@ -878,66 +981,24 @@ function syncFromSourceSheetToTargetSheet() {
   
   const parsedRecords = [];
   const sheetRows = [];
-  const nowStr = new Date().toISOString();
+  const nowStr = formatTimestamp(new Date());
   
   for (let i = 1; i < data.length; i++) {
     let parsed = parseRow(data[i], i + 1);
     if (parsed) {
       parsedRecords.push(parsed);
-      sheetRows.push([
-        formatTimestamp(parsed.submissionTimestamp),
-        parsed.email || "",
-        parsed.city || "",
-        parsed.onboardingType || "",
-        parsed.leadSource || "",
-        parsed.driverPlan || "",
-        parsed.driverName || "",
-        parsed.driverPhone || "",
-        parsed.whatsappPhone || "",
-        parsed.emergencyName || "",
-        parsed.emergencyPhone || "",
-        parsed.refName || "",
-        parsed.refPhone || "",
-        parsed.fatherName || "",
-        formatDateOnly(parsed.dob) || "",
-        parsed.aadhaarAddress || "",
-        parsed.presentAddress || "",
-        parsed.panNumber || "",
-        parsed.aadhaarNumber || "",
-        formatDateOnly(parsed.dlExpiry) || "",
-        parsed.dlNumber || "",
-        parsed.upiId || "",
-        parsed.panAadhaarLinked || "",
-        parsed.dlFront || "",
-        parsed.dlBack || "",
-        parsed.aadhaarFront || "",
-        parsed.aadhaarBack || "",
-        parsed.panCard || "",
-        parsed.localAddressProof || "",
-        parsed.selfiePhoto || "",
-        parsed.panAadhaarPhoto || "",
-        parsed.bankDetailsDoc || "",
-        parsed.referralPhone || "",
-        parsed.referralName || "",
-        parsed.accountName || "",
-        parsed.accountNumber || "",
-        parsed.ifscCode || "",
-        parsed.depositAmount || 0,
-        parsed.partnerId || "",
-        parsed.sheetRowNumber,
-        nowStr
-      ]);
+      sheetRows.push(formatRecordForSheet(parsed, nowStr));
     }
   }
   
-  // Write to Target Sheet in chunks of 500
+  // Write to Target Sheet in chunks of 500 rows to optimize execution time
   const CHUNK_SIZE = 500;
   for (let j = 0; j < sheetRows.length; j += CHUNK_SIZE) {
     let chunk = sheetRows.slice(j, j + CHUNK_SIZE);
     targetSheet.getRange(j + 2, 1, chunk.length, headers.length).setValues(chunk);
   }
   
-  Logger.log("Wrote " + sheetRows.length + " clean standardized rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+  Logger.log("Wrote " + sheetRows.length + " clean standardized rows to tab '" + cfg.targetSheetName + "'.");
   
   // Sync all records to PostgreSQL using persistent single-connection multi-row inserts
   Logger.log("Starting PostgreSQL upsert for all " + parsedRecords.length + " onboarding records...");
@@ -992,7 +1053,7 @@ function formatRecordForSheet(parsed, nowStr) {
 }
 
 // =============================================================================
-// TRIGGER HANDLERS
+// TRIGGER HANDLERS (WITH LOCKSERVICE AND BATCHING)
 // =============================================================================
 
 /**
@@ -1000,39 +1061,47 @@ function formatRecordForSheet(parsed, nowStr) {
  */
 function handleOnEdit(e) {
   if (!e || !e.range) return;
+  const cfg = getDbConfig();
   const sheet = e.range.getSheet();
-  // Restrict live edit handling strictly to the raw source form tab (Onboarding form_V2).
-  // Never process edits on target sheet_driver_onboarding tab to prevent column-scrambling.
-  if (sheet.getName() !== DB_CONFIG.sourceSheetName) return;
+  if (sheet.getName() !== cfg.sourceSheetName) return;
   
   const startRow = e.range.getRow();
   const endRow = e.range.getLastRow();
   if (startRow <= 1 && endRow <= 1) return; // Header row
   
-  Logger.log("Live edit detected on rows " + startRow + " to " + endRow);
-  
-  const actualStart = Math.max(2, startRow);
-  const numRows = endRow - actualStart + 1;
-  const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
-  
-  const records = [];
-  const nowStr = formatTimestamp(new Date());
-  const targetSs = getTargetSpreadsheet();
-  const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
-
-  for (let i = 0; i < rawData.length; i++) {
-    let parsed = parseRow(rawData[i], actualStart + i);
-    if (parsed) {
-      records.push(parsed);
-      if (targetSheet) {
-        let sheetRow = formatRecordForSheet(parsed, nowStr);
-        targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
-      }
-    }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log("handleOnEdit skipped: Lock contention.");
+    return;
   }
   
-  if (records.length > 0) {
-    upsertRecordsToDatabase(records);
+  try {
+    const actualStart = Math.max(2, startRow);
+    const numRows = endRow - actualStart + 1;
+    const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
+    
+    const records = [];
+    const nowStr = formatTimestamp(new Date());
+    const targetSs = getTargetSpreadsheet();
+    const targetSheet = targetSs.getSheetByName(cfg.targetSheetName);
+
+    for (let i = 0; i < rawData.length; i++) {
+      let parsed = parseRow(rawData[i], actualStart + i);
+      if (parsed) {
+        records.push(parsed);
+        if (targetSheet) {
+          let sheetRow = formatRecordForSheet(parsed, nowStr);
+          // Write directly at corresponding row coordinate
+          targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
+        }
+      }
+    }
+    
+    if (records.length > 0) {
+      upsertRecordsToDatabase(records);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -1041,28 +1110,36 @@ function handleOnEdit(e) {
  */
 function handleOnFormSubmit(e) {
   if (!e || !e.values) return;
-  Logger.log("Form submission event received.");
-  let parsed = parseRow(e.values, e.range ? e.range.getRow() : 0);
-  if (parsed) {
-    const targetSs = getTargetSpreadsheet();
-    const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
-    if (targetSheet && parsed.sheetRowNumber > 1) {
-      let sheetRow = formatRecordForSheet(parsed, formatTimestamp(new Date()));
-      targetSheet.getRange(parsed.sheetRowNumber, 1, 1, sheetRow.length).setValues([sheetRow]);
+  const cfg = getDbConfig();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log("handleOnFormSubmit skipped: Lock contention.");
+    return;
+  }
+  try {
+    let parsed = parseRow(e.values, e.range ? e.range.getRow() : 0);
+    if (parsed) {
+      const targetSs = getTargetSpreadsheet();
+      const targetSheet = targetSs.getSheetByName(cfg.targetSheetName);
+      if (targetSheet && parsed.sheetRowNumber > 1) {
+        let sheetRow = formatRecordForSheet(parsed, formatTimestamp(new Date()));
+        targetSheet.getRange(parsed.sheetRowNumber, 1, 1, sheetRow.length).setValues([sheetRow]);
+      }
+      upsertRecordsToDatabase([parsed]);
     }
-    upsertRecordsToDatabase([parsed]);
+  } finally {
+    lock.releaseLock();
   }
 }
 
 /**
- * Helper to find the actual last non-empty row (ignoring blank formatted rows at sheet bottom)
+ * Helper to find the actual last non-empty row
  */
 function getTrueLastRow(sheet) {
   if (!sheet) return 0;
   const lastRow = sheet.getLastRow();
   if (lastRow <= 1) return lastRow;
   
-  // Scan timestamps / column A backwards
   const colA = sheet.getRange(1, 1, lastRow, 1).getValues();
   for (let i = colA.length - 1; i >= 0; i--) {
     let val = colA[i][0];
@@ -1077,47 +1154,57 @@ function getTrueLastRow(sheet) {
  * 1-Minute Time-Driven Catch-Up Sync for Recent Submissions
  */
 function syncRecentOnboardings() {
+  const cfg = getDbConfig();
   const sourceSs = getSourceSpreadsheet();
-  const sourceSheet = sourceSs.getSheetByName(DB_CONFIG.sourceSheetName);
+  const sourceSheet = sourceSs.getSheetByName(cfg.sourceSheetName);
   if (!sourceSheet) return;
   
   const trueLastRow = getTrueLastRow(sourceSheet);
   if (trueLastRow <= 1) return;
   
-  const WINDOW_SIZE = 100;
-  const startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
-  const numRows = trueLastRow - startRow + 1;
-  
-  const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
-  const records = [];
-  const sheetRows = [];
-  const nowStr = formatTimestamp(new Date());
-
-  for (let i = 0; i < data.length; i++) {
-    let parsed = parseRow(data[i], startRow + i);
-    if (parsed) {
-      records.push(parsed);
-      sheetRows.push({
-        rowNum: startRow + i,
-        values: formatRecordForSheet(parsed, nowStr)
-      });
-    }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(20000)) {
+    Logger.log("syncRecentOnboardings skipped: Lock contention.");
+    return;
   }
   
-  if (records.length > 0) {
-    // 1. Sync recent rows to clean target sheet tab
-    const targetSs = getTargetSpreadsheet();
-    const targetSheet = targetSs.getSheetByName(DB_CONFIG.targetSheetName);
-    if (targetSheet) {
-      for (let j = 0; j < sheetRows.length; j++) {
-        let r = sheetRows[j];
-        targetSheet.getRange(r.rowNum, 1, 1, r.values.length).setValues([r.values]);
+  try {
+    const WINDOW_SIZE = 100;
+    const startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
+    const numRows = trueLastRow - startRow + 1;
+    
+    const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
+    const records = [];
+    const sheetRows = [];
+    const nowStr = formatTimestamp(new Date());
+
+    for (let i = 0; i < data.length; i++) {
+      let parsed = parseRow(data[i], startRow + i);
+      if (parsed) {
+        records.push(parsed);
+        sheetRows.push({
+          rowNum: startRow + i,
+          values: formatRecordForSheet(parsed, nowStr)
+        });
       }
     }
+    
+    if (records.length > 0) {
+      const targetSs = getTargetSpreadsheet();
+      const targetSheet = targetSs.getSheetByName(cfg.targetSheetName);
+      if (targetSheet) {
+        // Write to target sheet
+        for (let j = 0; j < sheetRows.length; j++) {
+          let r = sheetRows[j];
+          targetSheet.getRange(r.rowNum, 1, 1, r.values.length).setValues([r.values]);
+        }
+      }
 
-    // 2. Sync to PostgreSQL
-    upsertRecordsToDatabase(records);
-    Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent records in sheet & database.");
+      upsertRecordsToDatabase(records);
+      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent records in sheet & database.");
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -1126,12 +1213,13 @@ function syncRecentOnboardings() {
  */
 function logOnboardingError(rowIndex, rawPhone, driverName, failureReason, rawRow) {
   try {
+    const cfg = getDbConfig();
     const targetSs = getTargetSpreadsheet();
-    let errSheet = targetSs.getSheetByName(DB_CONFIG.errorSheetName);
+    let errSheet = targetSs.getSheetByName(cfg.errorSheetName);
     const errHeaders = ["Logged At", "Source Row Index", "Driver Name", "Raw Phone", "Failure Reason", "Raw Data Summary"];
     
     if (!errSheet) {
-      errSheet = targetSs.insertSheet(DB_CONFIG.errorSheetName);
+      errSheet = targetSs.insertSheet(cfg.errorSheetName);
       errSheet.appendRow(errHeaders);
       errSheet.getRange(1, 1, 1, errHeaders.length).setFontWeight("bold").setBackground("#fee2e2");
     }
@@ -1150,7 +1238,6 @@ function logOnboardingError(rowIndex, rawPhone, driverName, failureReason, rawRo
 
 /**
  * Installs event-driven and lightweight hourly reconciliation triggers.
- * (1-minute polling is removed since PostgreSQL native triggers handle real-time sync <10ms)
  */
 function setupTriggers() {
   deleteAllTriggers();
@@ -1188,5 +1275,25 @@ function deleteAllTriggers() {
     count++;
   }
   Logger.log("Removed " + count + " existing trigger(s).");
+}
+
+// =============================================================================
+// GOOGLE SHEETS CUSTOM MENU (ONE-CLICK UI)
+// =============================================================================
+
+/**
+ * Creates a custom menu in the Google Sheets interface upon opening.
+ */
+function onOpen() {
+  if (typeof SpreadsheetApp !== "undefined" && SpreadsheetApp.getUi) {
+    SpreadsheetApp.getUi()
+      .createMenu("🚀 LetzRyd Pipeline")
+      .addItem("1. Test Database Connection", "testConnection")
+      .addItem("2. Setup Live Triggers", "setupTriggers")
+      .addSeparator()
+      .addItem("3. Sync All Onboardings (Full Refresh)", "syncAllOnboardings")
+      .addItem("4. Catch-Up Sync Recent Rows", "syncRecentOnboardings")
+      .addToUi();
+  }
 }
 

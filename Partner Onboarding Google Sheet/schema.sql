@@ -142,7 +142,7 @@ SELECT * FROM public.core_partner_onboarding
 WHERE is_deleted = FALSE;
 
 -- -----------------------------------------------------------------------------
--- 3. HELPER FUNCTION: Canonical Partner ID & City Mapping
+-- 3. HELPER FUNCTIONS: Canonical Partner ID & Safe Date Casting
 -- -----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION public.fn_canonical_partner_id(p_city VARCHAR, p_phone VARCHAR)
@@ -160,14 +160,31 @@ BEGIN
     v_clean_city := UPPER(TRIM(COALESCE(p_city, 'BLR')));
     
     v_prefix := CASE 
-        WHEN v_clean_city IN ('BANGALORE', 'BENGALURU', 'BLR') THEN 'BLR'
-        WHEN v_clean_city IN ('HYDERABAD', 'HYD') THEN 'HYD'
-        WHEN v_clean_city IN ('MUMBAI', 'MUM') THEN 'MUM'
-        WHEN v_clean_city IN ('PUNE', 'PUN') THEN 'PUN'
+        WHEN v_clean_city ~* '^(BANGALORE|BENGALURU|BLR)' THEN 'BLR'
+        WHEN v_clean_city ~* '^(HYDERABAD|HYD)' THEN 'HYD'
+        WHEN v_clean_city ~* '^(MUMBAI|MUM|BOMBAY)' THEN 'MUM'
+        WHEN v_clean_city ~* '^(PUNE|PUN)' THEN 'PUN'
+        WHEN v_clean_city ~* '^(DELHI|NEW DELHI|DEL)' THEN 'DEL'
+        WHEN v_clean_city ~* '^(CHENNAI|MADRAS|CHN)' THEN 'CHN'
+        WHEN v_clean_city ~* '^(AHMEDABAD|AHM)' THEN 'AHM'
+        WHEN v_clean_city ~* '^(KOCHI|COCHIN|KOC)' THEN 'KOC'
+        WHEN v_clean_city ~* '^(KOLKATA|CALCUTTA|CCU|KOL)' THEN 'KOL'
         ELSE UPPER(LEFT(v_clean_city, 3))
     END;
 
     RETURN 'LETZ' || v_prefix || v_clean_phone;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION public.fn_safe_cast_date(p_val VARCHAR)
+RETURNS DATE AS $$
+BEGIN
+    IF p_val IS NULL OR TRIM(p_val) = '' OR TRIM(p_val) = '-' OR LOWER(TRIM(p_val)) = 'na' THEN
+        RETURN NULL;
+    END IF;
+    RETURN p_val::DATE;
+EXCEPTION WHEN OTHERS THEN
+    RETURN NULL;
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
@@ -197,18 +214,15 @@ BEGIN
     IF NEW.driver_phone IS NOT NULL THEN
         v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.driver_phone, '[^0-9]', '', 'g'), 10);
         IF LENGTH(v_clean_phone) = 10 THEN
-            -- Acquire transactional advisory lock for gapless zero-burn concurrency
             PERFORM pg_advisory_xact_lock(777111222);
 
-            v_partner_id := COALESCE(NEW.partner_id, public.fn_canonical_partner_id(NEW.city, v_clean_phone));
+            v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
 
-            -- Check if record already exists
             SELECT id, source_origin INTO v_existing_id, v_existing_origin
             FROM public.core_partner_onboarding
             WHERE phone_number = v_clean_phone;
 
             IF v_existing_id IS NOT NULL THEN
-                -- Explicit UPDATE prevents PostgreSQL sequence burning
                 UPDATE public.core_partner_onboarding
                 SET
                     partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
@@ -227,7 +241,7 @@ BEGIN
                     dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
                     dl_expiry_date = COALESCE(NEW.dl_expiry, core_partner_onboarding.dl_expiry_date),
                     pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
-                    aadhaar_number = COALESCE(NEW.aadhaar_number, core_partner_onboarding.aadhaar_number),
+                    aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
                     pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
                     account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
                     account_number = COALESCE(NEW.account_number, core_partner_onboarding.account_number),
@@ -243,13 +257,12 @@ BEGIN
                     cancelled_cheque_photo = COALESCE(NEW.bank_details_doc, core_partner_onboarding.cancelled_cheque_photo),
                     security_deposit = CASE WHEN COALESCE(NEW.deposit_amount, 0.00) > 0 THEN NEW.deposit_amount ELSE core_partner_onboarding.security_deposit END,
                     source_sheet_row_id = NEW.id,
-                    source_origin = CASE WHEN v_existing_origin = 'PORTAL_FORM' THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
+                    source_origin = CASE WHEN v_existing_origin IN ('PORTAL_FORM', 'MERGED') THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
                     is_deleted = FALSE,
                     deleted_at = NULL,
                     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 WHERE id = v_existing_id;
             ELSE
-                -- Assign contiguous gapless ID
                 SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
 
                 INSERT INTO public.core_partner_onboarding (
@@ -283,7 +296,7 @@ BEGIN
                     NEW.dl_number,
                     NEW.dl_expiry,
                     NEW.pan_number,
-                    NEW.aadhaar_number,
+                    REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
                     NEW.pan_aadhaar_linked,
                     NEW.account_name,
                     NEW.account_number,
@@ -298,12 +311,12 @@ BEGIN
                     NEW.pan_card,
                     NEW.local_address_proof,
                     NEW.bank_details_doc,
-                    'Approved',
+                    'Draft',
                     'GOOGLE_SHEET',
                     NEW.id,
                     NEW.submission_timestamp,
                     FALSE,
-                    (COALESCE(NEW.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
                     (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 );
             END IF;
@@ -328,6 +341,8 @@ DECLARE
     v_existing_origin VARCHAR(50);
     v_next_id BIGINT;
     v_partner_id VARCHAR(50);
+    v_parsed_dob DATE;
+    v_parsed_dl_exp DATE;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         UPDATE public.core_partner_onboarding
@@ -341,23 +356,24 @@ BEGIN
     IF NEW.phone_number IS NOT NULL THEN
         v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.phone_number, '[^0-9]', '', 'g'), 10);
         IF LENGTH(v_clean_phone) = 10 THEN
-            -- Acquire transactional advisory lock for gapless zero-burn concurrency
             PERFORM pg_advisory_xact_lock(777111222);
 
-            v_partner_id := COALESCE(NEW.driver_id, public.fn_canonical_partner_id(NEW.city, v_clean_phone));
+            v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
+            v_parsed_dob := public.fn_safe_cast_date(NEW.dob);
+            v_parsed_dl_exp := public.fn_safe_cast_date(NEW.dl_expiry_date);
 
-            -- Check if record already exists
             SELECT id, source_origin INTO v_existing_id, v_existing_origin
             FROM public.core_partner_onboarding
             WHERE phone_number = v_clean_phone;
 
             IF v_existing_id IS NOT NULL THEN
-                -- Explicit UPDATE prevents PostgreSQL sequence burning
                 UPDATE public.core_partner_onboarding
                 SET
                     partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
                     driver_name = UPPER(NEW.driver_name),
                     whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
+                    dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
+                    father_name = COALESCE(NEW.father_name, core_partner_onboarding.father_name),
                     city = COALESCE(NEW.city, core_partner_onboarding.city),
                     present_address = COALESCE(NEW.present_address, core_partner_onboarding.present_address),
                     permanent_address = COALESCE(NEW.permanent_address, core_partner_onboarding.permanent_address),
@@ -365,8 +381,9 @@ BEGIN
                     emergency_phone = COALESCE(NEW.emergency_phone, core_partner_onboarding.emergency_phone),
                     emergency_relationship = COALESCE(NEW.emergency_relationship, core_partner_onboarding.emergency_relationship),
                     dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
+                    dl_expiry_date = COALESCE(v_parsed_dl_exp, core_partner_onboarding.dl_expiry_date),
                     pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
-                    aadhaar_number = COALESCE(NEW.aadhaar_number, core_partner_onboarding.aadhaar_number),
+                    aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
                     pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
                     bank_name = COALESCE(NEW.bank_name, core_partner_onboarding.bank_name),
                     account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
@@ -379,27 +396,27 @@ BEGIN
                     aadhaar_card_front = COALESCE(NEW.aadhaar_card_front, core_partner_onboarding.aadhaar_card_front),
                     aadhaar_card_back = COALESCE(NEW.aadhaar_card_back, core_partner_onboarding.aadhaar_card_back),
                     pan_card_photo = COALESCE(NEW.pan_card_photo, core_partner_onboarding.pan_card_photo),
+                    local_address_proof = COALESCE(NEW.local_address_proof, core_partner_onboarding.local_address_proof),
                     cancelled_cheque_photo = COALESCE(NEW.cancelled_cheque_photo, core_partner_onboarding.cancelled_cheque_photo),
                     approval_status = COALESCE(NEW.approval_status, core_partner_onboarding.approval_status),
                     is_documents_verified = COALESCE(NEW.documents_verified, core_partner_onboarding.is_documents_verified),
                     is_spring_verified = COALESCE(NEW.is_spring_verified, core_partner_onboarding.is_spring_verified),
                     source_portal_form_id = NEW.id,
-                    source_origin = CASE WHEN v_existing_origin = 'GOOGLE_SHEET' THEN 'MERGED' ELSE 'PORTAL_FORM' END,
+                    source_origin = CASE WHEN v_existing_origin IN ('GOOGLE_SHEET', 'MERGED') THEN 'MERGED' ELSE 'PORTAL_FORM' END,
                     is_deleted = FALSE,
                     deleted_at = NULL,
                     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 WHERE id = v_existing_id;
             ELSE
-                -- Assign contiguous gapless ID
                 SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
 
                 INSERT INTO public.core_partner_onboarding (
                     id, partner_id, driver_name, phone_number, whatsapp_number,
-                    city, present_address, permanent_address, emergency_name, emergency_phone,
-                    emergency_relationship, dl_number, lead_source, pan_number, aadhaar_number,
+                    dob, father_name, city, present_address, permanent_address, emergency_name, emergency_phone,
+                    emergency_relationship, dl_number, dl_expiry_date, lead_source, pan_number, aadhaar_number,
                     pan_aadhaar_linked, bank_name, account_name, account_number, ifsc_code,
                     upi_id, selfie_photo, dl_front, dl_back, aadhaar_card_front,
-                    aadhaar_card_back, pan_card_photo, cancelled_cheque_photo, approval_status,
+                    aadhaar_card_back, pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
                     is_documents_verified, is_spring_verified, source_origin, source_portal_form_id,
                     onboarding_timestamp, is_deleted, created_at, updated_at
                 ) VALUES (
@@ -408,6 +425,8 @@ BEGIN
                     UPPER(NEW.driver_name),
                     v_clean_phone,
                     RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10),
+                    v_parsed_dob,
+                    NEW.father_name,
                     COALESCE(NEW.city, 'Bengaluru'),
                     NEW.present_address,
                     NEW.permanent_address,
@@ -415,9 +434,10 @@ BEGIN
                     NEW.emergency_phone,
                     NEW.emergency_relationship,
                     NEW.dl_number,
+                    v_parsed_dl_exp,
                     NEW.lead_source,
                     NEW.pan_number,
-                    NEW.aadhaar_number,
+                    REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
                     NEW.pan_aadhaar_linked,
                     NEW.bank_name,
                     NEW.account_name,
@@ -430,15 +450,16 @@ BEGIN
                     NEW.aadhaar_card_front,
                     NEW.aadhaar_card_back,
                     NEW.pan_card_photo,
+                    NEW.local_address_proof,
                     NEW.cancelled_cheque_photo,
                     COALESCE(NEW.approval_status, 'Draft'),
                     COALESCE(NEW.documents_verified, FALSE),
                     COALESCE(NEW.is_spring_verified, FALSE),
                     'PORTAL_FORM',
                     NEW.id,
-                    (COALESCE(NEW.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
                     FALSE,
-                    (COALESCE(NEW.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
                     (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 );
             END IF;
@@ -746,6 +767,55 @@ SET source_origin = CASE
     END,
     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata');
 
+-- Fix 6.4: Purge 2,116 whole-second duplicate records in sheet_driver_onboarding (retain primary per phone & sheet row)
+WITH ranked_duplicates AS (
+    SELECT id,
+           ROW_NUMBER() OVER (
+               PARTITION BY RIGHT(REGEXP_REPLACE(driver_phone, '[^0-9]', '', 'g'), 10), sheet_row_number 
+               ORDER BY id ASC
+           ) AS rnk
+    FROM public.sheet_driver_onboarding
+)
+DELETE FROM public.sheet_driver_onboarding
+WHERE id IN (SELECT id FROM ranked_duplicates WHERE rnk > 1);
+
+-- Fix 6.5: DL Data Recovery - Extract valid expiry dates from corrupted SATSEP... strings
+UPDATE public.sheet_driver_onboarding
+SET dl_expiry = CASE 
+        WHEN dl_number ~ '^([A-Z]{3})([A-Z]{3})([0-9]{1,2})([0-9]{4})' THEN
+            TO_DATE(
+                SUBSTRING(dl_number FROM 7 FOR 2) || '-' || 
+                SUBSTRING(dl_number FROM 4 FOR 3) || '-' || 
+                SUBSTRING(dl_number FROM 9 FOR 4), 
+                'DD-Mon-YYYY'
+            )
+        ELSE dl_expiry
+    END,
+    dl_number = NULL, -- Clear corrupted date string from DL number field to allow KYC review
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE dl_number ~ '^([A-Z]{3})([A-Z]{3})([0-9]{1,2})([0-9]{4})';
+
+-- Fix 6.6: Sanitize out-of-range calendar years in staging and core tables
+UPDATE public.sheet_driver_onboarding
+SET dl_expiry = NULL,
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE dl_expiry IS NOT NULL AND (EXTRACT(YEAR FROM dl_expiry) < 1990 OR EXTRACT(YEAR FROM dl_expiry) > 2060);
+
+UPDATE public.sheet_driver_onboarding
+SET dob = NULL,
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE dob IS NOT NULL AND (EXTRACT(YEAR FROM dob) < 1950 OR EXTRACT(YEAR FROM dob) > (EXTRACT(YEAR FROM CURRENT_DATE) - 18));
+
+UPDATE public.core_partner_onboarding
+SET dl_expiry_date = NULL,
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE dl_expiry_date IS NOT NULL AND (EXTRACT(YEAR FROM dl_expiry_date) < 1990 OR EXTRACT(YEAR FROM dl_expiry_date) > 2060);
+
+UPDATE public.core_partner_onboarding
+SET dob = NULL,
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE dob IS NOT NULL AND (EXTRACT(YEAR FROM dob) < 1950 OR EXTRACT(YEAR FROM dob) > (EXTRACT(YEAR FROM CURRENT_DATE) - 18));
+
 -- -----------------------------------------------------------------------------
 -- 7. SAMPLE OPERATIONAL & VERIFICATION QUERIES
 -- -----------------------------------------------------------------------------
@@ -774,3 +844,15 @@ SELECT
     max(id) AS max_id,
     COALESCE(max(id), 0) - count(*) AS sequence_gap
 FROM public.core_partner_onboarding;
+
+-- Query 7.4: Verify Zero Corrupted DL Numbers in Staging
+SELECT count(*) AS corrupted_dl_count
+FROM public.sheet_driver_onboarding
+WHERE dl_number ~ '^([A-Z]{3})([A-Z]{3})[0-9]';
+
+-- Query 7.5: Verify Zero Out-of-Range Years in DOB and DL Expiry
+SELECT 
+    count(CASE WHEN EXTRACT(YEAR FROM dl_expiry) < 1990 OR EXTRACT(YEAR FROM dl_expiry) > 2060 THEN 1 END) AS invalid_dl_expiry_years,
+    count(CASE WHEN EXTRACT(YEAR FROM dob) < 1950 OR EXTRACT(YEAR FROM dob) > 2008 THEN 1 END) AS invalid_dob_years
+FROM public.sheet_driver_onboarding;
+

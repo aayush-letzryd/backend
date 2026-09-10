@@ -190,11 +190,11 @@ This document provides a comprehensive audit of all 47 data quality anomalies (I
 - **Standardization Rule**:
   Automatic homoglyph transliteration replaces non-Latin lookalikes with standard ASCII characters.
 
-#### ISS-45: Expiry Date Entered in DL Number Column
-- **Affected Column**: `Driving License Number`
-- **Raw Anomaly**: Date strings entered into the DL number column by mistake.
+#### ISS-45: Expiry Date Entered in DL Number Column / Column Inversion
+- **Affected Column**: `Driving License Number` / `Driving License Expiry Date`
+- **Raw Anomaly**: Date strings or Date objects entered into DL column, or index inversion between Column 19 (DL Number) and Column 20 (DL Expiry Date).
 - **Standardization Rule**:
-  Cleaned to uppercase alphanumeric; flagged if matching date pattern.
+  `sanitizeDL()` rejects Date objects and date-like strings (e.g. `SATSEP...`, `GMT`). `parseRow()` performs intelligent cross-column auto-detection: if Column 19 contains a Date and Column 20 contains an alphanumeric string, the pipeline automatically routes Column 19 to `dl_expiry` and Column 20 to `dl_number`. Expired or out-of-range dates outside `[1990, 2060]` are clamped to SQL `NULL`.
 
 #### ISS-46: Missing DL Expiry Date
 - **Affected Column**: `Driving License Expiry Date`
