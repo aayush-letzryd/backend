@@ -1,5 +1,5 @@
 -- ============================================================================
--- LetzRyd Rental Engine - Google Sheet Staging Tables DDL
+-- LetzRyd Rental Engine - Google Sheet Staging Tables DDL (Production Fixed)
 -- ============================================================================
 -- Tables:
 --   1. public.sheet_rental_slabs: Live mirror of pricing menus across all cities
@@ -14,22 +14,23 @@
 CREATE TABLE IF NOT EXISTS sheet_rental_slabs (
     id SERIAL PRIMARY KEY,
     city VARCHAR(32) NOT NULL,                                -- 'Hyderabad', 'Mumbai', 'Bengaluru'
-    vehicle_model VARCHAR(64) NOT NULL,                       -- 'Maruti Wagonr Tour H3 CNG', 'Dzire Tour S CNG', etc.
+    vehicle_model VARCHAR(64) NOT NULL,                       -- 'Maruti Wagonr Tour H3 CNG', 'Dzire Tour S CNG', 'EC3'
     uber_type VARCHAR(32) DEFAULT 'TBS',                      -- 'TBS', 'EBS', 'Standard'
     plan_scheme VARCHAR(64) NOT NULL DEFAULT 'Uber Reducing Rent', -- 'Uber Reducing Rent', 'All Platform'
-    trip_slab_label VARCHAR(64) NOT NULL,                     -- e.g. '0-49', '50-69', '70+', '<55 Trips', '55+ Trips'
+    driver_type VARCHAR(32) NOT NULL DEFAULT 'All',           -- 'Individual', 'Operator', 'All'
+    trip_slab_label VARCHAR(64) NOT NULL,                     -- e.g. '0-49', '50-59', '70+', '0+'
     min_trips INT NOT NULL DEFAULT 0,                         -- Lower trip threshold (inclusive)
     max_trips INT NOT NULL DEFAULT 9999,                      -- Upper trip threshold (inclusive)
     daily_rent NUMERIC(10,2) NOT NULL,                        -- Base daily rent (INR)
-    daily_indemnity NUMERIC(10,2) NOT NULL DEFAULT 30.00,     -- Standard daily indemnity (INR 30/day)
+    daily_indemnity NUMERIC(10,2) NOT NULL DEFAULT 0.00,      -- Daily indemnity (default 0.00; indemnity is a contract policy in core_rent)
     platform VARCHAR(64) DEFAULT 'Uber',                      -- 'Uber', 'All Platform'
     pass_on_incentive VARCHAR(16) DEFAULT 'yes',              -- 'yes', 'no'
     last_synced_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_sheet_rental_slabs UNIQUE (city, vehicle_model, uber_type, plan_scheme, min_trips)
+    CONSTRAINT uq_sheet_rental_slabs UNIQUE (city, vehicle_model, uber_type, plan_scheme, driver_type, min_trips)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sheet_rental_slabs_lookup 
-ON sheet_rental_slabs (city, vehicle_model, min_trips, max_trips);
+ON sheet_rental_slabs (city, vehicle_model, driver_type, min_trips, max_trips);
 
 -- Table 2: sheet_rental_partners
 CREATE TABLE IF NOT EXISTS sheet_rental_partners (
@@ -37,7 +38,7 @@ CREATE TABLE IF NOT EXISTS sheet_rental_partners (
     vendor_name VARCHAR(128),                                 -- Partner / Operator legal or display name
     city VARCHAR(32) NOT NULL,                                -- 'Hyderabad', 'Mumbai', 'Bengaluru'
     vendor_type VARCHAR(32),                                  -- 'Operator', 'Individual', 'VIP'
-    plan_name VARCHAR(64),                                    -- Contract plan label
+    plan_name VARCHAR(64),                                    -- Contract plan label / 'Fixed Rent Driver'
     platform VARCHAR(64),                                     -- 'Uber - EBS', 'Uber - TBS', 'All Platform'
     plan_type_hisaab VARCHAR(64),                             -- 'Reducing Rental', 'Fixed', 'All Platform'
     custom_daily_rent NUMERIC(10,2) NULL,                     -- Custom negotiated flat rate (e.g. INR 900, INR 970, INR 1050)
