@@ -5,6 +5,15 @@ REGION="asia-south1"
 FUNCTION_NAME="sync-rental-sheets-live"
 JOB_NAME="sync-rental-sheets-30m"
 
+echo "Enabling required GCP services..."
+gcloud services enable \
+    cloudfunctions.googleapis.com \
+    cloudbuild.googleapis.com \
+    run.googleapis.com \
+    cloudscheduler.googleapis.com \
+    artifactregistry.googleapis.com \
+    --quiet
+
 echo "Deploying $FUNCTION_NAME to $REGION from GitHub repository..."
 gcloud functions deploy $FUNCTION_NAME \
     --gen2 \
@@ -15,7 +24,8 @@ gcloud functions deploy $FUNCTION_NAME \
     --trigger-http \
     --allow-unauthenticated \
     --memory=512MB \
-    --timeout=180s
+    --timeout=180s \
+    --quiet
 
 echo "Retrieving Function URL..."
 FUNCTION_URL=$(gcloud functions describe $FUNCTION_NAME --gen2 --region=$REGION --format='value(serviceConfig.uri)')
@@ -28,8 +38,9 @@ gcloud scheduler jobs create http $JOB_NAME \
     --schedule="*/30 * * * *" \
     --time-zone="Asia/Kolkata" \
     --uri="$FUNCTION_URL" \
-    --http-method=POST
+    --http-method=POST \
+    --quiet
 
 echo "Triggering initial test run..."
-gcloud scheduler jobs run $JOB_NAME --location=$REGION
+gcloud scheduler jobs run $JOB_NAME --location=$REGION --quiet
 echo "Deployment and scheduling complete!"
