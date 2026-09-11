@@ -32,3 +32,5 @@ This document catalogs all 24 data anomalies identified in the Google Sheets `Ve
 | **ISS-22** | Driver Plan vs Type | Cross-column plan taxonomy variations (`LIP` vs `Fixed`/`Uber - TBS`) | Preserve as-is | Stored raw values as entered per operational direction. |
 | **ISS-23** | Date vs Timestamp | Allocations dated after form submission timestamp | Preserve as-is | Retained as valid forward-dated allocations. |
 | **ISS-24** | Email address | Personal employee Gmail accounts and `'Old Data'` | Preserve as-is | Retained as-is for historical operational tracking. |
+| **ISS-25** | Allocation Type | Drop-Off records entered into Allocation dataset | Filter Drop-Off records | Exclude any row where `LOWER(TRIM(allocation_type)) == 'drop-off'` (`return null;`) so only legitimate allocations enter `sheet_vehicle_allocations`. |
+

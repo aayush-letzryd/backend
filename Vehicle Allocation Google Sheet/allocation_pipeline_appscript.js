@@ -22,15 +22,15 @@
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const CONFIG = {
   // Master Fleet Spreadsheet (Read directly in background):
-  masterSpreadsheetId: "YOUR_MASTER_SPREADSHEET_ID_HERE",
+  masterSpreadsheetId: "1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM",
   masterTabName: "Vehicle Allocation",
 
   // PostgreSQL Database Credentials:
-  dbHost: "YOUR_DB_HOST_HERE",
+  dbHost: "35.200.196.113",
   dbPort: "5432",
   dbName: "postgres",
   dbUser: "postgres",
-  dbPassword: "YOUR_DB_PASSWORD_HERE"
+  dbPassword: "8S5]U3@L^Xz)\\FH}"
 };
 
 // Standard JDBC SQL Type Codes (Apps Script does not expose java.sql.Types)
@@ -65,12 +65,21 @@ function onOpen() {
  * Opens and returns the Master Sheet tab directly via openById.
  */
 function getMasterSheet() {
-  const ss = SpreadsheetApp.openById(CONFIG.masterSpreadsheetId);
-  const sheet = ss.getSheetByName(CONFIG.masterTabName);
-  if (!sheet) {
-    throw new Error("Tab '" + CONFIG.masterTabName + "' not found in Master Spreadsheet.");
+  if (CONFIG.masterSpreadsheetId && CONFIG.masterSpreadsheetId !== "YOUR_MASTER_SPREADSHEET_ID_HERE") {
+    try {
+      const ss = SpreadsheetApp.openById(CONFIG.masterSpreadsheetId);
+      const sheet = ss.getSheetByName(CONFIG.masterTabName);
+      if (sheet) return sheet;
+    } catch (e) {
+      Logger.log("Could not open by masterSpreadsheetId: " + e.message);
+    }
   }
-  return sheet;
+  const activeSs = SpreadsheetApp.getActiveSpreadsheet();
+  if (activeSs) {
+    const sheet = activeSs.getSheetByName(CONFIG.masterTabName) || activeSs.getActiveSheet();
+    if (sheet) return sheet;
+  }
+  throw new Error("Tab '" + CONFIG.masterTabName + "' not found in Spreadsheet.");
 }
 
 /**
@@ -408,6 +417,12 @@ function extractRecord(row, excelRow, hMap) {
 
   if (!dateClean || vehClean === "UNKNOWN") return null;
 
+  const allocTypeRaw = cleanPlaceholder(get("Allocation Type", 6));
+  // Explicitly guard against drop-offs entering the allocation table:
+  if (allocTypeRaw && allocTypeRaw.toLowerCase().trim() === "drop-off") {
+    return null;
+  }
+
   return {
     ts: cleanTimestamp(tsRaw),
     email: cleanStr(get("Email address", 1)),
@@ -415,7 +430,7 @@ function extractRecord(row, excelRow, hMap) {
     reason: cleanStr(get("Reason to Visit", 3)),
     alloc_date: dateClean,
     op_id: cleanOpId(get("Operator/Driver ID", 5)),
-    alloc_type: cleanPlaceholder(get("Allocation Type", 6)),
+    alloc_type: allocTypeRaw,
     driver_name: cleanDriverName(get("Driver Name", 7), excelRow),
     driver_phone: phoneClean,
     veh_num: vehClean,
