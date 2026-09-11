@@ -48,20 +48,38 @@ graph TD
 
 ## Deployment & Verification Instructions
 
-1. **Database DDL**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database:
+1. **Database DDL & One-Time Migrations**: Run [`schema.sql`](./schema.sql) on the production PostgreSQL database:
    ```bash
    psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
    ```
+   *Note: Section 6 of `schema.sql` automatically executes the required one-time tasks:*
+   - **BIGINT Migration**: `ALTER TABLE public.sheet_adjustments ALTER COLUMN id TYPE BIGINT;`
+   - **Date-Shift Duplicate Cleansing**: Deletes the 14,754 shifted Batch 1 rows (IDs $\le$ 14,838) where a matching Batch 2 row exists with the corrected IST date, restoring `public.sheet_adjustments` count from 29,620 to ~14,866 unique rows.
+
 2. **Apps Script Setup**:
    - Open the target Google Sheet.
    - Go to **Extensions** $\to$ **Apps Script**.
    - Navigate to **Project Settings** (⚙️) $\to$ **Script Properties** and configure `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`.
    - Paste the code from [`adjustments_pipeline_appscript.js`](./adjustments_pipeline_appscript.js).
-   - Run `setupTriggers` to register live On-Edit / Form-Submit and hourly reconciliation triggers.
+   - Run `setupTriggers` to register live On-Edit / Form-Submit and 1-minute catch-up sync triggers.
 
 3. **Verification Queries**:
    ```sql
-   -- Verify source distribution
+   -- Verify sheet_adjustments count restoration (Expected: ~14,866 rows, down from 29,620)
+   SELECT count(*) FROM public.sheet_adjustments;
+
+   -- Verify 0 date-shifted duplicate pairs in sheet_adjustments
+   SELECT count(*)
+   FROM public.sheet_adjustments b1
+   JOIN public.sheet_adjustments b2
+     ON b1.submission_timestamp = b2.submission_timestamp
+    AND b1.partner_phone IS NOT DISTINCT FROM b2.partner_phone
+    AND b1.amount = b2.amount
+    AND b1.adjustment_type = b2.adjustment_type
+    AND b1.id < b2.id
+    AND ABS(b1.adjustment_date - b2.adjustment_date) = 1;
+
+   -- Verify source distribution in core master table
    SELECT data_source, count(*), sum(amount) AS total_amount
    FROM public.core_adjustments 
    GROUP BY data_source;

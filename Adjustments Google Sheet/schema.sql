@@ -756,7 +756,35 @@ $$ LANGUAGE plpgsql;
 -- 6. ONE-TIME MIGRATION & RECONCILIATION SCRIPT FOR ADJUSTMENTS
 -- ------------------------------------------------------------------------------
 
--- Fix 6.1: Cleanly deduplicate exact duplicate rows in core_adjustments
+-- Task 6.1: Column Type Migration & Constraint Validation on public.sheet_adjustments
+ALTER TABLE public.sheet_adjustments ALTER COLUMN id TYPE BIGINT;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint 
+        WHERE conname = 'chk_sheet_adjustments_amount' 
+          AND conrelid = 'public.sheet_adjustments'::regclass
+    ) THEN
+        ALTER TABLE public.sheet_adjustments 
+        ADD CONSTRAINT chk_sheet_adjustments_amount CHECK (amount >= 0.00);
+    END IF;
+END $$;
+
+-- Task 6.2: Clean 14,754 Date-Shift Duplicates in public.sheet_adjustments
+-- Delete old Batch 1 shifted rows (IDs 1 to 14,838) where a matching Batch 2 row (IDs > 14,838) exists with corrected IST date.
+-- Restores staging table count from 29,620 to ~14,866 unique rows.
+DELETE FROM public.sheet_adjustments b1
+USING public.sheet_adjustments b2
+WHERE b1.submission_timestamp = b2.submission_timestamp
+  AND b1.partner_phone IS NOT DISTINCT FROM b2.partner_phone
+  AND b1.amount = b2.amount
+  AND b1.adjustment_type = b2.adjustment_type
+  AND b1.id <= 14838
+  AND b2.id > 14838
+  AND ABS(b1.adjustment_date - b2.adjustment_date) = 1;
+
+-- Task 6.3: Cleanly deduplicate exact duplicate rows in core_adjustments
 WITH ranked AS (
     SELECT id, partner_phone, vehicle_number, adjustment_date, amount, adjustment_type,
            ROW_NUMBER() OVER (PARTITION BY partner_phone, vehicle_number, adjustment_date, amount, adjustment_type ORDER BY 
@@ -773,7 +801,7 @@ SET is_deleted = TRUE,
 FROM ranked r
 WHERE c.id = r.id AND r.rn > 1;
 
--- Fix 6.2: Cleanly deduplicate legacy 1-day date-shifted duplicate rows (timezone ingestion artifact)
+-- Task 6.4: Cleanly deduplicate legacy 1-day date-shifted duplicate rows in core_adjustments (timezone ingestion artifact)
 WITH date_shift_dupes AS (
     SELECT c2.id
     FROM public.core_adjustments c1
@@ -792,5 +820,22 @@ SET is_deleted = TRUE,
     deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 WHERE id IN (SELECT id FROM date_shift_dupes);
+
+-- ------------------------------------------------------------------------------
+-- 7. RECONCILIATION & VERIFICATION QUERIES
+-- ------------------------------------------------------------------------------
+-- Verify total count in public.sheet_adjustments (Expected: ~14,866 rows, down from 29,620)
+-- SELECT COUNT(*) FROM public.sheet_adjustments;
+
+-- Verify 0 date-shifted duplicate pairs remaining in public.sheet_adjustments
+-- SELECT COUNT(*)
+-- FROM public.sheet_adjustments b1
+-- JOIN public.sheet_adjustments b2
+--   ON b1.submission_timestamp = b2.submission_timestamp
+--  AND b1.partner_phone IS NOT DISTINCT FROM b2.partner_phone
+--  AND b1.amount = b2.amount
+--  AND b1.adjustment_type = b2.adjustment_type
+--  AND b1.id < b2.id
+--  AND ABS(b1.adjustment_date - b2.adjustment_date) = 1;
 
 
