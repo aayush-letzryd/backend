@@ -1,155 +1,296 @@
-# LetzRyd Vehicle Dropoff Google Sheet Pipeline & PostgreSQL Master Ingestion
+# LetzRyd Vehicle Dropoff Pipeline - Knowledge Transfer Runbook
 
-Real-time and batch synchronization engine bridging vehicle dropoff / return reports from Google Sheets (`Drop off History` in `Pan India Master Sheet.xlsx`) and web portal submissions (`public.july_vehicle_dropoffs`) into the centralized production PostgreSQL database (`public.core_dropoffs`).
+Target System: Vehicle Dropoff Google Sheet Ingestion Engine  
+Spreadsheet: `dropoffs_form` (Spreadsheet ID: `1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8`)  
+Target Tab: `sheet_dropoffs`  
+Target Staging Table: `public.sheet_dropoffs`  
+Host: `YOUR_DB_HOST_HERE:5432`  
 
 ---
 
-## Architecture Overview
+## 1. Executive Summary
 
-```mermaid
-graph TD
-    A["Google Sheet: 'Pan India Master Sheet'<br>('Drop off History')"] -->|On-Edit & Sliding Window Sync| B["Google Apps Script<br>dropoff_pipeline_appscript.js"]
-    B -->|Dual Ingestion: Standardized Tab| S["Google Sheet Tab:<br>sheet_dropoffs"]
-    B -->|JDBC Batch Upsert with Standardizations| C[("PostgreSQL Staging<br>public.sheet_dropoffs")]
-    D["LetzRyd Web Portal<br>Dropoff Submissions"] -->|Portal Form Ingestion| E[("PostgreSQL Portal Table<br>public.july_vehicle_dropoffs")]
-    C -->|Trigger: trg_sheet_dropoffs_sync<br>Advisory Lock 777444555| G[("Production Master<br>public.core_dropoffs")]
-    E -->|Trigger: trg_july_vehicle_dropoffs_sync<br>Advisory Lock 777444555| G
-    G -->|is_deleted = FALSE| H["Active Master View:<br>public.active_core_dropoffs"]
+The LetzRyd Vehicle Dropoff Google Sheet Pipeline provides high-throughput, low-latency data synchronization between the standalone operational spreadsheet `dropoffs_form` and the PostgreSQL staging table `public.sheet_dropoffs`. 
+
+This staging table acts as the decoupled landing zone for all raw return events recorded by ground operations. Downstream consolidation into master operational tables (`public.core_dropoffs`) is handled independently by the `Vehicle Dropoff Final Table` repository.
+
+---
+
+## 2. System Architecture
+
+```text
++-----------------------------------------------------------------------------------+
+|                           Google Sheet: dropoffs_form                             |
+|              (ID: 1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8)                   |
+|                              Tab: sheet_dropoffs                                  |
++-----------------------------------------------------------------------------------+
+       |                                |                             |
+       | [Live Cell / Range Paste]      | [Form Submit]               | [1-Min Time Trigger]
+       v                                v                             v
++------------------+           +--------------------+         +---------------------+
+|   handleOnEdit   |           | handleOnFormSubmit |         |  syncRecentDropoffs |
++------------------+           +--------------------+         +---------------------+
+       |                                |                             |
+       +--------------------------------+-----------------------------+
+                                        |
+                                        v
++-----------------------------------------------------------------------------------+
+|                Google Apps Script Engine (dropoff_pipeline_appscript.js)          |
+|                                                                                   |
+|  1. LockService Guard (30s Mutual Exclusion Timeout across all handlers)          |
+|  2. Dynamic Header Scanner (getHeaderIndexMap scans Row 1 for regex matches)      |
+|  3. Data Sanitizers:                                                              |
+|     - normalizeDate: Pure IST ("Asia/Kolkata") parsing; Excel serial conversion   |
+|     - cleanVehicleNumber: Regex ^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$             |
+|     - cleanBalance: Accounting parentheses (500.00) -> -500.00; strips symbols    |
+|     - cleanDriverType: Operator vs Individual detection                           |
+|     - normalizeCity: Canonical hub resolution with plate prefix fallback          |
+|  4. Batch Parameter Binding (PreparedStatement JDBC with binary SQL typing)       |
++-----------------------------------------------------------------------------------+
+                                        |
+                                        | [JDBC Connection via PropertiesService]
+                                        v
++-----------------------------------------------------------------------------------+
+|               PostgreSQL Staging Database (public.sheet_dropoffs)                 |
+|                                                                                   |
+|  - Zero-Burn Sequence CTE:                                                        |
+|    WITH incoming AS (...), upd AS (UPDATE ... RETURNING ...)                      |
+|    INSERT INTO sheet_dropoffs SELECT ... WHERE NOT EXISTS (SELECT 1 FROM upd)     |
+|  - Primary Key: dropoff_id BIGINT GENERATED BY DEFAULT AS IDENTITY                |
+|  - Idempotency Constraint: source_row INTEGER UNIQUE                              |
+|  - High Performance B-Tree Indexes: vehicle, return_date, driver, city, etc.      |
++-----------------------------------------------------------------------------------+
+                                        |
+                                        | [Decoupled Downstream ETL / Views]
+                                        v
++-----------------------------------------------------------------------------------+
+|             Vehicle Dropoff Final Table Engine (public.core_dropoffs)             |
++-----------------------------------------------------------------------------------+
 ```
 
 ---
 
-## Key Guarantees & V2 Audit Enhancements
+## 3. Key Technical Innovations
 
-1. **Cross-Source Deduplication & Merge State**:
-   - Reconciles sheet and portal submissions on matching `(vehicle_number, return_date)`. When returns arrive from both sources for the same vehicle dropoff event, portal details merge onto sheet records and mark `data_source = 'MERGED'` without creating duplicate ledger liabilities.
-2. **Gapless Continuous Sequencing**:
-   - Primary key is `id BIGINT PRIMARY KEY`. Ingestion uses transactional advisory locking (`pg_advisory_xact_lock(777444555)`) and explicit `UPDATE` for existing records, completely eliminating sequence burning.
-3. **Signed Debt Polarity Contract**:
-   - Standardizes all driver liabilities, pending dues, and damage penalties as negative floats (e.g. `₹500` liability $\to$ `-500.00`) to accurately feed downstream Hisaab settlement deduction engines.
-4. **Pure IST Timestamp Contract**:
-   - Timestamps stored as `TIMESTAMP WITHOUT TIME ZONE` in Indian Standard Time (`(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`).
-5. **Multi-Format Resilience**:
-   - Ingests multi-format return dates (`DD/MM/YYYY`, `YYYY-MM-DD`, 5-digit Excel epoch serials), trims and validates uppercase vehicle plates (8–12 chars), and automatically detects operator types (`LETZ%IP%`).
-6. **Credential Security**:
-   - Hardcoded database passwords removed in favor of dynamic `PropertiesService.getScriptProperties()` with `setupScriptProperties()` helper.
+- **Zero-Burn Sequence CTE**:
+  Standard PostgreSQL `ON CONFLICT DO UPDATE` consumes an identity sequence value (`nextval`) for every evaluated row, regardless of whether an insert or update occurs. Running catch-up syncs every minute burned millions of sequence values. The Zero-Burn CTE isolates updates in a `WITH upd AS (UPDATE ... RETURNING ...)` block and executes `INSERT` only `WHERE NOT EXISTS (SELECT 1 FROM upd)`. Sequence values are generated strictly for net-new records.
 
----
+- **Dynamic Header Mapping**:
+  The script never relies on hardcoded column indices. The `getHeaderIndexMap()` function analyzes row 1 using case-insensitive regular expressions. If operations staff inserts, reorders, or removes columns (such as inserting a "Source Row" column at Column A), the pipeline automatically adapts without configuration changes or code crashes.
 
-## Target Database Schema
+- **Distributed LockService Guard**:
+  To prevent race conditions, concurrent database writes, and table lock deadlocks between live edits, form submissions, and the 1-minute time trigger, every handler requests a script lock with a 30-second timeout (`LockService.getScriptLock().tryLock(30000)`). Critical sections release locks inside guaranteed `finally` blocks.
 
-- **Host**: `YOUR_DB_HOST_HERE:5432`
-- **Database**: `postgres`
-- **Staging Table**: `public.sheet_dropoffs`
-- **Portal Table**: `public.july_vehicle_dropoffs`
-- **Master Single Source of Truth**: `public.core_dropoffs`
-- **Active Master View**: `public.active_core_dropoffs`
-- **Consolidation Function**: `public.refresh_core_dropoffs()`
+- **Batched Updates with Connection Leak Prevention**:
+  The database engine groups operations into 100-row batch updates via JDBC `addBatch()` and `executeBatch()`. Database connections and prepared statements are wrapped in strict `try-catch-finally` blocks ensuring `stmt.close()` and `conn.close()` execute under all failure modes.
 
 ---
 
-## Directory Contents
+## 4. Spreadsheet Specifications
 
-| File | Description |
-| :--- | :--- |
-| [`dropoff_pipeline_appscript.js`](./dropoff_pipeline_appscript.js) | Production Google Apps Script engine featuring dual ingestion, live `handleOnEdit` event streaming, 11-issue data hygiene engine, custom spreadsheet UI menu, 250-row batch chunking, and automated trigger handlers. |
-| [`schema.sql`](./schema.sql) | PostgreSQL DDL definitions for `public.sheet_dropoffs`, `public.core_dropoffs`, advisory lock `777444555`, dual row-level triggers, consolidation procedure `refresh_core_dropoffs()`, and operational verification queries. |
-| [`data_issues.md`](./data_issues.md) | Comprehensive 13-column audit catalog documenting all 11 operational anomalies (`ISS-01` through `ISS-11`), category breakdown, and team lead audit resolution logs. |
-| [`README.md`](./README.md) | Complete Knowledge Transfer (KT) document, system architecture, database schema, and operational runbook. |
-
----
-
-## Summary of 11-Issue Standardization Engine
-
-| Category | Issue Range | Key Standardizations Implemented |
-| :--- | :--- | :--- |
-| **Data Integrity & Headers** | `ISS-01`, `ISS-02`, `ISS-05` | Filters repeated header rows (`Return Date = 'Return Date'`); multi-format date parser converts `DD/MM/YYYY`, ISO, and Excel serial integers (`46272` $\to$ `2026-09-07`); validates uppercase alphanumeric vehicle plate (8–12 chars). |
-| **Driver & Operator Profiles** | `ISS-03`, `ISS-04`, `ISS-07`, `ISS-08` | Coalesces missing/null driver IDs to `'UNKNOWN_DRIVER'`; standardizes driver names with `'Unknown Driver'` fallback; applies Title Case on driver types (`Operator`, `Individual`); infers missing types from `LETZ%IP%` operator prefix. |
-| **Financial Balances & Liabilities** | `ISS-06` | Strips currency symbols (`₹`), commas, and hyphens; handles accounting format `(500.00)` $\to$ `-500.00`; standardizes all debts to negative numbers; maps `'Pending'`/`'TBD'` to `NULL`. |
-| **Demographics & Operational Enums** | `ISS-09`, `ISS-10` | Normalizes 3-letter city abbreviations (`BLR` $\to$ `Bengaluru`, `HYD` $\to$ `Hyderabad`, `MUM` $\to$ `Mumbai`, `PUN` $\to$ `Pune`) with plate fallback (`KA` $\to$ `Bengaluru`, `TS/TG` $\to$ `Hyderabad`, `MH` $\to$ `Mumbai`); standardizes return reasons (`Attrition`, `Repair and Maintenance`, `Force Recovery`). |
-| **Master Entity Consolidation** | `ISS-11` | Employs `source_row` unique constraint for sheet sync and gapless `id BIGINT PRIMARY KEY` with advisory locking (`777444555`) for core master consolidation. |
+- **Spreadsheet Name**: `dropoffs_form`
+- **Spreadsheet ID**: `1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8`
+- **Active Ingestion Tab**: `sheet_dropoffs`
+- **Supported Columns**:
+  - `Source Row`: Physical row number index (optional in sheet, generated automatically if absent).
+  - `Return Date`: Date of vehicle dropoff (supports DD/MM/YYYY, YYYY-MM-DD, Excel serial integers).
+  - `Return Type`: Return classification (Attrition, Repair and Maintenance, Force Recovery).
+  - `Driver ID`: Driver or operator identification string.
+  - `Driver Name`: Full name of driver.
+  - `Driver Type`: Driver classification (Individual or Operator).
+  - `Vehicle Number`: Vehicle registration plate number.
+  - `City`: Operating city or hub location.
+  - `Negative Balance`: Financial closing balance or outstanding liability amount.
+  - `Sync Status`: Real-time status populated by script (`SYNCED`, `FAILED`).
+  - `Last Synced At`: Timestamp of latest synchronization in IST.
 
 ---
 
-## Deployment & Operations Runbook
+## 5. Step-by-Step Setup & Installation Runbook
 
-### Step 1: Database Setup
-Execute [`schema.sql`](./schema.sql) in PostgreSQL:
+### Step 1: Deploy PostgreSQL Staging Table
+Connect to your PostgreSQL cluster and execute [`schema.sql`](./schema.sql):
 ```bash
-psql -h YOUR_DB_HOST_HERE -U postgres -d postgres -f schema.sql
+psql -h YOUR_DB_HOST_HERE -U YOUR_DB_USER_HERE -d postgres -f schema.sql
 ```
 
-### Step 2: Google Apps Script Setup
-1. Open the target Google Sheet: [`LetzRyd_Sheet_Dropoffs_Master`](https://docs.google.com/spreadsheets/d/1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8/edit?usp=sharing).
-2. Go to **Extensions > Apps Script**.
-3. Paste the contents of [`dropoff_pipeline_appscript.js`](./dropoff_pipeline_appscript.js).
-4. Press `Ctrl + S` to save.
+### Step 2: Open Target Google Sheet & Script Editor
+1. Open the spreadsheet `dropoffs_form` (ID: `1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8`).
+2. Navigate to **Extensions > Apps Script**.
+3. Replace existing script contents with [`dropoff_pipeline_appscript.js`](./dropoff_pipeline_appscript.js).
+4. Save the project (`Ctrl + S`).
 
-### Step 3: Run Full Historical Ingestion
-1. In the Apps Script function dropdown, select **`syncAllDropoffs`** (or use the sheet menu **LetzRyd Dropoffs > Sync All Records (Full)**) and click **▶ Run**.
-2. All historical dropoff records will commit in 250-row batches into PostgreSQL `public.sheet_dropoffs` and populate the standardized `sheet_dropoffs` tab.
+### Step 3: Securely Store Database Credentials
+Configure database credentials via Apps Script `PropertiesService` rather than leaving credentials in code.
+In the Script Editor, run the `setupScriptProperties` function or execute in the console:
+```javascript
+setupScriptProperties(
+  "YOUR_DB_HOST_HERE",
+  "5432",
+  "postgres",
+  "YOUR_DB_USER_HERE",
+  "YOUR_DB_PASSWORD_HERE"
+);
+```
 
-### Step 4: Activate Automated Triggers
-1. In the Apps Script function dropdown, select **`setupTriggers`** (or use the sheet menu **LetzRyd Dropoffs > Setup Automated Triggers**) and click **▶ Run**.
-2. Automated triggers installed:
-   - Removes any existing triggers to avoid duplicates.
-   - **`syncRecentDropoffs`**: 1-minute time-driven catch-up sync.
-   - **`handleOnEdit`**: Instant sync on cell and pasted range edits (< 1s).
-   - **`handleOnFormSubmit`**: Instant sync on form submission.
+### Step 4: Run Initial Full Ingestion
+1. In the Script Editor function dropdown, select `syncAllDropoffs` and click **Run**.
+2. Grant necessary Google OAuth permissions when prompted.
+3. Check the execution log to verify batch completion across all historical rows.
+
+### Step 5: Install Automated Triggers
+1. In the Script Editor function dropdown, select `setupTriggers` and click **Run** (or use the spreadsheet UI menu: **LetzRyd Dropoffs > Setup Automated Triggers**).
+2. This installs:
+   - 1-minute recurring time trigger for `syncRecentDropoffs`.
+   - Spreadsheet-bound `onEdit` trigger for `handleOnEdit`.
+   - Spreadsheet-bound `onFormSubmit` trigger for `handleOnFormSubmit`.
 
 ---
 
-## Verification & Data Quality Audit Queries
+## 6. Operational Guide
 
-```sql
--- 1. Check Source Distribution in Master Table
-SELECT 
-    data_source, 
-    COUNT(*) AS total_records,
-    COUNT(DISTINCT vehicle_number) AS unique_vehicles,
-    SUM(negative_balance) AS total_negative_balance,
-    SUM(total_liability) AS total_combined_liability
-FROM public.core_dropoffs
-GROUP BY data_source;
+- **Live Edits (`handleOnEdit`)**:
+  Fires instantly upon single-cell or multi-row paste modifications. Determines modified row bounds, extracts full row records, sanitizes data, and upserts to PostgreSQL via Zero-Burn CTE within 1 second. Edits to `Sync Status` or `Last Synced At` columns are automatically ignored to prevent trigger loops.
 
--- 2. Verify Zero Duplicates on (vehicle_number, return_date)
-SELECT 
-    vehicle_number, 
-    return_date, 
-    COUNT(*) AS duplicate_count
-FROM public.core_dropoffs
-WHERE is_deleted = FALSE
-GROUP BY vehicle_number, return_date
-HAVING COUNT(*) > 1;
+- **Form Submissions (`handleOnFormSubmit`)**:
+  Fires when an operator submits vehicle return details via a linked Google Form. Transforms the newly submitted row and executes an immediate atomic upsert.
 
--- 3. Verify Gapless Sequential IDs
-SELECT 
-    COUNT(*) AS total_rows,
-    MAX(id) AS max_id,
-    MAX(id) - COUNT(*) AS gap_count,
-    CASE 
-        WHEN COUNT(*) = MAX(id) AND MIN(id) = 1 
-        THEN '✅ 100% PERFECT: Gapless Sequential Integer (1, 2, 3... N)'
-        ELSE '❌ Sequence Gap Detected'
-    END AS validation_result
-FROM public.core_dropoffs;
+- **1-Minute Recurring Catch-Up Trigger (`syncRecentDropoffs`)**:
+  Acts as the self-healing background daemon. Every 60 seconds, inspects the last 150 rows of `sheet_dropoffs`. Guarantees eventual consistency for any edits made during temporary network hiccups or offline spreadsheet work. Execution finishes in under 2 seconds, consuming negligible platform quota.
 
--- 4. City Normalization & Fleet Distribution
-SELECT 
-    city, 
-    COUNT(*) AS total_dropoffs, 
-    COUNT(DISTINCT vehicle_number) AS unique_vehicles,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_share
-FROM public.active_core_dropoffs
-GROUP BY city
-ORDER BY total_dropoffs DESC;
+- **Custom Spreadsheet UI Menu (`onOpen`)**:
+  Provides an administrative menu labeled **LetzRyd Dropoffs** inside the Google Sheet:
+  - **Sync All Records (Full)**: Runs `syncAllDropoffs` on demand with progress toasts.
+  - **Sync Recent Records (150 Rows)**: Manually triggers the sliding window catch-up sync.
+  - **Setup Automated Triggers**: Configures all triggers and verifies permissions.
+  - **Remove Triggers**: Deletes all active project triggers during maintenance windows.
 
--- 5. Return Reason Distribution
-SELECT 
-    return_type, 
-    COUNT(*) AS total_records,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS pct_share
-FROM public.active_core_dropoffs
-GROUP BY return_type
-ORDER BY total_records DESC;
-```
+---
+
+## 7. Data Dictionary: `public.sheet_dropoffs`
+
+The staging table contains 15 standardized columns:
+
+- **dropoff_id**:
+  - Type: `BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY`
+  - Nullable: No
+  - Description: Auto-incrementing primary key managed by PostgreSQL identity sequence. Preserved from sequence burning via Zero-Burn CTE.
+
+- **source_row**:
+  - Type: `INTEGER UNIQUE`
+  - Nullable: Yes (Unique when present)
+  - Description: Physical spreadsheet row number. Serves as the natural idempotency key for all upserts.
+
+- **return_date**:
+  - Type: `DATE NOT NULL`
+  - Nullable: No
+  - Description: Date of physical vehicle return. Standardized to `YYYY-MM-DD` in `Asia/Kolkata` timezone.
+
+- **return_type**:
+  - Type: `VARCHAR(50) NOT NULL`
+  - Nullable: No
+  - Description: Reason or category for return (e.g., `Attrition`, `Repair and Maintenance`, `Force Recovery`).
+
+- **driver_id**:
+  - Type: `VARCHAR(50)`
+  - Nullable: Yes
+  - Description: Alphanumeric driver identifier (e.g., `LETZ001234`). Defaults to `UNKNOWN_DRIVER` if missing.
+
+- **driver_name**:
+  - Type: `VARCHAR(255)`
+  - Nullable: Yes
+  - Description: Full name of the returning driver. Defaults to `Unknown Driver` if missing.
+
+- **driver_type**:
+  - Type: `VARCHAR(30) DEFAULT 'Individual'`
+  - Nullable: Yes
+  - Description: Operational classification of driver (`Individual` or `Operator`). Detected via `LETZ...IP` prefix logic.
+
+- **vehicle_number**:
+  - Type: `VARCHAR(20) NOT NULL`
+  - Nullable: No
+  - Description: Uppercase alphanumeric registration number validated against `^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$`.
+
+- **city**:
+  - Type: `VARCHAR(50) NOT NULL`
+  - Nullable: No
+  - Description: Canonical operating hub name (`Bengaluru`, `Hyderabad`, `Mumbai`, `Pune`, `Delhi`).
+
+- **negative_balance**:
+  - Type: `NUMERIC(12,2) DEFAULT 0.00`
+  - Nullable: Yes
+  - Description: Driver liabilities recorded as negative balance (e.g., `-500.00`). Financial parentheses `(500.00)` are parsed as `-500.00`.
+
+- **sync_status**:
+  - Type: `VARCHAR(20) DEFAULT 'SYNCED'`
+  - Nullable: Yes
+  - Description: Synchronization state flag set by Google Apps Script engine.
+
+- **is_deleted**:
+  - Type: `BOOLEAN NOT NULL DEFAULT FALSE`
+  - Nullable: No
+  - Description: Soft deletion indicator for records purged from the source spreadsheet.
+
+- **deleted_at**:
+  - Type: `TIMESTAMP WITHOUT TIME ZONE`
+  - Nullable: Yes
+  - Description: Timestamp when record was marked deleted, expressed in IST.
+
+- **created_at**:
+  - Type: `TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`
+  - Nullable: No
+  - Description: Timestamp of initial row ingestion into staging table.
+
+- **updated_at**:
+  - Type: `TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`
+  - Nullable: No
+  - Description: Timestamp of latest row modification in staging table.
+
+---
+
+## 8. Maintenance & Troubleshooting Runbook
+
+- **Google Apps Script 6-Minute Timeout Mitigation**:
+  Google Apps Script imposes a strict 6-minute wall-clock limit on function execution. Never schedule `syncAllDropoffs` on a high-frequency trigger. Always use `syncRecentDropoffs` (150 rows), which completes in 1.2 to 1.8 seconds. Reserve `syncAllDropoffs` for initial deployments, manual backfills, or nightly off-peak batches.
+
+- **Sequence Gap Detection & Health Check**:
+  To confirm that the Zero-Burn CTE is operating correctly and not skipping primary keys, run the gap check query from `schema.sql`:
+  ```sql
+  SELECT 
+      COUNT(*) AS total_rows,
+      MIN(dropoff_id) AS min_id,
+      MAX(dropoff_id) AS max_id,
+      (MAX(dropoff_id) - MIN(dropoff_id) + 1) - COUNT(*) AS sequence_gaps
+  FROM public.sheet_dropoffs;
+  ```
+  A result of `sequence_gaps = 0` indicates zero sequence burning.
+
+- **Identity Sequence Resynchronization**:
+  If external batch tools ever perform direct inserts bypassing the sequence:
+  ```sql
+  SELECT setval(
+      pg_get_serial_sequence('public.sheet_dropoffs', 'dropoff_id'),
+      COALESCE((SELECT MAX(dropoff_id) FROM public.sheet_dropoffs), 1)
+  );
+  ```
+
+- **Connection Leak Diagnostics**:
+  If PostgreSQL reports `remaining connection slots are reserved for non-superuser connections`:
+  ```sql
+  SELECT pid, client_addr, state, query_start, query
+  FROM pg_stat_activity
+  WHERE datname = 'postgres' AND state = 'idle'
+  ORDER BY query_start ASC;
+  ```
+  Ensure all script modifications strictly maintain `conn.close()` inside the `finally` block of `upsertDropoffRecords`.
+
+- **Audit Multi-Event Returns on Same Day**:
+  To verify records where the same vehicle was returned multiple times on the same date:
+  ```sql
+  SELECT vehicle_number, return_date, COUNT(*) AS occurrences,
+         ARRAY_AGG(source_row) AS sheet_rows
+  FROM public.sheet_dropoffs
+  WHERE is_deleted = FALSE
+  GROUP BY vehicle_number, return_date
+  HAVING COUNT(*) > 1;
+  ```

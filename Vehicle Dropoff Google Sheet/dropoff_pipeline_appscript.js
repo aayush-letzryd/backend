@@ -1,41 +1,43 @@
 /**
  * ==============================================================================
- * LETZRYD - VEHICLE DROPOFF LIVE PIPELINE (sheet_dropoffs)
+ * LETZRYD - VEHICLE DROPOFF GOOGLE SHEET LIVE PIPELINE (sheet_dropoffs)
  * ==============================================================================
  * 
- * Source Sheet : 'Unified_Dropoff_source' / 'Drop off History' (Raw / Consolidated Records)
- * Target Sheet : 'sheet_dropoffs' (Standardized Tab in Spreadsheet)
- * Target Table : public.sheet_dropoffs & public.core_dropoffs
- * Host         : YOUR_DB_HOST_HERE:5432
+ * Target Spreadsheet : 'dropoffs_form' (Standalone Dropoff Form Spreadsheet)
+ * Spreadsheet ID     : 1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8
+ * Target Table       : public.sheet_dropoffs (PostgreSQL Staging Table)
+ * Host               : YOUR_DB_HOST_HERE:5432
  * 
  * Key Features:
- *  - Blazing-Fast Multi-Row SQL Batching: Eliminates JDBC RPC latency, syncing 6,400+ rows in seconds
- *  - Dual Ingestion: Populates standardized 'sheet_dropoffs' tab AND PostgreSQL database
+ *  - Zero-Burn Sequence CTE Upsert: Eliminates sequence burning, preventing ID explosion
+ *  - Native Active Spreadsheet Binding: Runs seamlessly inside 'dropoffs_form'
+ *  - Parameterized JDBC PreparedStatement: Binary parameter binding with SQL injection immunity
+ *  - Dynamic Header Mapping: Scans row 1 headers, handles 'Source Row' in Col A or anywhere
+ *  - Concurrency Protection: Robust LockService guards with 30s timeout on all handlers
  *  - Real-time live ingestion on cell edit (handleOnEdit) and form submit (handleOnFormSubmit)
- *  - 1-Minute Time-Driven Catch-Up Sync (syncRecentDropoffs) with sliding window
- *  - Full Historical Batch Sync (syncAllDropoffs)
- *  - 11-Issue standardization engine (ISS-01 through ISS-11)
- *  - Debt polarity standardization: all liabilities stored as negative floats (500 -> -500.00, (500) -> -500.00)
- *  - Strict plate validation (8 <= length <= 12, uppercase alphanumeric)
- *  - Strict Operator classification check (LETZ + IP prefix)
- *  - Complete connection leak prevention (try-catch-finally with conn.close())
- *  - Automated trigger installer (setupTriggers) removing old triggers before creating new ones
+ *  - 1-Minute Time-Driven Catch-Up Sync (syncRecentDropoffs) with 150-row sliding window
+ *  - Full Historical Batch Sync (syncAllDropoffs) with 100-row batch commits
+ *  - Accounting parentheses parsing: (500.00) -> -500.00
+ *  - Strict Indian vehicle plate regex validation (^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$)
+ *  - Pure IST Date Normalization via Utilities.formatDate ("Asia/Kolkata")
+ *  - Complete connection leak prevention (try-catch-finally with stmt.close() and conn.close())
+ *  - Automated trigger installer (setupTriggers) and remover (removeTriggers)
  *  - Custom spreadsheet UI menu with one-click actions
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "35.200.196.113",
+  host: "YOUR_DB_HOST_HERE",
   port: "5432",
   database: "postgres",
-  user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
+  user: "YOUR_DB_USER_HERE",
+  password: "YOUR_DB_PASSWORD_HERE",
   
-  // Original Pan India Master Sheet (same source as Adjustments pipeline)
-  sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
-  sourceSheetName: "Drop off History",
-  targetSheetName: "sheet_dropoffs"
+  // dropoffs_form Spreadsheet
+  sourceSpreadsheetId: "1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8",
+  sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1lb2BArHkQynUSA2hs_GAhCdjhOlwGIFIVjqA32Jw5M8/edit",
+  preferredSheetName: "sheet_dropoffs"
 };
 
 // Canonical City Code & Name Map
@@ -56,9 +58,77 @@ const CITY_MAP = {
   "chennai": "Chennai"
 };
 
+const SQL_TYPES = {
+  VARCHAR: 12,
+  INTEGER: 4,
+  NUMERIC: 2,
+  DATE: 91,
+  NULL: 0
+};
+
+// Zero-Burn Sequence CTE Upsert Query
+const UPSERT_CTE_SQL = `
+WITH incoming AS (
+    SELECT 
+        CAST(? AS integer) AS src_row,
+        CAST(? AS date) AS ret_date,
+        CAST(? AS varchar) AS ret_type,
+        CAST(? AS varchar) AS drv_id,
+        CAST(? AS varchar) AS drv_name,
+        CAST(? AS varchar) AS drv_type,
+        CAST(? AS varchar) AS veh_num,
+        CAST(? AS varchar) AS city_name,
+        CAST(? AS numeric) AS neg_bal
+),
+upd AS (
+    UPDATE public.sheet_dropoffs s
+    SET 
+        return_date = i.ret_date,
+        return_type = i.ret_type,
+        driver_id = i.drv_id,
+        driver_name = i.drv_name,
+        driver_type = i.drv_type,
+        vehicle_number = i.veh_num,
+        city = i.city_name,
+        negative_balance = i.neg_bal,
+        sync_status = 'SYNCED',
+        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    FROM incoming i
+    WHERE s.source_row = i.src_row
+    RETURNING s.dropoff_id
+)
+INSERT INTO public.sheet_dropoffs (
+    source_row, return_date, return_type, driver_id, driver_name,
+    driver_type, vehicle_number, city, negative_balance, sync_status,
+    created_at, updated_at
+)
+SELECT 
+    i.src_row, i.ret_date, i.ret_type, i.drv_id, i.drv_name,
+    i.drv_type, i.veh_num, i.city_name, i.neg_bal, 'SYNCED',
+    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+FROM incoming i
+WHERE NOT EXISTS (SELECT 1 FROM upd);
+`;
+
 // =============================================================================
-// DATABASE CONFIGURATION & CONNECTION MANAGEMENT
+// DATABASE CONNECTION MANAGEMENT & SECURE CREDENTIAL STORE
 // =============================================================================
+
+/**
+ * Configure credentials into Google Apps Script PropertiesService.
+ * Call this function once from Script Editor or runbook to store real credentials.
+ */
+function setupScriptProperties(host, port, dbName, user, password) {
+  PropertiesService.getScriptProperties().setProperties({
+    "DB_HOST": host || "YOUR_DB_HOST_HERE",
+    "DB_PORT": String(port || "5432"),
+    "DB_NAME": dbName || "postgres",
+    "DB_USER": user || "YOUR_DB_USER_HERE",
+    "DB_PASSWORD": password || "YOUR_DB_PASSWORD_HERE"
+  });
+  Logger.log("Database script properties configured successfully.");
+}
 
 function getConnection() {
   var host = DB_CONFIG.host;
@@ -76,7 +146,9 @@ function getConnection() {
       user = props.getProperty("DB_USER") || user;
       password = props.getProperty("DB_PASSWORD") || password;
     }
-  } catch(e) {}
+  } catch(e) {
+    Logger.log("PropertiesService lookup notice: " + e.message);
+  }
 
   var dbUrl = "jdbc:postgresql://" + host + ":" + port + "/" + database;
   return Jdbc.getConnection(dbUrl, user, password);
@@ -86,7 +158,23 @@ function getConnection() {
 // SPREADSHEET GETTERS & TAB MANAGEMENT
 // =============================================================================
 
-function getSourceSpreadsheet() {
+function getTargetSpreadsheet() {
+  // 1. Native active spreadsheet binding
+  try {
+    var active = SpreadsheetApp.getActiveSpreadsheet();
+    if (active) return active;
+  } catch(e) {}
+
+  // 2. Open by ID
+  if (DB_CONFIG.sourceSpreadsheetId && DB_CONFIG.sourceSpreadsheetId.trim() !== "") {
+    try {
+      return SpreadsheetApp.openById(DB_CONFIG.sourceSpreadsheetId);
+    } catch(e) {
+      Logger.log("openById notice: " + e.message);
+    }
+  }
+
+  // 3. Fallback to openByUrl
   if (DB_CONFIG.sourceSpreadsheetUrl && DB_CONFIG.sourceSpreadsheetUrl.trim() !== "") {
     try {
       return SpreadsheetApp.openByUrl(DB_CONFIG.sourceSpreadsheetUrl);
@@ -94,62 +182,112 @@ function getSourceSpreadsheet() {
       Logger.log("openByUrl notice: " + e.message);
     }
   }
-  return SpreadsheetApp.getActiveSpreadsheet();
+  return null;
 }
 
-function getSourceSheet() {
-  var ss = getSourceSpreadsheet();
-  if (!ss) throw new Error("Could not access spreadsheet.");
+function getDropoffSheet() {
+  var ss = getTargetSpreadsheet();
+  if (!ss) throw new Error("Could not access target spreadsheet 'dropoffs_form'.");
 
-  var sheet = ss.getSheetByName(DB_CONFIG.sourceSheetName);
-  if (sheet) return sheet;
-
-  var sheets = ss.getSheets();
-  var targetKey = DB_CONFIG.sourceSheetName.trim().toLowerCase();
-  for (var i = 0; i < sheets.length; i++) {
-    var sName = sheets[i].getName().trim().toLowerCase();
-    if (sName === targetKey || sName.indexOf("unified_dropoff") !== -1 || sName.indexOf("drop off history") !== -1 || sName.indexOf("dropoff") !== -1) {
-      return sheets[i];
-    }
+  // 1. Check preferred tab name ('sheet_dropoffs')
+  if (DB_CONFIG.preferredSheetName) {
+    var sheet = ss.getSheetByName(DB_CONFIG.preferredSheetName);
+    if (sheet) return sheet;
   }
-  
-  var activeSS = null;
-  try { activeSS = SpreadsheetApp.getActiveSpreadsheet(); } catch(e){}
-  if (activeSS && ss && activeSS.getId() !== ss.getId()) {
-    var aSheets = activeSS.getSheets();
-    for (var j = 0; j < aSheets.length; j++) {
-      var aName = aSheets[j].getName().trim().toLowerCase();
-      if (aName === targetKey || aName.indexOf("unified_dropoff") !== -1 || aName.indexOf("drop off history") !== -1 || aName.indexOf("dropoff") !== -1) {
-        return aSheets[j];
+
+  // 2. Look for tab containing dropoff headers (Return Date / Vehicle Number)
+  var sheets = ss.getSheets();
+  for (var i = 0; i < sheets.length; i++) {
+    var s = sheets[i];
+    if (s.getLastRow() >= 1 && s.getLastColumn() >= 3) {
+      var topVals = s.getRange(1, 1, 1, Math.min(s.getLastColumn(), 15)).getValues()[0];
+      var headerStr = topVals.join(" ").toLowerCase();
+      if (headerStr.includes("return date") || headerStr.includes("vehicle number") || headerStr.includes("driver id")) {
+        return s;
       }
     }
   }
 
-  throw new Error("Source tab '" + DB_CONFIG.sourceSheetName + "' not found in spreadsheet.");
+  // 3. Fallback to active sheet or first sheet
+  try {
+    var activeSheet = ss.getActiveSheet();
+    if (activeSheet) return activeSheet;
+  } catch(e) {}
+
+  return sheets[0];
 }
 
-function getTargetSheet() {
-  var ss = SpreadsheetApp.getActiveSpreadsheet() || getSourceSpreadsheet();
-  var targetSheet = ss.getSheetByName(DB_CONFIG.targetSheetName);
-  
-  if (!targetSheet) {
-    Logger.log("Creating target sheet tab '" + DB_CONFIG.targetSheetName + "'...");
-    targetSheet = ss.insertSheet(DB_CONFIG.targetSheetName);
-    var headers = [
-      "Source Row", "Return Date", "Return Type", "Driver ID", "Driver Name",
-      "Driver Type", "Vehicle Number", "City", "Negative Balance", "Sync Status", "Last Synced At"
-    ];
-    targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    targetSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#1F4E78").setFontColor("#FFFFFF");
-    targetSheet.setFrozenRows(1);
+// =============================================================================
+// DYNAMIC HEADER MAPPING
+// =============================================================================
+
+function getHeaderIndexMap(headers) {
+  const map = {
+    sourceRow: -1,
+    returnDate: -1,
+    returnType: -1,
+    driverId: -1,
+    driverName: -1,
+    driverType: -1,
+    vehicleNumber: -1,
+    city: -1,
+    negativeBalance: -1,
+    syncStatus: -1,
+    lastSyncedAt: -1
+  };
+
+  if (!headers || headers.length === 0) return map;
+
+  for (let c = 0; c < headers.length; c++) {
+    const raw = String(headers[c] || "").trim().toLowerCase();
+    if (!raw) continue;
+
+    if (/source.*row|^row$/i.test(raw)) {
+      map.sourceRow = c;
+    } else if (/return.*date|drop.*off.*date|date.*return/i.test(raw)) {
+      map.returnDate = c;
+    } else if (/return.*type|reason.*return|drop.*off.*reason|reason/i.test(raw)) {
+      map.returnType = c;
+    } else if (/operator.*driver.*id|driver.*id|partner.*id|operator.*id/i.test(raw)) {
+      map.driverId = c;
+    } else if (/driver.*name|partner.*name/i.test(raw)) {
+      map.driverName = c;
+    } else if (/driver.*type|partner.*type|category|^type$/i.test(raw)) {
+      map.driverType = c;
+    } else if (/vehicle.*number|vehicle.*num|car.*number|plate.*number/i.test(raw)) {
+      map.vehicleNumber = c;
+    } else if (/^city$|^hub$|location/i.test(raw)) {
+      map.city = c;
+    } else if (/negative.*balance|balance.*amount|ola.*negative|closing.*balance|balance/i.test(raw)) {
+      map.negativeBalance = c;
+    } else if (/sync.*status/i.test(raw)) {
+      map.syncStatus = c;
+    } else if (/last.*sync/i.test(raw)) {
+      map.lastSyncedAt = c;
+    }
   }
-  return targetSheet;
+
+  // Positional fallbacks if headers were not explicitly matched
+  if (map.returnDate === -1) map.returnDate = map.sourceRow === 0 ? 1 : 0;
+  if (map.returnType === -1) map.returnType = map.sourceRow === 0 ? 2 : 1;
+  if (map.driverId === -1) map.driverId = map.sourceRow === 0 ? 3 : 2;
+  if (map.driverName === -1) map.driverName = map.sourceRow === 0 ? 4 : 3;
+  if (map.driverType === -1) map.driverType = map.sourceRow === 0 ? 5 : 6;
+  if (map.vehicleNumber === -1) map.vehicleNumber = map.sourceRow === 0 ? 6 : 4;
+  if (map.city === -1) map.city = map.sourceRow === 0 ? 7 : 7;
+  if (map.negativeBalance === -1) map.negativeBalance = map.sourceRow === 0 ? 8 : 5;
+
+  return map;
 }
 
 // =============================================================================
-// DATA SANITIZATION & STANDARDIZATION ENGINE (ISS-01 THROUGH ISS-11)
+// DATA SANITIZATION & STANDARDIZATION ENGINE
 // =============================================================================
 
+/**
+ * Normalizes input date to standard YYYY-MM-DD string in Asia/Kolkata timezone.
+ * Handles Date objects, 5-digit Excel epoch serials, DMY text, and ISO dates.
+ */
 function normalizeDate(rawDate) {
   if (!rawDate) return null;
   
@@ -157,36 +295,30 @@ function normalizeDate(rawDate) {
     if (isNaN(rawDate.getTime())) return null;
     const y = rawDate.getFullYear();
     if (y < 1950 || y > 2100) return null;
-    const m = String(rawDate.getMonth() + 1).padStart(2, '0');
-    const d = String(rawDate.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    return Utilities.formatDate(rawDate, "Asia/Kolkata", "yyyy-MM-dd");
   }
   
   let str = String(rawDate).trim();
-  if (!str || str.toLowerCase() === 'null' || str === '-' || str.toLowerCase() === 'return date' || str.toLowerCase() === 'n/a') return null;
-  
-  if (str.includes(' ')) {
-    str = str.split(' ')[0].trim();
+  if (!str || str.toLowerCase() === 'null' || str === '-' || str.toLowerCase() === 'return date' || str.toLowerCase() === 'n/a') {
+    return null;
   }
   
-  // Excel Serial Integer (e.g. 45123)
+  // 5-digit Excel Serial Integer (e.g. 45123)
   if (/^\d{5}$/.test(str)) {
     const serial = parseInt(str, 10);
     const epoch = new Date(1899, 11, 30);
     epoch.setDate(epoch.getDate() + serial);
     const y = epoch.getFullYear();
     if (y < 1950 || y > 2100) return null;
-    const m = String(epoch.getMonth() + 1).padStart(2, '0');
-    const d = String(epoch.getDate()).padStart(2, '0');
-    return `${y}-${m}-${d}`;
+    return Utilities.formatDate(epoch, "Asia/Kolkata", "yyyy-MM-dd");
   }
   
-  // Text Month format (e.g. 12-Jan-2024)
+  // Text Month format (e.g. 12-Jan-2024, 12 Jan 2024)
   const monthMap = {
     'jan': '01', 'feb': '02', 'mar': '03', 'apr': '04', 'may': '05', 'jun': '06',
     'jul': '07', 'aug': '08', 'sep': '09', 'oct': '10', 'nov': '11', 'dec': '12'
   };
-  const textMonthMatch = str.match(/^(\d{1,2})[\/\-\.]([A-Za-z]{3,9})[\/\-\.](\d{2,4})$/);
+  const textMonthMatch = str.match(/^(\d{1,2})[\/\-\.\s]([A-Za-z]{3,9})[\/\-\.\s](\d{2,4})$/);
   if (textMonthMatch) {
     const day = textMonthMatch[1].padStart(2, '0');
     const monKey = textMonthMatch[2].substring(0, 3).toLowerCase();
@@ -198,8 +330,8 @@ function normalizeDate(rawDate) {
     }
   }
   
-  // DMY format: DD.MM.YYYY, DD/MM/YYYY, DD-MM-YYYY
-  const dmyMatch = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})$/);
+  // DMY format: DD/MM/YYYY, DD-MM-YYYY, DD.MM.YYYY
+  const dmyMatch = str.match(/^(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})/);
   if (dmyMatch) {
     const day = dmyMatch[1].padStart(2, '0');
     const mon = dmyMatch[2].padStart(2, '0');
@@ -211,7 +343,7 @@ function normalizeDate(rawDate) {
   }
   
   // ISO format: YYYY-MM-DD
-  const ymdMatch = str.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})$/);
+  const ymdMatch = str.match(/^(\d{4})[\/\-\.](\d{1,2})[\/\-\.](\d{1,2})/);
   if (ymdMatch) {
     const yr = ymdMatch[1];
     const mon = ymdMatch[2].padStart(2, '0');
@@ -224,12 +356,19 @@ function normalizeDate(rawDate) {
   return null;
 }
 
+/**
+ * Validates and cleans vehicle registration plates against standard Indian pattern:
+ * ^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$
+ */
 function cleanVehicleNumber(rawPlate) {
   if (!rawPlate) return null;
   const str = String(rawPlate).trim().toUpperCase();
-  if (["NA", "NAN", "NULL", "NONE", "-", "0", "VEHICLE NUMBER"].indexOf(str) !== -1) return null;
+  if (["NA", "NAN", "NULL", "NONE", "-", "0", "VEHICLE NUMBER"].indexOf(str) !== -1) {
+    return null;
+  }
   const cleaned = str.replace(/[^A-Z0-9]/g, '');
-  return (cleaned.length >= 8 && cleaned.length <= 12) ? cleaned : null;
+  if (cleaned.length < 8 || cleaned.length > 12) return null;
+  return /^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$/.test(cleaned) ? cleaned : null;
 }
 
 function normalizeCity(rawCity, vehiclePlate) {
@@ -250,24 +389,27 @@ function normalizeCity(rawCity, vehiclePlate) {
   return c ? c.charAt(0).toUpperCase() + c.slice(1).toLowerCase() : 'Bengaluru';
 }
 
+/**
+ * Parses financial balance amounts, handling accounting parentheses format:
+ * (500.00) -> -500.00
+ * Also strips currency symbols (₹, $), commas, and whitespace.
+ */
 function cleanBalance(rawVal) {
   if (rawVal === null || rawVal === undefined || rawVal === '') return 0.00;
-  let str = String(rawVal).replace(/[₹,\s]/g, '').trim();
+  let str = String(rawVal).replace(/[₹$,\s]/g, '').trim();
   if (!str || str === '-' || str.toLowerCase() === 'null' || str.toLowerCase() === 'n/a') return 0.00;
-  
   if (str.toLowerCase() === 'pending' || str.toLowerCase() === 'tbd') return null;
   
+  // Accounting negative format: (500.00) -> -500.00
   if (str.startsWith("(") && str.endsWith(")")) {
-    const inner = str.slice(1, -1).trim();
+    const inner = str.slice(1, -1).replace(/[₹$,\s]/g, '').trim();
     const num = parseFloat(inner);
     return isNaN(num) ? null : -Math.abs(num);
   }
   
   const num = parseFloat(str);
   if (isNaN(num)) return null;
-  if (num === 0) return 0.00;
-  
-  return -Math.abs(num);
+  return num;
 }
 
 function cleanDriverType(rawType, driverId) {
@@ -306,55 +448,23 @@ function cleanReturnType(rawType) {
   return str;
 }
 
-// =============================================================================
-// HELPER SQL FORMATTERS (ELIMINATES JDBC BRIDGE LATENCY)
-// =============================================================================
-
-function sqlStr(val) {
-  if (val === null || val === undefined) return "NULL::text";
-  var s = String(val).trim();
-  if (s === "" || s.toUpperCase() === "NULL") return "NULL::text";
-  return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "''") + "'::text";
-}
-
-function sqlNum(val) {
-  if (val === null || val === undefined || val === "") return "0.00::numeric";
-  var n = parseFloat(val);
-  return (isNaN(n) ? "0.00" : n.toFixed(2)) + "::numeric";
-}
-
-function sqlNullableNum(val) {
-  if (val === null || val === undefined || val === "") return "NULL::numeric";
-  var n = parseFloat(val);
-  return (isNaN(n) ? "NULL::numeric" : n.toFixed(2)) + "::numeric";
-}
-
-function sqlInt(val) {
-  if (val === null || val === undefined || val === "") return "0::integer";
-  var n = parseInt(val, 10);
-  return (isNaN(n) ? "0" : String(n)) + "::integer";
-}
-
-function sqlDate(val) {
-  if (!val) return "NULL::date";
-  return "'" + String(val).replace(/'/g, "") + "'::date";
-}
-
-/**
- * Transforms raw sheet row into sanitized dropoff record object
- */
-function transformDropoffRow(row, rowIdx) {
+function transformDropoffRow(row, rowIdx, hMap) {
   if (!row || row.length === 0) return null;
   
-  const rawDate = row[0];
-  const rawReturnType = row[1];
-  const rawDriverId = row[2];
-  const rawDriverName = row[3];
-  const rawPlate = row[4];
-  const rawBal = row[5];
-  const rawType = row[6];
-  const rawCity = row[7];
+  function getVal(idx) {
+    return idx !== undefined && idx >= 0 && idx < row.length ? row[idx] : null;
+  }
   
+  const rawDate = hMap ? getVal(hMap.returnDate) : row[1];
+  const rawReturnType = hMap ? getVal(hMap.returnType) : row[2];
+  const rawDriverId = hMap ? getVal(hMap.driverId) : row[3];
+  const rawDriverName = hMap ? getVal(hMap.driverName) : row[4];
+  const rawType = hMap ? getVal(hMap.driverType) : row[5];
+  const rawPlate = hMap ? getVal(hMap.vehicleNumber) : row[6];
+  const rawCity = hMap ? getVal(hMap.city) : row[7];
+  const rawBal = hMap ? getVal(hMap.negativeBalance) : row[8];
+  
+  // Skip embedded header repeats
   if (String(rawDate).trim().toLowerCase() === 'return date' || String(rawPlate).trim().toLowerCase() === 'vehicle number') {
     return null;
   }
@@ -362,6 +472,15 @@ function transformDropoffRow(row, rowIdx) {
   const returnDate = normalizeDate(rawDate);
   const vehicleNumber = cleanVehicleNumber(rawPlate);
   if (!returnDate || !vehicleNumber) return null;
+  
+  // Resolve source row: Col A value if populated, otherwise physical row index
+  let sourceRow = rowIdx;
+  if (hMap && hMap.sourceRow >= 0) {
+    const parsedRow = parseInt(getVal(hMap.sourceRow), 10);
+    if (!isNaN(parsedRow) && parsedRow > 0) {
+      sourceRow = parsedRow;
+    }
+  }
   
   const returnType = cleanReturnType(rawReturnType);
   const driverId = cleanDriverId(rawDriverId);
@@ -371,7 +490,8 @@ function transformDropoffRow(row, rowIdx) {
   const negativeBalance = cleanBalance(rawBal);
   
   return {
-    sourceRow: rowIdx,
+    sourceRow: sourceRow,
+    sheetRowIndex: rowIdx,
     returnDate: returnDate,
     returnType: returnType,
     driverId: driverId,
@@ -383,35 +503,20 @@ function transformDropoffRow(row, rowIdx) {
   };
 }
 
-function formatRecordForSheet(r, nowStr) {
-  return [
-    r.sourceRow,
-    r.returnDate,
-    r.returnType,
-    r.driverId,
-    r.driverName,
-    r.driverType,
-    r.vehicleNumber,
-    r.city,
-    r.negativeBalance !== null ? r.negativeBalance : "",
-    "SYNCED",
-    nowStr
-  ];
-}
-
-function formatTimestamp(d) {
-  if (!d) return "";
-  var y = d.getFullYear();
-  var m = String(d.getMonth() + 1).padStart(2, "0");
-  var day = String(d.getDate()).padStart(2, "0");
-  var h = String(d.getHours()).padStart(2, "0");
-  var min = String(d.getMinutes()).padStart(2, "0");
-  var s = String(d.getSeconds()).padStart(2, "0");
-  return y + "-" + m + "-" + day + " " + h + ":" + min + ":" + s;
+function bindDropoffParams(stmt, d) {
+  stmt.setInt(1, d.sourceRow);
+  stmt.setString(2, d.returnDate);
+  stmt.setString(3, d.returnType);
+  d.driverId ? stmt.setString(4, d.driverId) : stmt.setNull(4, SQL_TYPES.VARCHAR);
+  d.driverName ? stmt.setString(5, d.driverName) : stmt.setNull(5, SQL_TYPES.VARCHAR);
+  stmt.setString(6, d.driverType);
+  stmt.setString(7, d.vehicleNumber);
+  stmt.setString(8, d.city);
+  d.negativeBalance !== null ? stmt.setDouble(9, d.negativeBalance) : stmt.setNull(9, SQL_TYPES.NUMERIC);
 }
 
 // =============================================================================
-// DATABASE UPSERT ENGINE (MULTI-ROW CHUNKS - IDENTICAL TO ACCIDENTS PIPELINE)
+// DATABASE UPSERT ENGINE (ZERO-BURN CTE BATCHING)
 // =============================================================================
 
 function upsertDropoffRecords(records) {
@@ -419,131 +524,108 @@ function upsertDropoffRecords(records) {
   
   var conn = null;
   var stmt = null;
-  var BATCH_SIZE = 50;
+  var BATCH_SIZE = 100;
   var totalCount = 0;
   
   try {
     conn = getConnection();
     conn.setAutoCommit(false);
-    stmt = conn.createStatement();
+    stmt = conn.prepareStatement(UPSERT_CTE_SQL);
     
     for (var b = 0; b < records.length; b += BATCH_SIZE) {
       var chunk = records.slice(b, b + BATCH_SIZE);
-      var valuesList = [];
       
       for (var i = 0; i < chunk.length; i++) {
-        var r = chunk[i];
-        var rowSql = "(" +
-          sqlInt(r.sourceRow) + ", " +
-          sqlDate(r.returnDate) + ", " +
-          sqlStr(r.returnType) + ", " +
-          sqlStr(r.driverId) + ", " +
-          sqlStr(r.driverName) + ", " +
-          sqlStr(r.driverType) + ", " +
-          sqlStr(r.vehicleNumber) + ", " +
-          sqlStr(r.city) + ", " +
-          sqlNullableNum(r.negativeBalance) + ", " +
-          "'SYNCED', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')" +
-        ")";
-        valuesList.push(rowSql);
+        bindDropoffParams(stmt, chunk[i]);
+        stmt.addBatch();
       }
       
-      var sql = 
-        "INSERT INTO public.sheet_dropoffs (" +
-        "  source_row, return_date, return_type, driver_id, driver_name," +
-        "  driver_type, vehicle_number, city, negative_balance, sync_status, updated_at" +
-        ") VALUES " + valuesList.join(",\n") + " " +
-        "ON CONFLICT (source_row) DO UPDATE SET " +
-        "  return_date = EXCLUDED.return_date, " +
-        "  return_type = EXCLUDED.return_type, " +
-        "  driver_id = EXCLUDED.driver_id, " +
-        "  driver_name = EXCLUDED.driver_name, " +
-        "  driver_type = EXCLUDED.driver_type, " +
-        "  vehicle_number = EXCLUDED.vehicle_number, " +
-        "  city = EXCLUDED.city, " +
-        "  negative_balance = EXCLUDED.negative_balance, " +
-        "  sync_status = 'SYNCED', " +
-        "  updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata');";
-      
-      stmt.executeUpdate(sql);
+      stmt.executeBatch();
+      conn.commit();
       totalCount += chunk.length;
-      Logger.log("Upserted batch: " + totalCount + "/" + records.length + " dropoff records into PostgreSQL.");
+      Logger.log("Upserted batch: " + totalCount + "/" + records.length + " dropoff records into public.sheet_dropoffs.");
     }
     
-    conn.commit();
-    Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " records.");
+    Logger.log("Successfully completed PostgreSQL Zero-Burn CTE upsert for all " + totalCount + " records.");
     return totalCount;
   } catch (err) {
-    if (conn) conn.rollback();
+    if (conn) {
+      try { conn.rollback(); } catch(e){}
+    }
     Logger.log("Error in upsertDropoffRecords: " + err.message);
     throw err;
   } finally {
-    if (stmt) try { stmt.close(); } catch(e){}
-    if (conn) try { conn.close(); } catch(e){}
+    if (stmt) {
+      try { stmt.close(); } catch(e){}
+    }
+    if (conn) {
+      try { conn.close(); } catch(e){}
+    }
   }
 }
 
 // =============================================================================
-// SYNCHRONIZATION HANDLERS (FULL, 1-MIN, ON-EDIT, ON-FORM-SUBMIT)
+// SYNCHRONIZATION HANDLERS (ALL PROTECTED BY 30S LOCKSERVICE)
 // =============================================================================
 
+/**
+ * Full sheet sync: Reads all rows, transforms data, and upserts in batches of 100.
+ * Protected by 30s LockService timeout.
+ */
 function syncAllDropoffs() {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
-    Logger.log("Another sync is currently in progress. Skipping execution.");
+    Logger.log("syncAllDropoffs: Another sync is currently active (lock timeout 30s). Skipping run.");
     return;
   }
+
   try {
-    const sourceSheet = getSourceSheet();
-    const data = sourceSheet.getDataRange().getValues();
-    Logger.log("Read " + data.length + " total rows from source tab '" + sourceSheet.getName() + "'");
+    const sheet = getDropoffSheet();
+    const data = sheet.getDataRange().getValues();
+    Logger.log("Read " + data.length + " total rows from tab '" + sheet.getName() + "'");
     
     if (data.length <= 1) {
-      Logger.log("Source tab contains no data rows yet.");
+      Logger.log("Sheet contains no data rows yet.");
       return;
     }
     
+    const hMap = getHeaderIndexMap(data[0]);
     const records = [];
-    const sheetRows = [];
-    const nowStr = formatTimestamp(new Date());
 
     for (let i = 1; i < data.length; i++) {
-      const transformed = transformDropoffRow(data[i], i + 1);
+      const transformed = transformDropoffRow(data[i], i + 1, hMap);
       if (transformed) {
         records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
       }
     }
     
     Logger.log("Transformed " + records.length + " valid dropoff records.");
-    
-    // 1. Write clean standardized rows to target tab in chunks of 500
-    try {
-      const targetSheet = getTargetSheet();
-      if (targetSheet && sheetRows.length > 0) {
-        const targetDataRange = targetSheet.getDataRange();
-        if (targetDataRange.getLastRow() > 1) {
-          targetSheet.getRange(2, 1, targetDataRange.getLastRow() - 1, targetSheet.getLastColumn()).clearContent();
-        }
-        const CHUNK_SIZE = 500;
-        for (let s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
-          const sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
-          targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
-        }
-        Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
-      }
-    } catch(e) {
-      Logger.log("Notice on target sheet write: " + e.message);
-    }
 
-    // 2. Batch upsert into PostgreSQL (Multi-row SQL statements)
+    // Batch upsert into PostgreSQL using Zero-Burn CTE
     Logger.log("Starting PostgreSQL upsert for " + records.length + " records...");
     const totalUpserted = upsertDropoffRecords(records);
-    Logger.log("Completed syncAllDropoffs! Total records synced to DB: " + totalUpserted);
+    Logger.log("Completed syncAllDropoffs! Total records synced: " + totalUpserted);
+    
+    // Update Sync Status & Timestamp in sheet if columns exist
+    try {
+      if (hMap.syncStatus >= 0 && hMap.lastSyncedAt >= 0) {
+        const nowStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
+        const statusVals = [];
+        for (let j = 0; j < records.length; j++) {
+          statusVals.push(["SYNCED", nowStr]);
+        }
+        if (statusVals.length > 0) {
+          const startR = records[0].sheetRowIndex;
+          sheet.getRange(startR, hMap.syncStatus + 1, statusVals.length, 2).setValues(statusVals);
+        }
+      }
+    } catch(e) {
+      Logger.log("Notice on status column update: " + e.message);
+    }
     
     try {
       if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getActiveSpreadsheet()) {
-        SpreadsheetApp.getActiveSpreadsheet().toast(`Successfully synced ${totalUpserted} dropoffs to database!`, 'Sync Complete', 5);
+        SpreadsheetApp.getActiveSpreadsheet().toast("Successfully synced " + totalUpserted + " dropoffs to PostgreSQL staging!", "Sync Complete", 5);
       }
     } catch(e){}
   } finally {
@@ -551,88 +633,98 @@ function syncAllDropoffs() {
   }
 }
 
+/**
+ * 1-Minute Sliding Window Catch-Up Sync (last 150 rows).
+ * Protects against GAS 6-minute timeout by restricting execution to under 2 seconds.
+ * Protected by 30s LockService timeout.
+ */
 function syncRecentDropoffs() {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(15000)) {
-    Logger.log("Another sync is running. Skipping recent sync.");
+  if (!lock.tryLock(30000)) {
+    Logger.log("syncRecentDropoffs: Another sync is currently running (lock timeout 30s). Skipping.");
     return;
   }
+
   try {
-    const sourceSheet = getSourceSheet();
-    const lastRow = sourceSheet.getLastRow();
+    const sheet = getDropoffSheet();
+    const lastRow = sheet.getLastRow();
     if (lastRow <= 1) return;
     
     const WINDOW_SIZE = 150;
     const startRow = Math.max(2, lastRow - WINDOW_SIZE + 1);
     const numRows = lastRow - startRow + 1;
     
-    const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
+    const headerVals = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const hMap = getHeaderIndexMap(headerVals);
+    const data = sheet.getRange(startRow, 1, numRows, sheet.getLastColumn()).getValues();
     const records = [];
-    const sheetRows = [];
-    const nowStr = formatTimestamp(new Date());
 
     for (let i = 0; i < data.length; i++) {
-      const transformed = transformDropoffRow(data[i], startRow + i);
+      const transformed = transformDropoffRow(data[i], startRow + i, hMap);
       if (transformed) {
         records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
       }
     }
     
     if (records.length > 0) {
-      try {
-        const targetSheet = getTargetSheet();
-        if (targetSheet && sheetRows.length > 0) {
-          targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
-        }
-      } catch(e) {}
-
       upsertDropoffRecords(records);
       Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent dropoff records.");
+      
+      // Update Sync Status & Timestamp in sheet
+      try {
+        if (hMap.syncStatus >= 0 && hMap.lastSyncedAt >= 0) {
+          const nowStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
+          const statusVals = [];
+          for (let k = 0; k < numRows; k++) {
+            statusVals.push(["SYNCED", nowStr]);
+          }
+          sheet.getRange(startRow, hMap.syncStatus + 1, numRows, 2).setValues(statusVals);
+        }
+      } catch(e) {}
     }
   } finally {
     lock.releaseLock();
   }
 }
 
+/**
+ * Live OnEdit trigger handler: Supports single edits and multi-row range pastes.
+ * Protected by 30s LockService timeout.
+ */
 function handleOnEdit(e) {
   if (!e || !e.range) return;
-  const sheet = e.range.getSheet();
-  const sName = sheet.getName().trim().toLowerCase();
-  if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase() && sName.indexOf("dropoff") === -1 && sName.indexOf("drop off") === -1) {
+  
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("handleOnEdit: Lock acquisition timed out (30s). Skipping edit event.");
     return;
   }
 
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) return;
   try {
+    const sheet = e.range.getSheet();
     const startRow = e.range.getRow();
     const endRow = e.range.getLastRow();
     if (startRow <= 1 && endRow <= 1) return;
+    
+    const headerVals = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    const hMap = getHeaderIndexMap(headerVals);
+    
+    // Ignore edits on Sync Status or Last Synced At to prevent infinite trigger loops
+    const editCol = e.range.getColumn();
+    if (editCol === hMap.syncStatus + 1 || editCol === hMap.lastSyncedAt + 1) {
+      return;
+    }
     
     const actualStart = Math.max(2, startRow);
     const numRows = endRow - actualStart + 1;
     const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
     
     const records = [];
-    const sheetRows = [];
-    const nowStr = formatTimestamp(new Date());
-
     for (let i = 0; i < rawData.length; i++) {
-      const transformed = transformDropoffRow(rawData[i], actualStart + i);
+      const transformed = transformDropoffRow(rawData[i], actualStart + i, hMap);
       if (transformed) {
         records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
       }
-    }
-    
-    if (sheetRows.length > 0) {
-      try {
-        const targetSheet = getTargetSheet();
-        if (targetSheet) {
-          targetSheet.getRange(actualStart, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
-        }
-      } catch(e) {}
     }
     
     if (records.length > 0) {
@@ -643,24 +735,27 @@ function handleOnEdit(e) {
   }
 }
 
+/**
+ * Live Form Submission trigger handler.
+ * Protected by 30s LockService timeout.
+ */
 function handleOnFormSubmit(e) {
-  if (!e || !e.values) {
-    syncRecentDropoffs();
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("handleOnFormSubmit: Lock acquisition timed out (30s). Skipping submit event.");
     return;
   }
-  const lock = LockService.getScriptLock();
-  if (!lock.tryLock(15000)) return;
+
   try {
+    if (!e || !e.values) {
+      syncRecentDropoffs();
+      return;
+    }
     const rowIdx = e.range ? e.range.getRow() : 0;
-    const transformed = transformDropoffRow(e.values, rowIdx);
+    const sheet = e.range ? e.range.getSheet() : getDropoffSheet();
+    const hMap = sheet ? getHeaderIndexMap(sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0]) : null;
+    const transformed = transformDropoffRow(e.values, rowIdx, hMap);
     if (transformed) {
-      try {
-        const targetSheet = getTargetSheet();
-        if (targetSheet && rowIdx > 1) {
-          const sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
-          targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
-        }
-      } catch(e) {}
       upsertDropoffRecords([transformed]);
     }
   } finally {
@@ -677,12 +772,14 @@ function onOpen() {
     SpreadsheetApp.getUi()
       .createMenu("LetzRyd Dropoffs")
       .addItem("Sync All Records (Full)", "syncAllDropoffs")
-      .addItem("Sync Recent Records (1-Min)", "syncRecentDropoffs")
+      .addItem("Sync Recent Records (150 Rows)", "syncRecentDropoffs")
       .addSeparator()
       .addItem("Setup Automated Triggers", "setupTriggers")
       .addItem("Remove Triggers", "removeTriggers")
       .addToUi();
-  } catch(e) {}
+  } catch(e) {
+    Logger.log("onOpen UI notice: " + e.message);
+  }
 }
 
 function removeTriggers() {
@@ -694,18 +791,21 @@ function removeTriggers() {
 }
 
 function setupTriggers() {
+  // Remove existing triggers to avoid duplicate execution
   var triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
     ScriptApp.deleteTrigger(triggers[i]);
   }
   
+  // 1-minute recurring time trigger for sliding window catch-up
   ScriptApp.newTrigger("syncRecentDropoffs")
     .timeBased()
     .everyMinutes(1)
     .create();
     
+  // Install sheet-bound event triggers
   try {
-    var ss = SpreadsheetApp.getActiveSpreadsheet() || getSourceSpreadsheet();
+    var ss = SpreadsheetApp.getActiveSpreadsheet() || getTargetSpreadsheet();
     if (ss) {
       ScriptApp.newTrigger("handleOnEdit")
         .forSpreadsheet(ss)
@@ -718,14 +818,14 @@ function setupTriggers() {
         .create();
     }
   } catch(e) {
-    Logger.log("Notice: Spreadsheet-bound triggers setup: " + e.message);
+    Logger.log("Spreadsheet-bound trigger notice: " + e.message);
   }
 
-  Logger.log("All automated triggers installed successfully (1-minute catch-up + Live OnEdit + OnFormSubmit)!");
+  Logger.log("All automated triggers installed successfully (1-min catch-up + Live OnEdit + OnFormSubmit).");
   try {
     SpreadsheetApp.getUi().alert(
       "Triggers Installed Successfully",
-      "1-minute catch-up sync (syncRecentDropoffs) and real-time triggers are now active!",
+      "1-minute sliding window catch-up sync (syncRecentDropoffs) and real-time triggers are now active.",
       SpreadsheetApp.getUi().ButtonSet.OK
     );
   } catch(e) {}
