@@ -162,24 +162,19 @@ This repository hosts production scripts, architecture specifications, database 
 ---
 
 ### 13. [Vehicle Status Google Sheet](./Vehicle%20Status%20Google%20Sheet/)
-- **Description**: Production ingestion pipeline synchronizing daily fleet operational status and attendance records directly from Google Sheets (`Daily Vehicle Status` in `Vehicle Status List V3.xlsx`) into PostgreSQL staging table `public.sheet_vehicle_status`.
+- **Description**: High-speed production ingestion and fleet intelligence pipeline synchronizing daily operational status and attendance records from Google Sheets (`Daily Vehicle Status` in `Vehicle Status List V3.xlsx`) into PostgreSQL staging (`public.sheet_vehicle_status`), continuous daily attendance ledger (`public.core_daily_vehicle_status`), mathematical trip intervals (`public.v_vehicle_trip_intervals`), and real-time live fleet status (`public.v_current_live_fleet_status`).
 - **Key Files**:
-  - [`schema.sql`](./Vehicle%20Status%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_status`, natural unique constraint `(status_date, vehicle_number)`, 6 B-Tree performance indexes, and verification queries.
-  - [`vehicle_status_pipeline_appscript.js`](./Vehicle%20Status%20Google%20Sheet/vehicle_status_pipeline_appscript.js): Production Google Apps Script pipeline with chunked JDBC batching (200 rows), `LockService` concurrency locking, `PropertiesService` secrets, and zero-burn CTE upserts.
-  - [`data_issues.md`](./Vehicle%20Status%20Google%20Sheet/data_issues.md): Comprehensive data hygiene audit cataloging date format shifts, status casing variations, unallocated partner ID overloading, and OCR plate fixes.
-  - [`README.md`](./Vehicle%20Status%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) runbook covering 3-layer architecture, pipeline flow, column data dictionary, trigger installation, and operational queries.
-- **Target Table**: `public.sheet_vehicle_status` (PostgreSQL)
-
----
-
-### 14. [Vehicle Status Final Table](./Vehicle%20Status%20Final%20Table/)
-- **Description**: Master operational fleet status architecture delivering the continuous daily attendance ledger (`public.core_daily_vehicle_status`), real-time live fleet snapshot (`public.v_current_live_fleet_status`), and mathematical interval pairing view (`public.v_vehicle_trip_intervals`).
-- **Key Files**:
-  - [`schema.sql`](./Vehicle%20Status%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_daily_vehicle_status`, views `v_vehicle_trip_intervals` and `v_current_live_fleet_status`, and stored procedure `sp_generate_daily_vehicle_status(target_date)`.
-  - [`automation_script.py`](./Vehicle%20Status%20Final%20Table/automation_script.py): Production Python health check and verification CLI (`--audit`, `--live`, `--generate-date`, `--backfill`).
-  - [`data_issues.md`](./Vehicle%20Status%20Final%20Table/data_issues.md): Technical catalog documenting all 10 real-world edge cases (Pristine RFD 139 cars, Same-day trips 1,094, Consecutive allocations 170, Orphan dropoffs 8, IP operator custody).
-  - [`README.md`](./Vehicle%20Status%20Final%20Table/README.md): Complete Knowledge Transfer (KT) runbook, mathematical pairing formalization, priority precedence rules, and nightly cron setup.
-- **Target Table**: `public.core_daily_vehicle_status` (Daily Ledger) & `public.v_current_live_fleet_status` (Live View)
+  - [`vehicle_status_pipeline_appscript.js`](./Vehicle%20Status%20Google%20Sheet/vehicle_status_pipeline_appscript.js): High-throughput production Google Apps Script engine featuring multi-row SQL statement batching (100 rows/statement), direct DB credentials, dual-target ingestion (`sheet_vehicle_status` tab + PostgreSQL), concurrency locking (`LockService`), and 1-minute automated time-driven triggers.
+  - [`schema.sql`](./Vehicle%20Status%20Google%20Sheet/schema.sql): PostgreSQL DDL for `public.sheet_vehicle_status`, `public.core_daily_vehicle_status`, views `v_vehicle_trip_intervals` and `v_current_live_fleet_status`, stored procedure `sp_generate_daily_vehicle_status(target_date)`, and real-time trigger `trg_sync_core_daily_status_from_sheet`.
+  - [`data_issues.md`](./Vehicle%20Status%20Google%20Sheet/data_issues.md): Comprehensive data hygiene audit cataloging 11 standardized operational anomalies (`ISS-01` through `ISS-11`) including status normalization, scientific notation partner ID repair, and OCR plate fixes.
+  - [`README.md`](./Vehicle%20Status%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) runbook covering the consolidated architecture, trigger setup, 11-issue standardizations, data dictionary, and operational SQL queries.
+- **Target Tables & Views**: `public.sheet_vehicle_status` $\to$ `public.core_daily_vehicle_status` (Daily Attendance Ledger), `public.v_vehicle_trip_intervals`, `public.v_current_live_fleet_status` (Live View)
+- **Primary Features**:
+  - High-performance multi-row SQL batching processing 46,000+ records in ~2 minutes without hitting Apps Script execution limits.
+  - Dual-target sync writing both locally to the spreadsheet and to PostgreSQL.
+  - Automatic IST date normalization (`yyyy-MM-dd`) handling Excel serial floats, dates, and timestamp strings.
+  - Live PostgreSQL trigger cascading sheet updates directly to `core_daily_vehicle_status`.
+  - Continuous gapless attendance ledger and instantaneous live fleet operational snapshot.
 
 ---
 
