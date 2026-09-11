@@ -218,6 +218,9 @@ BEGIN
         v_neg_bal := 0.00;
     END IF;
 
+    -- Acquire transactional advisory lock for gapless serial ID generation
+    PERFORM pg_advisory_xact_lock(777444555);
+
     -- Fast Index Seek on dropoff_id / source_reference_id / (vehicle_number, return_date)
     SELECT id, data_source, source_reference_id
     INTO v_existing_id, v_existing_source, v_existing_ref
@@ -353,6 +356,9 @@ BEGIN
         v_pending_dues := COALESCE(NEW.pending_dues, 0.00);
         v_damage_pen := COALESCE(NEW.damage_penalty, 0.00);
 
+        -- Acquire transactional advisory lock
+        PERFORM pg_advisory_xact_lock(777444555);
+
         SELECT id, data_source, source_reference_id
         INTO v_existing_id, v_existing_source, v_existing_ref
         FROM public.core_dropoffs
@@ -472,6 +478,9 @@ DECLARE
     v_neg_bal NUMERIC(12,2);
     v_total_liab NUMERIC(12,2);
 BEGIN
+    -- Acquire transactional advisory lock
+    PERFORM pg_advisory_xact_lock(777444555);
+
     -- Step 5.1: Ingest/Upsert from sheet_dropoffs
     FOR r IN (SELECT * FROM public.sheet_dropoffs ORDER BY return_date ASC, dropoff_id ASC) LOOP
         v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(r.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));

@@ -36,6 +36,24 @@ const DB_CONFIG = {
   targetSheetName: "sheet_adjustments"
 };
 
+function getDbConfig() {
+  var props = null;
+  try {
+    props = PropertiesService.getScriptProperties();
+  } catch(e){}
+  
+  return {
+    host: (props && props.getProperty("DB_HOST")) || DB_CONFIG.host,
+    port: (props && props.getProperty("DB_PORT")) || DB_CONFIG.port,
+    database: (props && props.getProperty("DB_NAME")) || DB_CONFIG.database,
+    user: (props && props.getProperty("DB_USER")) || DB_CONFIG.user,
+    password: (props && props.getProperty("DB_PASSWORD")) || DB_CONFIG.password,
+    sourceSpreadsheetUrl: DB_CONFIG.sourceSpreadsheetUrl,
+    sourceSheetName: DB_CONFIG.sourceSheetName,
+    targetSheetName: DB_CONFIG.targetSheetName
+  };
+}
+
 // Standard JDBC SQL Type Codes
 const SQL_TYPES = {
   VARCHAR: 12,
@@ -372,7 +390,7 @@ function sqlStr(val) {
   if (val === null || val === undefined) return "NULL::text";
   var s = String(val).trim();
   if (s === "") return "NULL::text";
-  return "'" + s.replace(/'/g, "''").replace(/\\/g, "\\\\") + "'::text";
+  return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "''") + "'::text";
 }
 
 function sqlNum(val) {
@@ -400,14 +418,15 @@ function sqlTimestamp(val) {
 function upsertAdjustmentRecords(records) {
   if (!records || records.length === 0) return 0;
 
+  var cfg = getDbConfig();
   var conn = null;
   var stmt = null;
-  var url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
+  var url = "jdbc:postgresql://" + cfg.host + ":" + cfg.port + "/" + cfg.database;
   var BATCH_SIZE = 25;
   var totalCount = 0;
 
   try {
-    conn = Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
+    conn = Jdbc.getConnection(url, cfg.user, cfg.password);
     conn.setAutoCommit(false);
     stmt = conn.createStatement();
 
@@ -417,6 +436,10 @@ function upsertAdjustmentRecords(records) {
 
       for (var i = 0; i < chunk.length; i++) {
         var r = chunk[i];
+        var finalStatus = r.final_status;
+        if (!finalStatus) {
+          finalStatus = (r.first_level_status === "Rejected") ? "Rejected" : "Pending";
+        }
         var rowSql = "(" +
           sqlTimestamp(r.submission_timestamp || "CURRENT_TIMESTAMP") + ", " +
           sqlStr(r.submitter_email) + ", " +
@@ -441,7 +464,7 @@ function upsertAdjustmentRecords(records) {
           sqlStr(r.finance_team_status) + ", " +
           sqlStr(r.finance_team_remarks) + ", " +
           sqlStr(r.final_level_approver) + ", " +
-          sqlStr(r.final_status || "Pending") + ", " +
+          sqlStr(finalStatus) + ", " +
           sqlTimestamp(r.final_timestamp) + ", " +
           sqlStr(r.hisaab_week_str) + ", " +
           sqlInt(r.hisaab_week_number) +
@@ -461,7 +484,7 @@ function upsertAdjustmentRecords(records) {
         "  VALUES " + valuesList.join(",\n") + " " +
         "), " +
         "incoming_deduped AS ( " +
-        "  SELECT DISTINCT ON (submission_timestamp, partner_phone, adjustment_date, adjustment_type) * " +
+        "  SELECT DISTINCT ON (submission_timestamp, COALESCE(partner_phone, 'NO_PHONE'), adjustment_date, adjustment_type) * " +
         "  FROM incoming " +
         "), " +
         "upd AS ( " +
@@ -477,7 +500,7 @@ function upsertAdjustmentRecords(records) {
         "    updated_at = CURRENT_TIMESTAMP " +
         "  FROM incoming_deduped i " +
         "  WHERE t.submission_timestamp = i.submission_timestamp " +
-        "    AND t.partner_phone = i.partner_phone " +
+        "    AND t.partner_phone IS NOT DISTINCT FROM i.partner_phone " +
         "    AND t.adjustment_date = i.adjustment_date " +
         "    AND t.adjustment_type = i.adjustment_type " +
         "  RETURNING t.submission_timestamp, t.partner_phone, t.adjustment_date, t.adjustment_type " +
@@ -501,7 +524,7 @@ function upsertAdjustmentRecords(records) {
         "WHERE NOT EXISTS ( " +
         "  SELECT 1 FROM upd u " +
         "  WHERE u.submission_timestamp = i.submission_timestamp " +
-        "    AND u.partner_phone = i.partner_phone " +
+        "    AND u.partner_phone IS NOT DISTINCT FROM i.partner_phone " +
         "    AND u.adjustment_date = i.adjustment_date " +
         "    AND u.adjustment_type = i.adjustment_type " +
         ");";
@@ -538,31 +561,39 @@ function handleOnEdit(e) {
   // Restrict live edit handling strictly to raw source form tab. Never process edits on target sheet_adjustments tab.
   if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase()) return;
   
-  var startRow = e.range.getRow();
-  var endRow = e.range.getLastRow();
-  if (startRow <= 1 && endRow <= 1) return;
-  
-  var actualStart = Math.max(2, startRow);
-  var numRows = endRow - actualStart + 1;
-  var rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
-  
-  var records = [];
-  var targetSheet = getTargetSheet();
-  var nowStr = formatTimestamp(new Date());
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    var startRow = e.range.getRow();
+    var endRow = e.range.getLastRow();
+    if (startRow <= 1 && endRow <= 1) return;
+    
+    var actualStart = Math.max(2, startRow);
+    var numRows = endRow - actualStart + 1;
+    var rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
+    
+    var records = [];
+    var sheetRows = [];
+    var targetSheet = getTargetSheet();
+    var nowStr = formatTimestamp(new Date());
 
-  for (var i = 0; i < rawData.length; i++) {
-    var transformed = transformAdjustmentRow(rawData[i], actualStart + i);
-    if (transformed) {
-      records.push(transformed);
-      if (targetSheet) {
-        var sheetRow = formatRecordForSheet(transformed, nowStr);
-        targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
+    for (var i = 0; i < rawData.length; i++) {
+      var transformed = transformAdjustmentRow(rawData[i], actualStart + i);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
       }
     }
-  }
-  
-  if (records.length > 0) {
-    upsertAdjustmentRecords(records);
+    
+    if (sheetRows.length > 0 && targetSheet) {
+      targetSheet.getRange(actualStart, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+    }
+    
+    if (records.length > 0) {
+      upsertAdjustmentRecords(records);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -571,15 +602,21 @@ function handleOnEdit(e) {
  */
 function handleOnFormSubmit(e) {
   if (!e || !e.values) return;
-  var rowIdx = e.range ? e.range.getRow() : 0;
-  var transformed = transformAdjustmentRow(e.values, rowIdx);
-  if (transformed) {
-    var targetSheet = getTargetSheet();
-    if (targetSheet && rowIdx > 1) {
-      var sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
-      targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) return;
+  try {
+    var rowIdx = e.range ? e.range.getRow() : 0;
+    var transformed = transformAdjustmentRow(e.values, rowIdx);
+    if (transformed) {
+      var targetSheet = getTargetSheet();
+      if (targetSheet && rowIdx > 1) {
+        var sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
+        targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
+      }
+      upsertAdjustmentRecords([transformed]);
     }
-    upsertAdjustmentRecords([transformed]);
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -605,43 +642,46 @@ function getTrueLastRow(sheet) {
  * 1-Minute Time-Driven Catch-Up Sync for Recent Submissions
  */
 function syncRecentAdjustments() {
-  var sourceSheet = getSourceSheet();
-  var trueLastRow = getTrueLastRow(sourceSheet);
-  if (trueLastRow <= 1) return;
-  
-  var WINDOW_SIZE = 100;
-  var startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
-  var numRows = trueLastRow - startRow + 1;
-  
-  var data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
-  var records = [];
-  var sheetRows = [];
-  var nowStr = formatTimestamp(new Date());
-
-  for (var i = 0; i < data.length; i++) {
-    var transformed = transformAdjustmentRow(data[i], startRow + i);
-    if (transformed) {
-      records.push(transformed);
-      sheetRows.push({
-        rowNum: startRow + i,
-        values: formatRecordForSheet(transformed, nowStr)
-      });
-    }
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    Logger.log("Another sync is currently in progress. Skipping 1-min catch-up.");
+    return;
   }
-  
-  if (records.length > 0) {
-    // 1. Sync recent rows to clean target sheet tab
-    var targetSheet = getTargetSheet();
-    if (targetSheet) {
-      for (var j = 0; j < sheetRows.length; j++) {
-        var r = sheetRows[j];
-        targetSheet.getRange(r.rowNum, 1, 1, r.values.length).setValues([r.values]);
+  try {
+    var sourceSheet = getSourceSheet();
+    var trueLastRow = getTrueLastRow(sourceSheet);
+    if (trueLastRow <= 1) return;
+    
+    var WINDOW_SIZE = 100;
+    var startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
+    var numRows = trueLastRow - startRow + 1;
+    
+    var data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
+    var records = [];
+    var sheetRows = [];
+    var nowStr = formatTimestamp(new Date());
+
+    for (var i = 0; i < data.length; i++) {
+      var transformed = transformAdjustmentRow(data[i], startRow + i);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
       }
     }
+    
+    if (records.length > 0) {
+      // 1. Sync recent rows to clean target sheet tab in a single batch write
+      var targetSheet = getTargetSheet();
+      if (targetSheet && sheetRows.length > 0) {
+        targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+      }
 
-    // 2. Sync to PostgreSQL
-    upsertAdjustmentRecords(records);
-    Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent adjustment records in sheet & database.");
+      // 2. Sync to PostgreSQL
+      upsertAdjustmentRecords(records);
+      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent adjustment records in sheet & database.");
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -649,42 +689,51 @@ function syncRecentAdjustments() {
  * Full Manual Backfill Synchronization
  */
 function syncAllAdjustments() {
-  var sourceSheet = getSourceSheet();
-  var data = sourceSheet.getDataRange().getValues();
-  Logger.log("Read " + data.length + " total rows from source tab '" + sourceSheet.getName() + "'");
-  
-  if (data.length <= 1) {
-    Logger.log("Source tab contains no data rows yet.");
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("Another full sync is already running. Please wait.");
     return;
   }
-  
-  var records = [];
-  var sheetRows = [];
-  var nowStr = formatTimestamp(new Date());
-
-  for (var i = 1; i < data.length; i++) {
-    var transformed = transformAdjustmentRow(data[i], i + 1);
-    if (transformed) {
-      records.push(transformed);
-      sheetRows.push(formatRecordForSheet(transformed, nowStr));
+  try {
+    var sourceSheet = getSourceSheet();
+    var data = sourceSheet.getDataRange().getValues();
+    Logger.log("Read " + data.length + " total rows from source tab '" + sourceSheet.getName() + "'");
+    
+    if (data.length <= 1) {
+      Logger.log("Source tab contains no data rows yet.");
+      return;
     }
-  }
-  
-  Logger.log("Transformed " + records.length + " valid adjustment records.");
-  
-  // 1. Write clean standardized rows to targetSheet in chunks of 500
-  var targetSheet = getTargetSheet();
-  var CHUNK_SIZE = 500;
-  for (var s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
-    var sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
-    targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
-  }
-  Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+    
+    var records = [];
+    var sheetRows = [];
+    var nowStr = formatTimestamp(new Date());
 
-  // 2. Batch upsert into PostgreSQL using single-connection multi-row inserts
-  Logger.log("Starting PostgreSQL upsert for " + records.length + " adjustment records...");
-  var totalUpserted = upsertAdjustmentRecords(records);
-  Logger.log("Completed syncAllAdjustments! Total records synced to DB: " + totalUpserted);
+    for (var i = 1; i < data.length; i++) {
+      var transformed = transformAdjustmentRow(data[i], i + 1);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
+      }
+    }
+    
+    Logger.log("Transformed " + records.length + " valid adjustment records.");
+    
+    // 1. Write clean standardized rows to targetSheet in chunks of 500
+    var targetSheet = getTargetSheet();
+    var CHUNK_SIZE = 500;
+    for (var s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
+      var sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
+      targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
+    }
+    Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+
+    // 2. Batch upsert into PostgreSQL using single-connection multi-row inserts
+    Logger.log("Starting PostgreSQL upsert for " + records.length + " adjustment records...");
+    var totalUpserted = upsertAdjustmentRecords(records);
+    Logger.log("Completed syncAllAdjustments! Total records synced to DB: " + totalUpserted);
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 // =============================================================================

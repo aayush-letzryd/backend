@@ -44,7 +44,8 @@ CREATE TABLE IF NOT EXISTS public.sheet_adjustments (
     hisaab_week_str VARCHAR(255),
     hisaab_week_number INTEGER,
     ingested_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    CONSTRAINT chk_sheet_adjustments_amount CHECK (amount >= 0.00)
 );
 
 -- Unique index ensuring NULL partner_phones do NOT create duplicate rows
@@ -93,7 +94,8 @@ CREATE TABLE IF NOT EXISTS public.core_adjustments (
     is_deleted BOOLEAN DEFAULT FALSE,
     deleted_at TIMESTAMP WITHOUT TIME ZONE,
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    CONSTRAINT chk_core_adjustments_amount CHECK (amount >= 0.00)
 );
 
 -- Indexes for core_adjustments
@@ -182,10 +184,10 @@ BEGIN
     WHERE adjustment_id = 'ADJ-SHT-' || NEW.id::TEXT
        OR source_reference_id = 'ADJ-SHT-' || NEW.id::TEXT
        OR source_reference_id = NEW.id::TEXT
-       OR source_reference_id LIKE '%,' || NEW.id::TEXT || '%'
-       OR source_reference_id LIKE NEW.id::TEXT || ',%'
+       OR NEW.id::TEXT = ANY(string_to_array(source_reference_id, ','))
+       OR ('ADJ-SHT-' || NEW.id::TEXT) = ANY(string_to_array(source_reference_id, ','))
        OR (
-           (v_clean_phone != '' AND partner_phone = v_clean_phone)
+           ((v_clean_phone != '' AND partner_phone = v_clean_phone) OR (v_clean_phone = '' AND (partner_phone IS NULL OR partner_phone = '') AND v_clean_veh != '' AND vehicle_number = v_clean_veh))
            AND (v_clean_veh != '' AND vehicle_number = v_clean_veh)
            AND adjustment_date = NEW.adjustment_date
            AND amount = NEW.amount
@@ -220,7 +222,7 @@ BEGIN
             photo_url = COALESCE(NEW.photo_url, core_adjustments.photo_url),
             data_source = CASE WHEN v_existing_source = 'PORTAL_FORM' THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
             source_reference_id = CASE 
-                WHEN v_existing_ref IS NOT NULL AND v_existing_ref NOT LIKE '%' || NEW.id::TEXT || '%' 
+                WHEN v_existing_ref IS NOT NULL AND NOT (NEW.id::TEXT = ANY(string_to_array(v_existing_ref, ',')))
                 THEN v_existing_ref || ',' || NEW.id::TEXT 
                 ELSE COALESCE(v_existing_ref, NEW.id::TEXT) 
             END,
@@ -355,12 +357,14 @@ BEGIN
     INTO v_existing_id, v_existing_source, v_existing_ref
     FROM public.core_adjustments
     WHERE (
-        (v_clean_phone != '' AND partner_phone = v_clean_phone)
+        ((v_clean_phone != '' AND partner_phone = v_clean_phone) OR (v_clean_phone = '' AND (partner_phone IS NULL OR partner_phone = '') AND v_clean_veh != '' AND vehicle_number = v_clean_veh))
         AND (v_clean_veh != '' AND vehicle_number = v_clean_veh)
         AND adjustment_date = v_adj_date
         AND amount = v_amount
         AND adjustment_type = v_adj_type
     ) OR source_reference_id = 'ADJ-PORTAL-' || NEW.id::TEXT
+      OR NEW.id::TEXT = ANY(string_to_array(source_reference_id, ','))
+      OR ('ADJ-PORTAL-' || NEW.id::TEXT) = ANY(string_to_array(source_reference_id, ','))
     ORDER BY CASE WHEN source_reference_id = 'ADJ-PORTAL-' || NEW.id::TEXT THEN 1 ELSE 2 END
     LIMIT 1;
 
@@ -384,7 +388,7 @@ BEGIN
             cost_level = COALESCE(NEW.cost_level, core_adjustments.cost_level),
             data_source = CASE WHEN v_existing_source = 'GOOGLE_SHEET' THEN 'MERGED' ELSE 'PORTAL_FORM' END,
             source_reference_id = CASE 
-                WHEN v_existing_ref IS NOT NULL AND v_existing_ref NOT LIKE '%ADJ-PORTAL-' || NEW.id::TEXT || '%' 
+                WHEN v_existing_ref IS NOT NULL AND NOT (('ADJ-PORTAL-' || NEW.id::TEXT) = ANY(string_to_array(v_existing_ref, ',')))
                 THEN v_existing_ref || ',ADJ-PORTAL-' || NEW.id::TEXT 
                 ELSE COALESCE(v_existing_ref, 'ADJ-PORTAL-' || NEW.id::TEXT) 
             END,
@@ -512,12 +516,14 @@ BEGIN
         INTO v_existing_id, v_existing_source, v_existing_ref
         FROM public.core_adjustments
         WHERE (
-            (v_clean_phone != '' AND partner_phone = v_clean_phone)
+            ((v_clean_phone != '' AND partner_phone = v_clean_phone) OR (v_clean_phone = '' AND (partner_phone IS NULL OR partner_phone = '') AND v_clean_veh != '' AND vehicle_number = v_clean_veh))
             AND (v_clean_veh != '' AND vehicle_number = v_clean_veh)
             AND adjustment_date = r.adjustment_date
             AND amount = r.amount
             AND adjustment_type = r.adjustment_type
         ) OR source_reference_id = 'ADJ-SHT-' || r.id::TEXT
+          OR r.id::TEXT = ANY(string_to_array(source_reference_id, ','))
+          OR ('ADJ-SHT-' || r.id::TEXT) = ANY(string_to_array(source_reference_id, ','))
         LIMIT 1;
 
         IF v_existing_id IS NOT NULL THEN
@@ -536,7 +542,7 @@ BEGIN
                 photo_url = COALESCE(r.photo_url, core_adjustments.photo_url),
                 data_source = CASE WHEN v_existing_source = 'PORTAL_FORM' THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
                 source_reference_id = CASE 
-                    WHEN v_existing_ref IS NOT NULL AND v_existing_ref NOT LIKE '%ADJ-SHT-' || r.id::TEXT || '%' 
+                    WHEN v_existing_ref IS NOT NULL AND NOT (r.id::TEXT = ANY(string_to_array(v_existing_ref, ',')))
                     THEN v_existing_ref || ',ADJ-SHT-' || r.id::TEXT 
                     ELSE COALESCE(v_existing_ref, 'ADJ-SHT-' || r.id::TEXT) 
                 END,
@@ -632,12 +638,14 @@ BEGIN
             INTO v_existing_id, v_existing_source, v_existing_ref
             FROM public.core_adjustments
             WHERE (
-                (v_clean_phone != '' AND partner_phone = v_clean_phone)
+                ((v_clean_phone != '' AND partner_phone = v_clean_phone) OR (v_clean_phone = '' AND (partner_phone IS NULL OR partner_phone = '') AND v_clean_veh != '' AND vehicle_number = v_clean_veh))
                 AND (v_clean_veh != '' AND vehicle_number = v_clean_veh)
                 AND adjustment_date = v_adj_date
                 AND amount = v_amount
                 AND adjustment_type = v_adj_type
             ) OR source_reference_id = 'ADJ-PORTAL-' || r.id::TEXT
+              OR r.id::TEXT = ANY(string_to_array(source_reference_id, ','))
+              OR ('ADJ-PORTAL-' || r.id::TEXT) = ANY(string_to_array(source_reference_id, ','))
             LIMIT 1;
 
             IF v_existing_id IS NOT NULL THEN
@@ -659,7 +667,7 @@ BEGIN
                     cost_level = COALESCE(r.cost_level, core_adjustments.cost_level),
                     data_source = CASE WHEN v_existing_source = 'GOOGLE_SHEET' THEN 'MERGED' ELSE 'PORTAL_FORM' END,
                     source_reference_id = CASE 
-                        WHEN v_existing_ref IS NOT NULL AND v_existing_ref NOT LIKE '%ADJ-PORTAL-' || r.id::TEXT || '%' 
+                        WHEN v_existing_ref IS NOT NULL AND NOT (('ADJ-PORTAL-' || r.id::TEXT) = ANY(string_to_array(v_existing_ref, ',')))
                         THEN v_existing_ref || ',ADJ-PORTAL-' || r.id::TEXT 
                         ELSE COALESCE(v_existing_ref, 'ADJ-PORTAL-' || r.id::TEXT) 
                     END,
@@ -748,7 +756,7 @@ $$ LANGUAGE plpgsql;
 -- 6. ONE-TIME MIGRATION & RECONCILIATION SCRIPT FOR ADJUSTMENTS
 -- ------------------------------------------------------------------------------
 
--- Fix 6.1: Cleanly deduplicate cross-source duplicate rows in core_adjustments
+-- Fix 6.1: Cleanly deduplicate exact duplicate rows in core_adjustments
 WITH ranked AS (
     SELECT id, partner_phone, vehicle_number, adjustment_date, amount, adjustment_type,
            ROW_NUMBER() OVER (PARTITION BY partner_phone, vehicle_number, adjustment_date, amount, adjustment_type ORDER BY 
@@ -764,4 +772,25 @@ SET is_deleted = TRUE,
     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 FROM ranked r
 WHERE c.id = r.id AND r.rn > 1;
+
+-- Fix 6.2: Cleanly deduplicate legacy 1-day date-shifted duplicate rows (timezone ingestion artifact)
+WITH date_shift_dupes AS (
+    SELECT c2.id
+    FROM public.core_adjustments c1
+    JOIN public.core_adjustments c2
+      ON c1.partner_phone = c2.partner_phone
+     AND c1.vehicle_number = c2.vehicle_number
+     AND c1.amount = c2.amount
+     AND c1.adjustment_type = c2.adjustment_type
+     AND ABS(c1.adjustment_date - c2.adjustment_date) = 1
+     AND c1.id < c2.id
+    WHERE c1.is_deleted = FALSE AND c2.is_deleted = FALSE
+      AND c1.partner_phone IS NOT NULL AND c1.partner_phone != ''
+)
+UPDATE public.core_adjustments
+SET is_deleted = TRUE,
+    deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE id IN (SELECT id FROM date_shift_dupes);
+
 

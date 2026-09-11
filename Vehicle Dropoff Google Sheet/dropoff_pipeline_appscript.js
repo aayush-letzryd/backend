@@ -26,11 +26,11 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 const DB_CONFIG = {
-  host: "YOUR_DB_HOST_HERE",
+  host: "35.200.196.113",
   port: "5432",
   database: "postgres",
   user: "postgres",
-  password: "YOUR_DB_PASSWORD_HERE",
+  password: "8S5]U3@L^Xz)\\FH}",
   
   // Original Pan India Master Sheet (same source as Adjustments pipeline)
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
@@ -314,7 +314,7 @@ function sqlStr(val) {
   if (val === null || val === undefined) return "NULL::text";
   var s = String(val).trim();
   if (s === "" || s.toUpperCase() === "NULL") return "NULL::text";
-  return "'" + s.replace(/'/g, "''").replace(/\\/g, "\\\\") + "'::text";
+  return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "''") + "'::text";
 }
 
 function sqlNum(val) {
@@ -419,12 +419,11 @@ function upsertDropoffRecords(records) {
   
   var conn = null;
   var stmt = null;
-  var url = "jdbc:postgresql://" + DB_CONFIG.host + ":" + DB_CONFIG.port + "/" + DB_CONFIG.database;
   var BATCH_SIZE = 50;
   var totalCount = 0;
   
   try {
-    conn = Jdbc.getConnection(url, DB_CONFIG.user, DB_CONFIG.password);
+    conn = getConnection();
     conn.setAutoCommit(false);
     stmt = conn.createStatement();
     
@@ -489,98 +488,110 @@ function upsertDropoffRecords(records) {
 // =============================================================================
 
 function syncAllDropoffs() {
-  const sourceSheet = getSourceSheet();
-  const data = sourceSheet.getDataRange().getValues();
-  Logger.log("Read " + data.length + " total rows from source tab '" + sourceSheet.getName() + "'");
-  
-  if (data.length <= 1) {
-    Logger.log("Source tab contains no data rows yet.");
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    Logger.log("Another sync is currently in progress. Skipping execution.");
     return;
   }
-  
-  const records = [];
-  const sheetRows = [];
-  const nowStr = formatTimestamp(new Date());
-
-  for (let i = 1; i < data.length; i++) {
-    const transformed = transformDropoffRow(data[i], i + 1);
-    if (transformed) {
-      records.push(transformed);
-      sheetRows.push(formatRecordForSheet(transformed, nowStr));
-    }
-  }
-  
-  Logger.log("Transformed " + records.length + " valid dropoff records.");
-  
-  // 1. Write clean standardized rows to target tab in chunks of 500
   try {
-    const targetSheet = getTargetSheet();
-    if (targetSheet && sheetRows.length > 0) {
-      const targetDataRange = targetSheet.getDataRange();
-      if (targetDataRange.getLastRow() > 1) {
-        targetSheet.getRange(2, 1, targetDataRange.getLastRow() - 1, targetSheet.getLastColumn()).clearContent();
-      }
-      const CHUNK_SIZE = 500;
-      for (let s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
-        const sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
-        targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
-      }
-      Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+    const sourceSheet = getSourceSheet();
+    const data = sourceSheet.getDataRange().getValues();
+    Logger.log("Read " + data.length + " total rows from source tab '" + sourceSheet.getName() + "'");
+    
+    if (data.length <= 1) {
+      Logger.log("Source tab contains no data rows yet.");
+      return;
     }
-  } catch(e) {
-    Logger.log("Notice on target sheet write: " + e.message);
-  }
+    
+    const records = [];
+    const sheetRows = [];
+    const nowStr = formatTimestamp(new Date());
 
-  // 2. Batch upsert into PostgreSQL (Multi-row SQL statements)
-  Logger.log("Starting PostgreSQL upsert for " + records.length + " records...");
-  const totalUpserted = upsertDropoffRecords(records);
-  Logger.log("Completed syncAllDropoffs! Total records synced to DB: " + totalUpserted);
-  
-  try {
-    if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getActiveSpreadsheet()) {
-      SpreadsheetApp.getActiveSpreadsheet().toast(`Successfully synced ${totalUpserted} dropoffs to database!`, 'Sync Complete', 5);
+    for (let i = 1; i < data.length; i++) {
+      const transformed = transformDropoffRow(data[i], i + 1);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
+      }
     }
-  } catch(e){}
+    
+    Logger.log("Transformed " + records.length + " valid dropoff records.");
+    
+    // 1. Write clean standardized rows to target tab in chunks of 500
+    try {
+      const targetSheet = getTargetSheet();
+      if (targetSheet && sheetRows.length > 0) {
+        const targetDataRange = targetSheet.getDataRange();
+        if (targetDataRange.getLastRow() > 1) {
+          targetSheet.getRange(2, 1, targetDataRange.getLastRow() - 1, targetSheet.getLastColumn()).clearContent();
+        }
+        const CHUNK_SIZE = 500;
+        for (let s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
+          const sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
+          targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
+        }
+        Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+      }
+    } catch(e) {
+      Logger.log("Notice on target sheet write: " + e.message);
+    }
+
+    // 2. Batch upsert into PostgreSQL (Multi-row SQL statements)
+    Logger.log("Starting PostgreSQL upsert for " + records.length + " records...");
+    const totalUpserted = upsertDropoffRecords(records);
+    Logger.log("Completed syncAllDropoffs! Total records synced to DB: " + totalUpserted);
+    
+    try {
+      if (typeof SpreadsheetApp !== 'undefined' && SpreadsheetApp.getActiveSpreadsheet()) {
+        SpreadsheetApp.getActiveSpreadsheet().toast(`Successfully synced ${totalUpserted} dropoffs to database!`, 'Sync Complete', 5);
+      }
+    } catch(e){}
+  } finally {
+    lock.releaseLock();
+  }
 }
 
 function syncRecentDropoffs() {
-  const sourceSheet = getSourceSheet();
-  const lastRow = sourceSheet.getLastRow();
-  if (lastRow <= 1) return;
-  
-  const WINDOW_SIZE = 150;
-  const startRow = Math.max(2, lastRow - WINDOW_SIZE + 1);
-  const numRows = lastRow - startRow + 1;
-  
-  const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
-  const records = [];
-  const sheetRows = [];
-  const nowStr = formatTimestamp(new Date());
-
-  for (let i = 0; i < data.length; i++) {
-    const transformed = transformDropoffRow(data[i], startRow + i);
-    if (transformed) {
-      records.push(transformed);
-      sheetRows.push({
-        rowNum: startRow + i,
-        values: formatRecordForSheet(transformed, nowStr)
-      });
-    }
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) {
+    Logger.log("Another sync is running. Skipping recent sync.");
+    return;
   }
-  
-  if (records.length > 0) {
-    try {
-      const targetSheet = getTargetSheet();
-      if (targetSheet) {
-        for (let j = 0; j < sheetRows.length; j++) {
-          const r = sheetRows[j];
-          targetSheet.getRange(r.rowNum, 1, 1, r.values.length).setValues([r.values]);
-        }
-      }
-    } catch(e) {}
+  try {
+    const sourceSheet = getSourceSheet();
+    const lastRow = sourceSheet.getLastRow();
+    if (lastRow <= 1) return;
+    
+    const WINDOW_SIZE = 150;
+    const startRow = Math.max(2, lastRow - WINDOW_SIZE + 1);
+    const numRows = lastRow - startRow + 1;
+    
+    const data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
+    const records = [];
+    const sheetRows = [];
+    const nowStr = formatTimestamp(new Date());
 
-    upsertDropoffRecords(records);
-    Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent dropoff records.");
+    for (let i = 0; i < data.length; i++) {
+      const transformed = transformDropoffRow(data[i], startRow + i);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
+      }
+    }
+    
+    if (records.length > 0) {
+      try {
+        const targetSheet = getTargetSheet();
+        if (targetSheet && sheetRows.length > 0) {
+          targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+        }
+      } catch(e) {}
+
+      upsertDropoffRecords(records);
+      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent dropoff records.");
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -591,34 +602,44 @@ function handleOnEdit(e) {
   if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase() && sName.indexOf("dropoff") === -1 && sName.indexOf("drop off") === -1) {
     return;
   }
-  
-  const startRow = e.range.getRow();
-  const endRow = e.range.getLastRow();
-  if (startRow <= 1 && endRow <= 1) return;
-  
-  const actualStart = Math.max(2, startRow);
-  const numRows = endRow - actualStart + 1;
-  const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
-  
-  const records = [];
-  const nowStr = formatTimestamp(new Date());
 
-  for (let i = 0; i < rawData.length; i++) {
-    const transformed = transformDropoffRow(rawData[i], actualStart + i);
-    if (transformed) {
-      records.push(transformed);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(10000)) return;
+  try {
+    const startRow = e.range.getRow();
+    const endRow = e.range.getLastRow();
+    if (startRow <= 1 && endRow <= 1) return;
+    
+    const actualStart = Math.max(2, startRow);
+    const numRows = endRow - actualStart + 1;
+    const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
+    
+    const records = [];
+    const sheetRows = [];
+    const nowStr = formatTimestamp(new Date());
+
+    for (let i = 0; i < rawData.length; i++) {
+      const transformed = transformDropoffRow(rawData[i], actualStart + i);
+      if (transformed) {
+        records.push(transformed);
+        sheetRows.push(formatRecordForSheet(transformed, nowStr));
+      }
+    }
+    
+    if (sheetRows.length > 0) {
       try {
         const targetSheet = getTargetSheet();
         if (targetSheet) {
-          const sheetRow = formatRecordForSheet(transformed, nowStr);
-          targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
+          targetSheet.getRange(actualStart, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
         }
       } catch(e) {}
     }
-  }
-  
-  if (records.length > 0) {
-    upsertDropoffRecords(records);
+    
+    if (records.length > 0) {
+      upsertDropoffRecords(records);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
@@ -627,17 +648,23 @@ function handleOnFormSubmit(e) {
     syncRecentDropoffs();
     return;
   }
-  const rowIdx = e.range ? e.range.getRow() : 0;
-  const transformed = transformDropoffRow(e.values, rowIdx);
-  if (transformed) {
-    try {
-      const targetSheet = getTargetSheet();
-      if (targetSheet && rowIdx > 1) {
-        const sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
-        targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
-      }
-    } catch(e) {}
-    upsertDropoffRecords([transformed]);
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(15000)) return;
+  try {
+    const rowIdx = e.range ? e.range.getRow() : 0;
+    const transformed = transformDropoffRow(e.values, rowIdx);
+    if (transformed) {
+      try {
+        const targetSheet = getTargetSheet();
+        if (targetSheet && rowIdx > 1) {
+          const sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
+          targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
+        }
+      } catch(e) {}
+      upsertDropoffRecords([transformed]);
+    }
+  } finally {
+    lock.releaseLock();
   }
 }
 
