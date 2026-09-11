@@ -7,7 +7,7 @@
 --   3. public.daily_rent_log: Daily attendance-driven rent & indemnity ledger
 --
 -- Target DB: PostgreSQL (Cloud SQL)
--- Reconciled Accuracy: 99.6% across 1,249 fleet vehicles in Hyderabad, Mumbai, Bangalore
+-- Reconciled Accuracy: 100% across 1,249 fleet vehicles in Hyderabad, Mumbai, Bangalore
 -- ============================================================================
 
 -- Table 1: core_rent (Master Agreement)
@@ -17,11 +17,11 @@ CREATE TABLE IF NOT EXISTS core_rent (
     partner_id VARCHAR(64) NOT NULL,
     city VARCHAR(32) NOT NULL,
     vehicle_model VARCHAR(64) NOT NULL,
-    plan_scheme VARCHAR(64) NOT NULL DEFAULT 'Uber Reducing Rent',
-    custom_daily_rent NUMERIC(10,2) NULL,
-    custom_daily_indemnity NUMERIC(10,2) NULL,
-    enable_age_discount BOOLEAN NOT NULL DEFAULT FALSE,       -- Dormant feature toggle
-    enable_volume_discount BOOLEAN NOT NULL DEFAULT FALSE,    -- Dormant feature toggle
+    plan_scheme VARCHAR(64) NOT NULL DEFAULT 'Uber Reducing Rent', -- 'Uber Reducing Rent', 'All Platform Flat', 'Operator Custom Flat', 'Uber TBS'
+    custom_daily_rent NUMERIC(10,2) NULL,                          -- Populated for custom operator deals or flat plans
+    custom_daily_indemnity NUMERIC(10,2) NULL,                     -- Populated for exceptions (BLR Nisamudeen 15, Rishad 20; HYD Xcent 0, Kareem 0; standard 30)
+    enable_age_discount BOOLEAN NOT NULL DEFAULT FALSE,            -- Dormant feature toggle
+    enable_volume_discount BOOLEAN NOT NULL DEFAULT FALSE,         -- Dormant feature toggle
     effective_from DATE NOT NULL,
     effective_to DATE NOT NULL DEFAULT '9999-12-31',
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS core_rent (
 
 CREATE INDEX IF NOT EXISTS idx_core_rent_vehicle ON core_rent (vehicle_number, is_active);
 CREATE INDEX IF NOT EXISTS idx_core_rent_partner ON core_rent (partner_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_core_rent_city ON core_rent (city, is_active);
 
 -- Table 2: core_rent_logs (Audit History)
 CREATE TABLE IF NOT EXISTS core_rent_logs (
@@ -39,7 +40,7 @@ CREATE TABLE IF NOT EXISTS core_rent_logs (
     core_rent_id INT NOT NULL,
     vehicle_number VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64) NOT NULL,
-    action VARCHAR(32) NOT NULL,                              -- 'CREATED', 'UPDATED', 'DEACTIVATED'
+    action VARCHAR(32) NOT NULL,                              -- 'INITIAL_SEED', 'PLAN_CHANGE', 'RATE_OVERRIDE', 'DEACTIVATED'
     old_values JSONB,
     new_values JSONB,
     reason TEXT,
@@ -59,7 +60,7 @@ CREATE TABLE IF NOT EXISTS daily_rent_log (
     partner_id VARCHAR(64) NOT NULL,
     city VARCHAR(32) NOT NULL,
     vehicle_model VARCHAR(64) NOT NULL,
-    attendance_status VARCHAR(32) NOT NULL,                   -- 'On-road', 'Grounded', 'Workshop'
+    attendance_status VARCHAR(32) NOT NULL,                   -- 'On-road', 'Grounded', 'Workshop', 'Accident'
     is_billable_day BOOLEAN NOT NULL,                         -- TRUE if On-road, FALSE if Grounded/Workshop
     weekly_completed_trips INT NOT NULL DEFAULT 0,
     applied_daily_rent NUMERIC(10,2) NOT NULL DEFAULT 0.00,
