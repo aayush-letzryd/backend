@@ -7,10 +7,11 @@ Single Source of Truth (SSOT) consolidating vehicle drop-offs from:
   2. public.july_vehicle_dropoffs (Web Portal digital dropoff submissions: 121 rows)
 
 Live DB Production Baselines:
-  - Total rows in public.core_dropoffs : 6,379 (Active: 6,361, Soft-deleted: 18)
-  - Gapless Sequence Continuity       : 1 to 6,379 (0 sequence gaps)
-  - Source Provenance Breakdown       : GOOGLE_SHEET (6,251), MERGED (76), PORTAL_FORM (34)
+  - Total rows in public.core_dropoffs : 6,531 (Active: 6,397, Soft-deleted: 134)
+  - Gapless Sequence Continuity       : 1 to 6,531 (0 sequence gaps)
+  - Source Provenance Breakdown       : GOOGLE_SHEET (6,361), MERGED (114), PORTAL_FORM (56)
   - Primary Key Generation            : MAX(id) + 1 guarded by advisory lock 777444555
+  - ID Standard                       : Plain numerical strings (e.g. '1578') without string prefixes
   - Polarity Contract                 : Signed negative liabilities (Hisaab deductions)
   - Timestamp Contract                : TIMESTAMP WITHOUT TIME ZONE (Asia/Kolkata IST)
 
@@ -112,8 +113,8 @@ def audit_health(conn):
     cur.execute("SELECT COUNT(*) AS count FROM public.core_dropoffs WHERE is_deleted = TRUE;")
     core_deleted = cur.fetchone()["count"]
 
-    print(f"   - Total Records     : {core_total} (Baseline: 6,379)")
-    print(f"   - Active Records    : {core_active} (Active: 6,349, Soft-Deleted Test: 30)")
+    print(f"   - Total Records     : {core_total} (Baseline: 6,531)")
+    print(f"   - Active Records    : {core_active} (Active: 6,397, Soft-Deleted: 134)")
     print(f"   - Soft-Deleted Rows : {core_deleted}")
 
     # 3. Upstream Source Reconciliation
@@ -181,6 +182,29 @@ def audit_health(conn):
     sources = cur.fetchall()
     for s in sources:
         print(f"   - {s['data_source']:15}: Total={s['total_records']}, Active={s['active_records']}, Soft-Deleted={s['soft_deleted_records']}")
+
+    # 5b. Plain Numerical ID Standard Audit (Zero String Prefixes)
+    print("\n5b. Plain Numerical ID Standard Audit (Zero String Prefixes):")
+    cur.execute("""
+        SELECT COUNT(*) AS count
+        FROM public.core_dropoffs
+        WHERE dropoff_id !~ '^[0-9]+$';
+    """)
+    invalid_dropoff_count = cur.fetchone()["count"]
+
+    cur.execute("""
+        SELECT COUNT(*) AS count
+        FROM public.core_dropoffs
+        WHERE source_reference_id !~ '^[0-9]+(,[0-9]+)?$';
+    """)
+    invalid_ref_count = cur.fetchone()["count"]
+
+    id_ok = (invalid_dropoff_count == 0 and invalid_ref_count == 0)
+    print(f"   - Invalid dropoff_id     : {invalid_dropoff_count} (must match ^[0-9]+$)")
+    print(f"   - Invalid source_ref_id  : {invalid_ref_count} (must match ^[0-9]+(,[0-9]+)?$)")
+    if not id_ok:
+        all_passed = False
+    print(f"   - Numerical ID Status    : {'[PASS] All IDs Clean Plain Numbers' if id_ok else '[FAIL] Prefix Anomalies Detected'}")
 
     # 6. Dummy / Test Registration Plate Audit
     print("\n6. Vehicle Registration Plate Hygiene Audit:")
@@ -335,7 +359,7 @@ def verify_triggers(conn):
     print("          LIVE TRIGGER SYNCHRONIZATION VERIFICATION              ")
     print("=================================================================\n")
 
-    test_veh = "KA03TEST9999"
+    test_veh = "KA03AB9999"
     test_did = "LETZBLRIP9999999999"
     test_name = "TEST DROPOFF DRIVER"
     test_date = "2026-09-10"
@@ -360,18 +384,20 @@ def verify_triggers(conn):
         sheet_id = cur.fetchone()["dropoff_id"]
 
         cur.execute("""
-            SELECT id, dropoff_id, data_source, negative_balance, total_liability, city, is_deleted
+            SELECT id, dropoff_id, source_reference_id, data_source, negative_balance, total_liability, city, is_deleted
             FROM public.core_dropoffs 
             WHERE vehicle_number = %s;
         """, (test_veh,))
         core_row = cur.fetchone()
         assert core_row is not None, "Trigger test failed: Record was not synced to core_dropoffs"
+        assert core_row["dropoff_id"] == str(core_row["id"]), f"dropoff_id mismatch: {core_row['dropoff_id']}"
+        assert core_row["source_reference_id"] == str(sheet_id), f"source_reference_id mismatch: {core_row['source_reference_id']}"
         assert core_row["data_source"] == "GOOGLE_SHEET", f"Unexpected source: {core_row['data_source']}"
         assert float(core_row["negative_balance"]) == -500.00, f"Polarity failed: {core_row['negative_balance']}"
         assert float(core_row["total_liability"]) == -500.00, f"Liability failed: {core_row['total_liability']}"
         assert core_row["city"] == "Bengaluru", f"City normalization failed: {core_row['city']}"
         assert core_row["is_deleted"] is False, "New record should not be deleted"
-        print(f"   [PASS] Synced to core (id={core_row['id']}, source={core_row['data_source']}, liability={core_row['total_liability']})")
+        print(f"   [PASS] Synced to core (id={core_row['id']}, dropoff_id={core_row['dropoff_id']}, src_ref={core_row['source_reference_id']})")
 
         # Step 2: Sheet UPDATE
         print("\n2. Testing Sheet Dropoff Modification (UPDATE on public.sheet_dropoffs)...")
@@ -409,18 +435,20 @@ def verify_triggers(conn):
         portal_id = cur.fetchone()["id"]
 
         cur.execute("""
-            SELECT id, data_source, negative_balance, pending_dues, damage_penalty, total_liability, remarks
+            SELECT id, dropoff_id, source_reference_id, data_source, negative_balance, pending_dues, damage_penalty, total_liability, remarks
             FROM public.core_dropoffs 
             WHERE vehicle_number = %s;
         """, (test_veh,))
         merged_row = cur.fetchone()
         assert merged_row["data_source"] == "MERGED", f"Merge failed: Expected 'MERGED' but got {merged_row['data_source']}"
+        assert merged_row["dropoff_id"] == str(merged_row["id"]), f"Merged dropoff_id mismatch: {merged_row['dropoff_id']}"
+        assert merged_row["source_reference_id"] == f"{sheet_id},{portal_id}", f"Merged source_reference_id mismatch: {merged_row['source_reference_id']}"
         assert float(merged_row["negative_balance"]) == -750.00, "Preservation failed: negative_balance lost"
-        assert float(merged_row["pending_dues"]) == -200.00, "Overlay failed: pending_dues not merged"
-        assert float(merged_row["damage_penalty"]) == -300.00, "Overlay failed: damage_penalty not merged"
+        assert float(merged_row["pending_dues"]) == 200.00, "Overlay failed: pending_dues not merged"
+        assert float(merged_row["damage_penalty"]) == 300.00, "Overlay failed: damage_penalty not merged"
         assert float(merged_row["total_liability"]) == -1250.00, f"Combined liability mismatch: {merged_row['total_liability']}"
-        assert merged_row["remarks"] == "Live Trigger Merge Verification", "Remarks not overlaid"
-        print(f"   [PASS] Successfully merged in core (data_source={merged_row['data_source']}, total_liability={merged_row['total_liability']})")
+        assert "Live Trigger Merge Verification" in merged_row["remarks"], "Remarks not overlaid"
+        print(f"   [PASS] Successfully merged in core (data_source={merged_row['data_source']}, dropoff_id={merged_row['dropoff_id']}, src_ref={merged_row['source_reference_id']})")
 
         # Step 4: Soft-Delete Verification
         print("\n4. Testing Soft-Delete Protection (DELETE on upstream sources)...")

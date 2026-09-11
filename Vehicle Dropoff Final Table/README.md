@@ -131,25 +131,27 @@ Total Columns: **20**
 | # | Column Name | Data Type | Constraints | Description |
 |---|---|---|---|---|
 | 1 | `id` | `BIGINT` | `PRIMARY KEY` | Gapless continuous integer sequence assigned via advisory lock `777444555`. |
-| 2 | `dropoff_id` | `VARCHAR(50)` | `UNIQUE NOT NULL` | Business identifier for drop-off event (`DRP-SHT-101`, `DRP-PORTAL-12`). |
-| 3 | `return_date` | `DATE` | `NOT NULL` | Standardized ISO calendar date of vehicle return (`YYYY-MM-DD`). |
-| 4 | `return_type` | `VARCHAR(50)` | `NOT NULL` | Classification: `Attrition`, `Repair and Maintenance`, `Force Recovery`. |
-| 5 | `driver_id` | `VARCHAR(50)` | Nullable | Identifier linking to `core_partner_onboarding` (e.g. `LETZBLRIP9876543210`). |
-| 6 | `driver_name` | `VARCHAR(255)` | Nullable | Driver full name, standardized with Title Case. |
-| 7 | `driver_type` | `VARCHAR(30)` | Nullable | Driver classification: `Individual` or `Operator`. |
-| 8 | `vehicle_number` | `VARCHAR(20)` | `NOT NULL` | Normalized uppercase alphanumeric vehicle plate (8-12 characters). |
-| 9 | `city` | `VARCHAR(50)` | `NOT NULL` | Canonical city: `Bengaluru`, `Hyderabad`, `Mumbai`, `Pune`, `Delhi`. |
-| 10 | `negative_balance` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from Ola/Uber balances. |
-| 11 | `pending_dues` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from unpaid vehicle rent and tolls. |
-| 12 | `damage_penalty` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from vehicle body and mechanical damage. |
-| 13 | `total_liability` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Total driver liability: `negative_balance + pending_dues + damage_penalty`. |
-| 14 | `remarks` | `TEXT` | Nullable | Detailed handover notes, inspection comments, or reason for return. |
-| 15 | `data_source` | `VARCHAR(50)` | `NOT NULL` | Source provenance: `GOOGLE_SHEET`, `PORTAL_FORM`, or `MERGED`. |
-| 16 | `source_reference_id` | `VARCHAR(100)` | `UNIQUE` | Upstream system reference pointer (`DRP-SHT-1402`, `DRP-PORTAL-88`). |
-| 17 | `is_deleted` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Soft-delete flag for audit preservation. |
-| 18 | `deleted_at` | `TIMESTAMP WITHOUT TIME ZONE` | Nullable | IST timestamp when record was soft-deleted. |
-| 19 | `created_at` | `TIMESTAMP WITHOUT TIME ZONE` | `DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')` | Pure IST record creation timestamp. |
-| 20 | `updated_at` | `TIMESTAMP WITHOUT TIME ZONE` | `DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')` | Pure IST record modification timestamp. |
+| 2 | `dropoff_id` | `VARCHAR(50)` | `UNIQUE NOT NULL` | Plain numerical business identifier matching `id::TEXT` (`'1578'`). |
+| 3 | `sheet_dropoff_id` | `BIGINT` | Nullable | Relational foreign key reference linking directly to `sheet_dropoffs(dropoff_id)`. |
+| 4 | `portal_dropoff_id` | `INTEGER` | Nullable | Relational foreign key reference linking directly to `july_vehicle_dropoffs(id)`. |
+| 5 | `return_date` | `DATE` | `NOT NULL` | Standardized ISO calendar date of vehicle return (`YYYY-MM-DD`). |
+| 6 | `return_type` | `VARCHAR(50)` | `NOT NULL` | Classification: `Attrition`, `Repair and Maintenance`, `Force Recovery`. |
+| 7 | `driver_id` | `VARCHAR(50)` | Nullable | Identifier linking to `core_partner_onboarding` (e.g. `LETZBLRIP9876543210`). |
+| 8 | `driver_name` | `VARCHAR(255)` | Nullable | Driver full name, standardized with Title Case. |
+| 9 | `driver_type` | `VARCHAR(30)` | Nullable | Driver classification: `Individual` or `Operator`. |
+| 10 | `vehicle_number` | `VARCHAR(20)` | `NOT NULL` | Normalized uppercase alphanumeric vehicle plate (8-12 characters). |
+| 11 | `city` | `VARCHAR(50)` | `NOT NULL` | Canonical city: `Bengaluru`, `Hyderabad`, `Mumbai`, `Pune`, `Delhi`. |
+| 12 | `negative_balance` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from Ola/Uber balances. |
+| 13 | `pending_dues` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from unpaid vehicle rent and tolls. |
+| 14 | `damage_penalty` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Signed negative liability from vehicle body and mechanical damage. |
+| 15 | `total_liability` | `NUMERIC(12,2)` | `DEFAULT 0.00` | Total driver liability: `negative_balance + pending_dues + damage_penalty`. |
+| 16 | `remarks` | `TEXT` | Nullable | Detailed handover notes, inspection comments, or reason for return. |
+| 17 | `data_source` | `VARCHAR(50)` | `NOT NULL` | Source provenance: `GOOGLE_SHEET`, `PORTAL_FORM`, or `MERGED`. |
+| 18 | `source_reference_id` | `VARCHAR(100)` | Nullable | Plain numerical upstream system reference pointer (`'1402'`, `'88'`, or `'1402,88'`). |
+| 19 | `is_deleted` | `BOOLEAN` | `NOT NULL DEFAULT FALSE` | Soft-delete flag for audit preservation. |
+| 20 | `deleted_at` | `TIMESTAMP WITHOUT TIME ZONE` | Nullable | IST timestamp when record was soft-deleted. |
+| 21 | `created_at` | `TIMESTAMP WITHOUT TIME ZONE` | `DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')` | Pure IST record creation timestamp. |
+| 22 | `updated_at` | `TIMESTAMP WITHOUT TIME ZONE` | `DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')` | Pure IST record modification timestamp. |
 
 ---
 

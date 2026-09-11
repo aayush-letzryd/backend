@@ -80,8 +80,8 @@ The two systems capture complementary but non-identical datasets:
    - Google Sheet-only records: `data_source = 'GOOGLE_SHEET'`.
    - Portal-only records: `data_source = 'PORTAL_FORM'`.
    - Reconciled dual submissions: `data_source = 'MERGED'`.
-2. **Deterministic Foreign Reference Tracking**:
-   - `source_reference_id` stores composite provenance, e.g., `'DRP-SHT-1402,DRP-PORTAL-88'`.
+   - `source_reference_id` stores composite provenance as plain numbers, e.g., `'1402,88'` (or `'1402'`).
+   - Dedicated foreign key columns `sheet_dropoff_id BIGINT` and `portal_dropoff_id INTEGER` provide indexed relational linkage.
 3. **Trigger Implementation**:
    - When `fn_sync_july_vehicle_dropoffs()` executes on an incoming portal row:
      ```sql
@@ -215,13 +215,11 @@ In spreadsheet workflows, users frequently press delete on rows or remove test r
    When an upstream row is deleted in `sheet_dropoffs` or `july_vehicle_dropoffs`:
    ```sql
    IF TG_OP = 'DELETE' THEN
-       v_ref_id := 'DRP-SHT-' || COALESCE(OLD.dropoff_id::TEXT, OLD.source_row::TEXT);
        UPDATE public.core_dropoffs
        SET is_deleted = TRUE, 
            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), 
            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-       WHERE (source_reference_id = v_ref_id OR dropoff_id = v_ref_id)
-         AND data_source = 'GOOGLE_SHEET';
+       WHERE sheet_dropoff_id = OLD.dropoff_id;
        RETURN OLD;
    END IF;
    ```

@@ -5,10 +5,11 @@
 -- Filtered View  : public.active_core_dropoffs (WHERE is_deleted = FALSE)
 -- Source 1       : public.sheet_dropoffs (Google Sheets Drop off History - 6,492 rows)
 -- Source 2       : public.july_vehicle_dropoffs (LetzRyd Web Portal Dropoff Form - 121 rows)
--- Live Row Count : 6,379 Total (6,361 Active, 18 Soft-Deleted, 0 Sequence Gaps)
+-- Live Row Count : 6,531 Total (6,397 Active, 134 Soft-Deleted, 0 Sequence Gaps)
 -- Host           : YOUR_DB_HOST_HERE:5432
 -- Database       : postgres
 -- Concurrency    : Transactional Advisory Lock 777444555
+-- ID Standard    : Plain Numerical IDs (e.g. '1578') without string prefixes
 -- ==============================================================================
 
 -- ------------------------------------------------------------------------------
@@ -78,7 +79,7 @@ CREATE TABLE IF NOT EXISTS public.core_dropoffs (
     total_liability NUMERIC(12,2) DEFAULT 0.00,
     remarks TEXT,
     data_source VARCHAR(50) NOT NULL,
-    source_reference_id VARCHAR(100) UNIQUE,
+    source_reference_id VARCHAR(100),
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     deleted_at TIMESTAMP WITHOUT TIME ZONE,
     created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -108,6 +109,8 @@ CREATE OR REPLACE VIEW public.active_core_dropoffs AS
 SELECT 
     id,
     dropoff_id,
+    sheet_dropoff_id,
+    portal_dropoff_id,
     return_date,
     return_type,
     driver_id,
@@ -231,93 +234,114 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_clean_veh VARCHAR(20);
     v_clean_city VARCHAR(50);
+    v_clean_driver_id VARCHAR(50);
     v_driver_type VARCHAR(30);
-    v_ref_id VARCHAR(100);
+    v_ref_id VARCHAR(50);
     v_existing_id BIGINT;
     v_existing_source VARCHAR(50);
     v_existing_ref VARCHAR(100);
-    v_existing_dues NUMERIC(12,2);
-    v_existing_dmg NUMERIC(12,2);
+    v_existing_portal_id INTEGER;
+    v_existing_driver_id VARCHAR(50);
+    v_final_driver_id VARCHAR(50);
     v_next_id BIGINT;
     v_neg_bal NUMERIC(12,2);
     v_total_liab NUMERIC(12,2);
-    v_dropoff_id VARCHAR(50);
 BEGIN
-    -- Transactional Advisory Lock ensures strict 1..N gapless ID continuity
-    PERFORM pg_advisory_xact_lock(777444555);
-
-    -- Handle Soft Delete
     IF TG_OP = 'DELETE' THEN
-        v_ref_id := 'DRP-SHT-' || COALESCE(OLD.dropoff_id::TEXT, OLD.source_row::TEXT);
         UPDATE public.core_dropoffs
         SET is_deleted = TRUE, 
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), 
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE (source_reference_id = v_ref_id OR dropoff_id = v_ref_id)
-          AND data_source = 'GOOGLE_SHEET';
+        WHERE sheet_dropoff_id = OLD.dropoff_id;
         RETURN OLD;
     END IF;
 
-    -- Clean Registration Plate
     v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(NEW.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
-    IF v_clean_veh = '' OR LENGTH(v_clean_veh) < 8 THEN
+    
+    -- Plate regex validation: ignore invalid plates
+    IF v_clean_veh !~ '^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$' THEN
         RETURN NEW;
     END IF;
 
     v_clean_city := public.fn_normalize_dropoff_city(NEW.city, v_clean_veh);
-    v_driver_type := public.fn_resolve_driver_type(NEW.driver_type, NEW.driver_id);
-    v_ref_id := 'DRP-SHT-' || COALESCE(NEW.dropoff_id::TEXT, NEW.source_row::TEXT);
+    v_clean_driver_id := COALESCE(NULLIF(TRIM(NEW.driver_id), ''), 'UNKNOWN_DRIVER');
+    v_driver_type := public.fn_resolve_driver_type(NEW.driver_type, v_clean_driver_id);
+    v_ref_id := COALESCE(NEW.dropoff_id::TEXT, NEW.source_row::TEXT);
 
-    -- Signed Liability Polarity
+    -- Signed liability polarity
     IF NEW.negative_balance IS NOT NULL THEN
         v_neg_bal := -1.0 * ABS(NEW.negative_balance);
     ELSE
         v_neg_bal := 0.00;
     END IF;
 
-    -- Fast Index Seek for Existing Record (Match by Reference ID or Composite Key)
-    SELECT id, data_source, source_reference_id, pending_dues, damage_penalty
-    INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_dues, v_existing_dmg
+    -- Transactional advisory lock
+    PERFORM pg_advisory_xact_lock(777444555);
+
+    -- Seek existing record
+    SELECT id, data_source, source_reference_id, portal_dropoff_id, driver_id
+    INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_portal_id, v_existing_driver_id
     FROM public.core_dropoffs
-    WHERE dropoff_id = v_ref_id
-       OR source_reference_id = v_ref_id
-       OR (vehicle_number = v_clean_veh AND return_date = NEW.return_date AND is_deleted = FALSE)
-    ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 WHEN data_source = 'GOOGLE_SHEET' THEN 2 ELSE 3 END, id ASC
+    WHERE sheet_dropoff_id = NEW.dropoff_id
+       OR (
+           vehicle_number = v_clean_veh 
+           AND return_date = NEW.return_date
+           AND (
+               driver_id = v_clean_driver_id
+               OR driver_id = 'UNKNOWN_DRIVER'
+               OR v_clean_driver_id = 'UNKNOWN_DRIVER'
+               OR (driver_id LIKE '%IP%' AND v_clean_driver_id LIKE '%' || SUBSTRING(driver_id FROM 8) || '%')
+               OR (v_clean_driver_id LIKE '%IP%' AND driver_id LIKE '%' || SUBSTRING(v_clean_driver_id FROM 8) || '%')
+           )
+       )
+    ORDER BY id DESC
     LIMIT 1;
 
     IF v_existing_id IS NOT NULL THEN
-        -- UPDATE existing row and calculate composite liability
+        -- Operator IP Priority Rule
+        IF v_existing_driver_id LIKE '%IP%' AND v_clean_driver_id NOT LIKE '%IP%' THEN
+            v_final_driver_id := v_existing_driver_id;
+        ELSE
+            v_final_driver_id := v_clean_driver_id;
+        END IF;
+
         v_total_liab := public.fn_calculate_dropoff_liability(
-            v_neg_bal,
-            COALESCE(v_existing_dues, 0.00),
-            COALESCE(v_existing_dmg, 0.00)
+            COALESCE(v_neg_bal, 0.00),
+            (SELECT pending_dues FROM public.core_dropoffs WHERE id = v_existing_id),
+            (SELECT damage_penalty FROM public.core_dropoffs WHERE id = v_existing_id)
         );
 
         UPDATE public.core_dropoffs
         SET
+            sheet_dropoff_id = NEW.dropoff_id,
             vehicle_number = v_clean_veh,
             city = v_clean_city,
             return_date = NEW.return_date,
-            return_type = COALESCE(NULLIF(TRIM(NEW.return_type), ''), core_dropoffs.return_type),
-            driver_id = COALESCE(NULLIF(TRIM(NEW.driver_id), ''), core_dropoffs.driver_id),
-            driver_name = COALESCE(NULLIF(TRIM(NEW.driver_name), ''), core_dropoffs.driver_name),
+            return_type = COALESCE(NULLIF(NEW.return_type, ''), core_dropoffs.return_type),
+            driver_id = v_final_driver_id,
+            driver_name = COALESCE(NULLIF(NEW.driver_name, ''), core_dropoffs.driver_name),
             driver_type = v_driver_type,
             negative_balance = v_neg_bal,
             total_liability = v_total_liab,
             data_source = CASE WHEN v_existing_source = 'PORTAL_FORM' THEN 'MERGED' ELSE core_dropoffs.data_source END,
+            source_reference_id = CASE 
+                WHEN v_existing_portal_id IS NOT NULL 
+                THEN v_ref_id || ',' || v_existing_portal_id::TEXT
+                ELSE COALESCE(v_ref_id, core_dropoffs.source_reference_id)
+            END,
             is_deleted = FALSE,
             deleted_at = NULL,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE id = v_existing_id;
     ELSE
-        -- INSERT new record with gapless sequential ID
         SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
-        v_dropoff_id := 'DRP-SHT-' || v_next_id;
         v_total_liab := public.fn_calculate_dropoff_liability(v_neg_bal, 0.00, 0.00);
 
         INSERT INTO public.core_dropoffs (
             id,
             dropoff_id,
+            sheet_dropoff_id,
+            portal_dropoff_id,
             return_date,
             return_type,
             driver_id,
@@ -337,11 +361,13 @@ BEGIN
             updated_at
         ) VALUES (
             v_next_id,
-            v_dropoff_id,
+            v_next_id::TEXT,
+            NEW.dropoff_id,
+            NULL,
             NEW.return_date,
-            COALESCE(NULLIF(TRIM(NEW.return_type), ''), 'Attrition'),
-            COALESCE(NULLIF(TRIM(NEW.driver_id), ''), 'UNKNOWN_DRIVER'),
-            COALESCE(NULLIF(TRIM(NEW.driver_name), ''), 'Unknown Driver'),
+            COALESCE(NULLIF(NEW.return_type, ''), 'Attrition'),
+            v_clean_driver_id,
+            COALESCE(NULLIF(NEW.driver_name, ''), 'Unknown Driver'),
             v_driver_type,
             v_clean_veh,
             v_clean_city,
@@ -373,139 +399,179 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_clean_veh VARCHAR(20);
     v_clean_city VARCHAR(50);
-    v_return_date DATE;
+    v_clean_driver_id VARCHAR(50);
     v_driver_type VARCHAR(30);
+    v_return_date DATE;
     v_pending_dues NUMERIC(12,2);
     v_damage_pen NUMERIC(12,2);
     v_total_liab NUMERIC(12,2);
-    v_ref_id VARCHAR(100);
+    v_ref_id VARCHAR(50);
     v_existing_id BIGINT;
     v_existing_source VARCHAR(50);
     v_existing_ref VARCHAR(100);
-    v_existing_neg NUMERIC(12,2);
+    v_existing_sheet_id BIGINT;
+    v_existing_driver_id VARCHAR(50);
+    v_existing_return_type VARCHAR(50);
+    v_existing_remarks TEXT;
+    v_final_driver_id VARCHAR(50);
+    v_combined_remarks TEXT;
     v_next_id BIGINT;
-    v_dropoff_id VARCHAR(50);
 BEGIN
-    -- Transactional Advisory Lock
-    PERFORM pg_advisory_xact_lock(777444555);
-
-    -- Handle Soft Delete
     IF TG_OP = 'DELETE' THEN
-        v_ref_id := 'DRP-PORTAL-' || OLD.id::TEXT;
         UPDATE public.core_dropoffs
         SET is_deleted = TRUE, 
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), 
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE (source_reference_id = v_ref_id OR dropoff_id = v_ref_id)
-          AND data_source = 'PORTAL_FORM';
+        WHERE portal_dropoff_id = OLD.id;
         RETURN OLD;
     END IF;
 
-    -- Clean Registration Plate
-    v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(NEW.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
-    IF v_clean_veh = '' OR LENGTH(v_clean_veh) < 8 THEN
-        RETURN NEW;
-    END IF;
+    IF NEW.vehicle_number IS NOT NULL AND NEW.vehicle_number != '' THEN
+        v_clean_veh := UPPER(REGEXP_REPLACE(NEW.vehicle_number, '[^A-Za-z0-9]', '', 'g'));
+        
+        -- Regex Gatekeeper: Ignore dummy/test plates
+        IF v_clean_veh !~ '^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$' THEN
+            RETURN NEW;
+        END IF;
 
-    v_clean_city := public.fn_normalize_dropoff_city(NEW.city_name, v_clean_veh);
-    v_driver_type := public.fn_resolve_driver_type(COALESCE(NEW.driver_type, 'Individual'), NEW.driver_id);
-    v_ref_id := 'DRP-PORTAL-' || NEW.id::TEXT;
-
-    -- Return Date Sanitization
-    v_return_date := COALESCE(
-        CASE 
-            WHEN NEW.return_date::TEXT ~ '^\d{4}-\d{2}-\d{2}' THEN NEW.return_date::DATE
-            WHEN NEW.return_date::TEXT ~ '^\d{2}/\d{2}/\d{4}' THEN TO_DATE(NEW.return_date::TEXT, 'DD/MM/YYYY')
-            ELSE NULL
-        END,
-        CURRENT_DATE
-    );
-
-    -- Signed Liabilities (Negative values)
-    v_pending_dues := -1.0 * ABS(COALESCE(NEW.pending_dues, 0.00));
-    v_damage_pen := -1.0 * ABS(COALESCE(NEW.damage_penalty, 0.00));
-
-    -- Seek Existing Record
-    SELECT id, data_source, source_reference_id, negative_balance
-    INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_neg
-    FROM public.core_dropoffs
-    WHERE dropoff_id = v_ref_id
-       OR source_reference_id = v_ref_id
-       OR (vehicle_number = v_clean_veh AND return_date = v_return_date AND is_deleted = FALSE)
-    ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 WHEN data_source = 'GOOGLE_SHEET' THEN 2 ELSE 3 END, id ASC
-    LIMIT 1;
-
-    IF v_existing_id IS NOT NULL THEN
-        -- MERGE portal details onto existing record
-        v_total_liab := public.fn_calculate_dropoff_liability(
-            COALESCE(v_existing_neg, 0.00),
-            v_pending_dues,
-            v_damage_pen
+        v_clean_city := public.fn_normalize_dropoff_city(NEW.city_name, v_clean_veh);
+        v_clean_driver_id := COALESCE(NULLIF(TRIM(NEW.driver_id), ''), 'UNKNOWN_DRIVER');
+        v_driver_type := public.fn_resolve_driver_type(COALESCE(NEW.driver_type, 'Individual'), v_clean_driver_id);
+        v_ref_id := NEW.id::TEXT;
+        
+        v_return_date := COALESCE(
+            CASE 
+                WHEN NEW.return_date::TEXT ~ '^\d{4}-\d{2}-\d{2}' THEN NEW.return_date::DATE
+                WHEN NEW.return_date::TEXT ~ '^\d{2}/\d{2}/\d{4}' THEN TO_DATE(NEW.return_date::TEXT, 'DD/MM/YYYY')
+                ELSE NULL
+            END,
+            CURRENT_DATE
         );
 
-        UPDATE public.core_dropoffs
-        SET
-            city = COALESCE(NULLIF(TRIM(v_clean_city), ''), core_dropoffs.city),
-            driver_name = COALESCE(NULLIF(TRIM(NEW.driver_name), ''), core_dropoffs.driver_name),
-            driver_id = COALESCE(NULLIF(TRIM(NEW.driver_id), ''), core_dropoffs.driver_id),
-            driver_type = COALESCE(NULLIF(TRIM(v_driver_type), ''), core_dropoffs.driver_type),
-            return_type = COALESCE(NULLIF(TRIM(NEW.return_type), ''), core_dropoffs.return_type),
-            pending_dues = v_pending_dues,
-            damage_penalty = v_damage_pen,
-            total_liability = v_total_liab,
-            remarks = COALESCE(NULLIF(TRIM(NEW.remarks), ''), core_dropoffs.remarks),
-            data_source = CASE WHEN v_existing_source IN ('GOOGLE_SHEET', 'MERGED') THEN 'MERGED' ELSE 'PORTAL_FORM' END,
-            is_deleted = FALSE,
-            deleted_at = NULL,
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE id = v_existing_id;
-    ELSE
-        -- INSERT standalone portal dropoff
-        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
-        v_dropoff_id := 'DRP-PORTAL-' || v_next_id;
-        v_total_liab := public.fn_calculate_dropoff_liability(0.00, v_pending_dues, v_damage_pen);
+        v_pending_dues := COALESCE(NEW.pending_dues, 0.00);
+        v_damage_pen := COALESCE(NEW.damage_penalty, 0.00);
 
-        INSERT INTO public.core_dropoffs (
-            id,
-            dropoff_id,
-            return_date,
-            return_type,
-            driver_id,
-            driver_name,
-            driver_type,
-            vehicle_number,
-            city,
-            negative_balance,
-            pending_dues,
-            damage_penalty,
-            total_liability,
-            remarks,
-            data_source,
-            source_reference_id,
-            is_deleted,
-            created_at,
-            updated_at
-        ) VALUES (
-            v_next_id,
-            v_dropoff_id,
-            v_return_date,
-            COALESCE(NULLIF(TRIM(NEW.return_type), ''), 'Attrition'),
-            COALESCE(NULLIF(TRIM(NEW.driver_id), ''), 'UNKNOWN_DRIVER'),
-            COALESCE(NULLIF(TRIM(NEW.driver_name), ''), 'Unknown Driver'),
-            v_driver_type,
-            v_clean_veh,
-            v_clean_city,
-            0.00,
-            v_pending_dues,
-            v_damage_pen,
-            v_total_liab,
-            TRIM(NEW.remarks),
-            'PORTAL_FORM',
-            v_ref_id,
-            FALSE,
-            (COALESCE(NEW.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
-            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        );
+        -- Transactional advisory lock
+        PERFORM pg_advisory_xact_lock(777444555);
+
+        -- Seek existing record
+        SELECT id, data_source, source_reference_id, sheet_dropoff_id, driver_id, return_type, remarks
+        INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_sheet_id, v_existing_driver_id, v_existing_return_type, v_existing_remarks
+        FROM public.core_dropoffs
+        WHERE portal_dropoff_id = NEW.id
+           OR (
+               vehicle_number = v_clean_veh 
+               AND return_date = v_return_date
+               AND (
+                   driver_id = v_clean_driver_id
+                   OR driver_id = 'UNKNOWN_DRIVER'
+                   OR v_clean_driver_id = 'UNKNOWN_DRIVER'
+                   OR (driver_id LIKE '%IP%' AND v_clean_driver_id LIKE '%' || SUBSTRING(driver_id FROM 8) || '%')
+                   OR (v_clean_driver_id LIKE '%IP%' AND driver_id LIKE '%' || SUBSTRING(v_clean_driver_id FROM 8) || '%')
+               )
+           )
+        ORDER BY id DESC
+        LIMIT 1;
+
+        IF v_existing_id IS NOT NULL THEN
+            -- Operator IP Priority Rule
+            IF v_clean_driver_id LIKE '%IP%' THEN
+                v_final_driver_id := v_clean_driver_id;
+            ELSIF v_existing_driver_id LIKE '%IP%' THEN
+                v_final_driver_id := v_existing_driver_id;
+            ELSE
+                v_final_driver_id := COALESCE(NULLIF(v_clean_driver_id, 'UNKNOWN_DRIVER'), v_existing_driver_id);
+            END IF;
+
+            -- Concatenate Remarks
+            IF NULLIF(TRIM(COALESCE(NEW.remarks, '')), '') IS NOT NULL THEN
+                IF v_existing_remarks IS NOT NULL AND v_existing_remarks NOT LIKE '%' || NEW.remarks || '%' THEN
+                    v_combined_remarks := v_existing_remarks || ' | Portal: ' || NEW.remarks;
+                ELSE
+                    v_combined_remarks := COALESCE(v_existing_remarks, 'Portal: ' || NEW.remarks);
+                END IF;
+            ELSE
+                v_combined_remarks := v_existing_remarks;
+            END IF;
+
+            v_total_liab := public.fn_calculate_dropoff_liability(
+                (SELECT negative_balance FROM public.core_dropoffs WHERE id = v_existing_id),
+                v_pending_dues,
+                v_damage_pen
+            );
+
+            UPDATE public.core_dropoffs
+            SET
+                portal_dropoff_id = NEW.id,
+                city = COALESCE(NULLIF(v_clean_city, ''), core_dropoffs.city),
+                driver_name = COALESCE(NULLIF(NEW.driver_name, ''), core_dropoffs.driver_name),
+                driver_id = v_final_driver_id,
+                driver_type = COALESCE(NULLIF(v_driver_type, ''), core_dropoffs.driver_type),
+                return_type = COALESCE(v_existing_return_type, NULLIF(NEW.return_type, ''), core_dropoffs.return_type),
+                pending_dues = v_pending_dues,
+                damage_penalty = v_damage_pen,
+                total_liability = v_total_liab,
+                remarks = v_combined_remarks,
+                data_source = CASE WHEN v_existing_source = 'GOOGLE_SHEET' THEN 'MERGED' ELSE 'PORTAL_FORM' END,
+                source_reference_id = CASE 
+                    WHEN v_existing_sheet_id IS NOT NULL 
+                    THEN v_existing_sheet_id::TEXT || ',' || v_ref_id
+                    ELSE COALESCE(v_existing_ref, v_ref_id)
+                END,
+                is_deleted = FALSE,
+                deleted_at = NULL,
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE id = v_existing_id;
+        ELSE
+            SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
+            v_total_liab := public.fn_calculate_dropoff_liability(0.00, v_pending_dues, v_damage_pen);
+
+            INSERT INTO public.core_dropoffs (
+                id,
+                dropoff_id,
+                sheet_dropoff_id,
+                portal_dropoff_id,
+                return_date,
+                return_type,
+                driver_id,
+                driver_name,
+                driver_type,
+                vehicle_number,
+                city,
+                negative_balance,
+                pending_dues,
+                damage_penalty,
+                total_liability,
+                remarks,
+                data_source,
+                source_reference_id,
+                is_deleted,
+                created_at,
+                updated_at
+            ) VALUES (
+                v_next_id,
+                v_next_id::TEXT,
+                NULL,
+                NEW.id,
+                v_return_date,
+                COALESCE(NULLIF(NEW.return_type, ''), 'Attrition'),
+                v_clean_driver_id,
+                COALESCE(NULLIF(NEW.driver_name, ''), 'Unknown Driver'),
+                v_driver_type,
+                v_clean_veh,
+                v_clean_city,
+                0.00,
+                v_pending_dues,
+                v_damage_pen,
+                v_total_liab,
+                CASE WHEN NEW.remarks IS NOT NULL THEN 'Portal: ' || NEW.remarks ELSE NULL END,
+                'PORTAL_FORM',
+                v_ref_id,
+                FALSE,
+                (COALESCE(NEW.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            );
+        END IF;
     END IF;
 
     RETURN NEW;
@@ -529,200 +595,294 @@ END $$;
 CREATE OR REPLACE FUNCTION public.refresh_core_dropoffs()
 RETURNS INTEGER AS $$
 DECLARE
-    v_processed_count INTEGER := 0;
-    r_sheet RECORD;
-    r_portal RECORD;
+    r RECORD;
+    p RECORD;
     v_clean_veh VARCHAR(20);
     v_clean_city VARCHAR(50);
+    v_clean_driver_id VARCHAR(50);
     v_driver_type VARCHAR(30);
-    v_ref_id VARCHAR(100);
+    v_neg_bal NUMERIC(12,2);
+    v_total_liab NUMERIC(12,2);
+    v_ref_id VARCHAR(50);
+    v_next_id BIGINT;
     v_existing_id BIGINT;
     v_existing_source VARCHAR(50);
     v_existing_ref VARCHAR(100);
-    v_existing_dues NUMERIC(12,2);
-    v_existing_dmg NUMERIC(12,2);
-    v_existing_neg NUMERIC(12,2);
-    v_next_id BIGINT;
-    v_neg_bal NUMERIC(12,2);
-    v_pending_dues NUMERIC(12,2);
-    v_damage_pen NUMERIC(12,2);
-    v_total_liab NUMERIC(12,2);
-    v_return_date DATE;
-    v_dropoff_id VARCHAR(50);
+    v_existing_sheet_id BIGINT;
+    v_existing_driver_id VARCHAR(50);
+    v_existing_return_type VARCHAR(50);
+    v_existing_remarks TEXT;
+    v_final_driver_id VARCHAR(50);
+    v_combined_remarks TEXT;
+    v_inserted_count INTEGER := 0;
 BEGIN
     PERFORM pg_advisory_xact_lock(777444555);
 
-    -- Step 6.1: Ingest & Deduplicate from sheet_dropoffs
-    FOR r_sheet IN (
+    -- Step 6.1: Sync all Google Sheet records
+    FOR r IN 
         SELECT * FROM public.sheet_dropoffs 
-        WHERE is_deleted = FALSE 
-        ORDER BY return_date ASC, dropoff_id ASC
-    ) LOOP
-        v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(r_sheet.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
-        IF v_clean_veh != '' AND LENGTH(v_clean_veh) >= 8 THEN
-            v_clean_city := public.fn_normalize_dropoff_city(r_sheet.city, v_clean_veh);
-            v_driver_type := public.fn_resolve_driver_type(r_sheet.driver_type, r_sheet.driver_id);
-            v_ref_id := 'DRP-SHT-' || COALESCE(r_sheet.dropoff_id::TEXT, r_sheet.source_row::TEXT);
+        ORDER BY dropoff_id ASC
+    LOOP
+        v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(r.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
+        
+        -- Skip invalid plates
+        IF v_clean_veh !~ '^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$' THEN
+            CONTINUE;
+        END IF;
 
-            IF r_sheet.negative_balance IS NOT NULL THEN
-                v_neg_bal := -1.0 * ABS(r_sheet.negative_balance);
+        v_clean_city := public.fn_normalize_dropoff_city(r.city, v_clean_veh);
+        v_clean_driver_id := COALESCE(NULLIF(TRIM(r.driver_id), ''), 'UNKNOWN_DRIVER');
+        v_driver_type := public.fn_resolve_driver_type(r.driver_type, v_clean_driver_id);
+        v_ref_id := r.dropoff_id::TEXT;
+
+        IF r.negative_balance IS NOT NULL THEN
+            v_neg_bal := -1.0 * ABS(r.negative_balance);
+        ELSE
+            v_neg_bal := 0.00;
+        END IF;
+
+        -- Seek existing record
+        SELECT id, data_source, source_reference_id, driver_id
+        INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_driver_id
+        FROM public.core_dropoffs
+        WHERE sheet_dropoff_id = r.dropoff_id
+           OR (
+               vehicle_number = v_clean_veh 
+               AND return_date = r.return_date
+               AND (
+                   driver_id = v_clean_driver_id
+                   OR driver_id = 'UNKNOWN_DRIVER'
+                   OR v_clean_driver_id = 'UNKNOWN_DRIVER'
+                   OR (driver_id LIKE '%IP%' AND v_clean_driver_id LIKE '%' || SUBSTRING(driver_id FROM 8) || '%')
+                   OR (v_clean_driver_id LIKE '%IP%' AND driver_id LIKE '%' || SUBSTRING(v_clean_driver_id FROM 8) || '%')
+               )
+           )
+        ORDER BY id DESC
+        LIMIT 1;
+
+        IF v_existing_id IS NOT NULL THEN
+            IF v_existing_driver_id LIKE '%IP%' AND v_clean_driver_id NOT LIKE '%IP%' THEN
+                v_final_driver_id := v_existing_driver_id;
             ELSE
-                v_neg_bal := 0.00;
+                v_final_driver_id := v_clean_driver_id;
             END IF;
 
-            SELECT id, data_source, source_reference_id, pending_dues, damage_penalty
-            INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_dues, v_existing_dmg
+            v_total_liab := public.fn_calculate_dropoff_liability(
+                v_neg_bal,
+                (SELECT pending_dues FROM public.core_dropoffs WHERE id = v_existing_id),
+                (SELECT damage_penalty FROM public.core_dropoffs WHERE id = v_existing_id)
+            );
+
+            UPDATE public.core_dropoffs
+            SET
+                sheet_dropoff_id = r.dropoff_id,
+                vehicle_number = v_clean_veh,
+                city = v_clean_city,
+                return_date = r.return_date,
+                return_type = COALESCE(NULLIF(r.return_type, ''), core_dropoffs.return_type),
+                driver_id = v_final_driver_id,
+                driver_name = COALESCE(NULLIF(r.driver_name, ''), core_dropoffs.driver_name),
+                driver_type = v_driver_type,
+                negative_balance = v_neg_bal,
+                total_liability = v_total_liab,
+                data_source = CASE WHEN v_existing_source = 'PORTAL_FORM' THEN 'MERGED' ELSE core_dropoffs.data_source END,
+                source_reference_id = COALESCE(v_ref_id, core_dropoffs.source_reference_id),
+                is_deleted = FALSE,
+                deleted_at = NULL,
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE id = v_existing_id;
+        ELSE
+            SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
+            v_total_liab := public.fn_calculate_dropoff_liability(v_neg_bal, 0.00, 0.00);
+
+            INSERT INTO public.core_dropoffs (
+                id,
+                dropoff_id,
+                sheet_dropoff_id,
+                portal_dropoff_id,
+                return_date,
+                return_type,
+                driver_id,
+                driver_name,
+                driver_type,
+                vehicle_number,
+                city,
+                negative_balance,
+                pending_dues,
+                damage_penalty,
+                total_liability,
+                remarks,
+                data_source,
+                source_reference_id,
+                is_deleted,
+                created_at,
+                updated_at
+            ) VALUES (
+                v_next_id,
+                v_next_id::TEXT,
+                r.dropoff_id,
+                NULL,
+                r.return_date,
+                COALESCE(NULLIF(r.return_type, ''), 'Attrition'),
+                v_clean_driver_id,
+                COALESCE(NULLIF(r.driver_name, ''), 'Unknown Driver'),
+                v_driver_type,
+                v_clean_veh,
+                v_clean_city,
+                v_neg_bal,
+                0.00,
+                0.00,
+                v_total_liab,
+                NULL,
+                'GOOGLE_SHEET',
+                v_ref_id,
+                FALSE,
+                (COALESCE(r.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            );
+            v_inserted_count := v_inserted_count + 1;
+        END IF;
+    END LOOP;
+
+    -- Step 6.2: Ingest & Merge from july_vehicle_dropoffs
+    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'july_vehicle_dropoffs') THEN
+        FOR p IN 
+            SELECT * FROM public.july_vehicle_dropoffs 
+            ORDER BY id ASC
+        LOOP
+            v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(p.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
+            
+            -- Skip invalid plates
+            IF v_clean_veh !~ '^[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}$' THEN
+                CONTINUE;
+            END IF;
+
+            v_clean_city := public.fn_normalize_dropoff_city(p.city_name, v_clean_veh);
+            v_clean_driver_id := COALESCE(NULLIF(TRIM(p.driver_id), ''), 'UNKNOWN_DRIVER');
+            v_driver_type := public.fn_resolve_driver_type(COALESCE(p.driver_type, 'Individual'), v_clean_driver_id);
+
+            -- Seek existing record
+            SELECT id, data_source, source_reference_id, sheet_dropoff_id, driver_id, return_type, remarks
+            INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_sheet_id, v_existing_driver_id, v_existing_return_type, v_existing_remarks
             FROM public.core_dropoffs
-            WHERE dropoff_id = v_ref_id
-               OR source_reference_id = v_ref_id
-               OR (vehicle_number = v_clean_veh AND return_date = r_sheet.return_date AND is_deleted = FALSE)
-            ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 WHEN data_source = 'GOOGLE_SHEET' THEN 2 ELSE 3 END, id ASC
+            WHERE portal_dropoff_id = p.id
+               OR (
+                   vehicle_number = v_clean_veh 
+                   AND return_date = p.return_date
+                   AND (
+                       driver_id = v_clean_driver_id
+                       OR driver_id = 'UNKNOWN_DRIVER'
+                       OR v_clean_driver_id = 'UNKNOWN_DRIVER'
+                       OR (driver_id LIKE '%IP%' AND v_clean_driver_id LIKE '%' || SUBSTRING(driver_id FROM 8) || '%')
+                       OR (v_clean_driver_id LIKE '%IP%' AND driver_id LIKE '%' || SUBSTRING(v_clean_driver_id FROM 8) || '%')
+                   )
+               )
+            ORDER BY id DESC
             LIMIT 1;
 
             IF v_existing_id IS NOT NULL THEN
+                IF v_clean_driver_id LIKE '%IP%' THEN
+                    v_final_driver_id := v_clean_driver_id;
+                ELSIF v_existing_driver_id LIKE '%IP%' THEN
+                    v_final_driver_id := v_existing_driver_id;
+                ELSE
+                    v_final_driver_id := COALESCE(NULLIF(v_clean_driver_id, 'UNKNOWN_DRIVER'), v_existing_driver_id);
+                END IF;
+
+                IF NULLIF(TRIM(COALESCE(p.remarks, '')), '') IS NOT NULL THEN
+                    IF v_existing_remarks IS NOT NULL AND v_existing_remarks NOT LIKE '%' || p.remarks || '%' THEN
+                        v_combined_remarks := v_existing_remarks || ' | Portal: ' || p.remarks;
+                    ELSE
+                        v_combined_remarks := COALESCE(v_existing_remarks, 'Portal: ' || p.remarks);
+                    END IF;
+                ELSE
+                    v_combined_remarks := v_existing_remarks;
+                END IF;
+
                 v_total_liab := public.fn_calculate_dropoff_liability(
-                    v_neg_bal,
-                    COALESCE(v_existing_dues, 0.00),
-                    COALESCE(v_existing_dmg, 0.00)
+                    (SELECT negative_balance FROM public.core_dropoffs WHERE id = v_existing_id),
+                    COALESCE(p.pending_dues, 0.00),
+                    COALESCE(p.damage_penalty, 0.00)
                 );
+
+                v_ref_id := p.id::TEXT;
 
                 UPDATE public.core_dropoffs
                 SET
-                    driver_name = COALESCE(NULLIF(TRIM(r_sheet.driver_name), ''), core_dropoffs.driver_name),
-                    driver_id = COALESCE(NULLIF(TRIM(r_sheet.driver_id), ''), core_dropoffs.driver_id),
-                    driver_type = v_driver_type,
-                    return_type = COALESCE(NULLIF(TRIM(r_sheet.return_type), ''), core_dropoffs.return_type),
-                    city = v_clean_city,
-                    negative_balance = v_neg_bal,
+                    portal_dropoff_id = p.id,
+                    city = COALESCE(NULLIF(v_clean_city, ''), core_dropoffs.city),
+                    driver_name = COALESCE(NULLIF(p.driver_name, ''), core_dropoffs.driver_name),
+                    driver_id = v_final_driver_id,
+                    driver_type = COALESCE(NULLIF(v_driver_type, ''), core_dropoffs.driver_type),
+                    pending_dues = COALESCE(p.pending_dues, 0.00),
+                    damage_penalty = COALESCE(p.damage_penalty, 0.00),
                     total_liability = v_total_liab,
-                    data_source = CASE WHEN v_existing_source = 'PORTAL_FORM' THEN 'MERGED' ELSE core_dropoffs.data_source END,
+                    remarks = v_combined_remarks,
+                    data_source = CASE WHEN v_existing_source = 'GOOGLE_SHEET' THEN 'MERGED' ELSE 'PORTAL_FORM' END,
+                    source_reference_id = CASE 
+                        WHEN v_existing_sheet_id IS NOT NULL 
+                        THEN v_existing_sheet_id::TEXT || ',' || v_ref_id
+                        ELSE COALESCE(v_existing_ref, v_ref_id)
+                    END,
                     is_deleted = FALSE,
                     deleted_at = NULL,
                     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 WHERE id = v_existing_id;
             ELSE
                 SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
-                v_dropoff_id := 'DRP-SHT-' || v_next_id;
-                v_total_liab := public.fn_calculate_dropoff_liability(v_neg_bal, 0.00, 0.00);
+                v_total_liab := public.fn_calculate_dropoff_liability(0.00, COALESCE(p.pending_dues, 0.00), COALESCE(p.damage_penalty, 0.00));
 
                 INSERT INTO public.core_dropoffs (
-                    id, dropoff_id, return_date, return_type, driver_id, driver_name,
-                    driver_type, vehicle_number, city, negative_balance, pending_dues,
-                    damage_penalty, total_liability, remarks, data_source, source_reference_id,
-                    is_deleted, created_at, updated_at
+                    id,
+                    dropoff_id,
+                    sheet_dropoff_id,
+                    portal_dropoff_id,
+                    return_date,
+                    return_type,
+                    driver_id,
+                    driver_name,
+                    driver_type,
+                    vehicle_number,
+                    city,
+                    negative_balance,
+                    pending_dues,
+                    damage_penalty,
+                    total_liability,
+                    remarks,
+                    data_source,
+                    source_reference_id,
+                    is_deleted,
+                    created_at,
+                    updated_at
                 ) VALUES (
-                    v_next_id, v_dropoff_id, r_sheet.return_date,
-                    COALESCE(NULLIF(TRIM(r_sheet.return_type), ''), 'Attrition'),
-                    COALESCE(NULLIF(TRIM(r_sheet.driver_id), ''), 'UNKNOWN_DRIVER'),
-                    COALESCE(NULLIF(TRIM(r_sheet.driver_name), ''), 'Unknown Driver'),
-                    v_driver_type, v_clean_veh, v_clean_city, v_neg_bal, 0.00, 0.00,
-                    v_total_liab, NULL, 'GOOGLE_SHEET', v_ref_id, FALSE,
-                    (COALESCE(r_sheet.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
+                    v_next_id,
+                    v_next_id::TEXT,
+                    NULL,
+                    p.id,
+                    p.return_date,
+                    COALESCE(NULLIF(p.return_type, ''), 'Attrition'),
+                    v_clean_driver_id,
+                    COALESCE(NULLIF(p.driver_name, ''), 'Unknown Driver'),
+                    v_driver_type,
+                    v_clean_veh,
+                    v_clean_city,
+                    0.00,
+                    COALESCE(p.pending_dues, 0.00),
+                    COALESCE(p.damage_penalty, 0.00),
+                    v_total_liab,
+                    CASE WHEN p.remarks IS NOT NULL THEN 'Portal: ' || p.remarks ELSE NULL END,
+                    'PORTAL_FORM',
+                    p.id::TEXT,
+                    FALSE,
+                    (COALESCE(p.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
                     (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                 );
-                v_processed_count := v_processed_count + 1;
-            END IF;
-        END IF;
-    END LOOP;
-
-    -- Step 6.2: Ingest & Merge from july_vehicle_dropoffs
-    IF EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = 'july_vehicle_dropoffs') THEN
-        FOR r_portal IN (SELECT * FROM public.july_vehicle_dropoffs ORDER BY id ASC) LOOP
-            v_clean_veh := UPPER(REGEXP_REPLACE(COALESCE(r_portal.vehicle_number, ''), '[^A-Za-z0-9]', '', 'g'));
-            IF v_clean_veh != '' AND LENGTH(v_clean_veh) >= 8 AND v_clean_veh NOT LIKE '%TEST%' THEN
-                v_clean_city := public.fn_normalize_dropoff_city(r_portal.city_name, v_clean_veh);
-                v_driver_type := public.fn_resolve_driver_type(COALESCE(r_portal.driver_type, 'Individual'), r_portal.driver_id);
-                v_ref_id := 'DRP-PORTAL-' || r_portal.id::TEXT;
-
-                v_return_date := COALESCE(
-                    CASE 
-                        WHEN r_portal.return_date::TEXT ~ '^\d{4}-\d{2}-\d{2}' THEN r_portal.return_date::DATE
-                        WHEN r_portal.return_date::TEXT ~ '^\d{2}/\d{2}/\d{4}' THEN TO_DATE(r_portal.return_date::TEXT, 'DD/MM/YYYY')
-                        ELSE NULL
-                    END,
-                    CURRENT_DATE
-                );
-
-                v_pending_dues := -1.0 * ABS(COALESCE(r_portal.pending_dues, 0.00));
-                v_damage_pen := -1.0 * ABS(COALESCE(r_portal.damage_penalty, 0.00));
-
-                SELECT id, data_source, source_reference_id, negative_balance
-                INTO v_existing_id, v_existing_source, v_existing_ref, v_existing_neg
-                FROM public.core_dropoffs
-                WHERE dropoff_id = v_ref_id
-                   OR source_reference_id = v_ref_id
-                   OR (vehicle_number = v_clean_veh AND return_date = v_return_date AND is_deleted = FALSE)
-                ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 WHEN data_source = 'GOOGLE_SHEET' THEN 2 ELSE 3 END, id ASC
-                LIMIT 1;
-
-                IF v_existing_id IS NOT NULL THEN
-                    v_total_liab := public.fn_calculate_dropoff_liability(
-                        COALESCE(v_existing_neg, 0.00),
-                        v_pending_dues,
-                        v_damage_pen
-                    );
-
-                    UPDATE public.core_dropoffs
-                    SET
-                        city = COALESCE(NULLIF(TRIM(v_clean_city), ''), core_dropoffs.city),
-                        driver_name = COALESCE(NULLIF(TRIM(r_portal.driver_name), ''), core_dropoffs.driver_name),
-                        driver_id = COALESCE(NULLIF(TRIM(r_portal.driver_id), ''), core_dropoffs.driver_id),
-                        driver_type = COALESCE(NULLIF(TRIM(v_driver_type), ''), core_dropoffs.driver_type),
-                        return_type = COALESCE(NULLIF(TRIM(r_portal.return_type), ''), core_dropoffs.return_type),
-                        pending_dues = v_pending_dues,
-                        damage_penalty = v_damage_pen,
-                        total_liability = v_total_liab,
-                        remarks = COALESCE(NULLIF(TRIM(r_portal.remarks), ''), core_dropoffs.remarks),
-                        data_source = CASE WHEN v_existing_source IN ('GOOGLE_SHEET', 'MERGED') THEN 'MERGED' ELSE 'PORTAL_FORM' END,
-                        is_deleted = FALSE,
-                        deleted_at = NULL,
-                        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                    WHERE id = v_existing_id;
-                ELSE
-                    SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_dropoffs;
-                    v_dropoff_id := 'DRP-PORTAL-' || v_next_id;
-                    v_total_liab := public.fn_calculate_dropoff_liability(0.00, v_pending_dues, v_damage_pen);
-
-                    INSERT INTO public.core_dropoffs (
-                        id, dropoff_id, return_date, return_type, driver_id, driver_name,
-                        driver_type, vehicle_number, city, negative_balance, pending_dues,
-                        damage_penalty, total_liability, remarks, data_source, source_reference_id,
-                        is_deleted, created_at, updated_at
-                    ) VALUES (
-                        v_next_id, v_dropoff_id, v_return_date,
-                        COALESCE(NULLIF(TRIM(r_portal.return_type), ''), 'Attrition'),
-                        COALESCE(NULLIF(TRIM(r_portal.driver_id), ''), 'UNKNOWN_DRIVER'),
-                        COALESCE(NULLIF(TRIM(r_portal.driver_name), ''), 'Unknown Driver'),
-                        v_driver_type, v_clean_veh, v_clean_city, 0.00, v_pending_dues,
-                        v_damage_pen, v_total_liab, TRIM(r_portal.remarks), 'PORTAL_FORM',
-                        v_ref_id, FALSE,
-                        (COALESCE(r_portal.created_at, CURRENT_TIMESTAMP) AT TIME ZONE 'Asia/Kolkata'),
-                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                    );
-                    v_processed_count := v_processed_count + 1;
-                END IF;
+                v_inserted_count := v_inserted_count + 1;
             END IF;
         END LOOP;
     END IF;
 
-    -- Step 6.3: Soft-Delete Any Redundant Duplicate Returns on (vehicle_number, return_date)
-    WITH duplicates AS (
-        SELECT id,
-               ROW_NUMBER() OVER (
-                   PARTITION BY vehicle_number, return_date 
-                   ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 WHEN data_source = 'PORTAL_FORM' THEN 2 ELSE 3 END, id ASC
-               ) AS rn
-        FROM public.core_dropoffs
-        WHERE is_deleted = FALSE
-    )
-    UPDATE public.core_dropoffs c
-    SET is_deleted = TRUE,
-        deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-    FROM duplicates d
-    WHERE c.id = d.id AND d.rn > 1;
-
-    RETURN v_processed_count;
+    RETURN v_inserted_count;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -732,7 +892,9 @@ $$ LANGUAGE plpgsql;
 
 COMMENT ON TABLE public.core_dropoffs IS 'Consolidated Master Single Source of Truth for vehicle returns and driver liabilities.';
 COMMENT ON COLUMN public.core_dropoffs.id IS 'Gapless continuous primary key manually assigned via MAX(id) + 1 with advisory lock 777444555.';
-COMMENT ON COLUMN public.core_dropoffs.dropoff_id IS 'Business identifier for drop-off event (e.g. DRP-SHT-1234 or DRP-PORTAL-45).';
+COMMENT ON COLUMN public.core_dropoffs.dropoff_id IS 'Plain numerical business identifier matching id::TEXT (e.g. 1578).';
+COMMENT ON COLUMN public.core_dropoffs.sheet_dropoff_id IS 'Foreign key reference linking directly to public.sheet_dropoffs(dropoff_id).';
+COMMENT ON COLUMN public.core_dropoffs.portal_dropoff_id IS 'Foreign key reference linking directly to public.july_vehicle_dropoffs(id).';
 COMMENT ON COLUMN public.core_dropoffs.return_date IS 'Standardized ISO calendar date when vehicle was returned to hub custody.';
 COMMENT ON COLUMN public.core_dropoffs.return_type IS 'Operational classification (Attrition, Repair and Maintenance, Force Recovery).';
 COMMENT ON COLUMN public.core_dropoffs.driver_id IS 'Identifier linking driver to core_partner_onboarding.';
@@ -746,7 +908,7 @@ COMMENT ON COLUMN public.core_dropoffs.damage_penalty IS 'Signed negative liabil
 COMMENT ON COLUMN public.core_dropoffs.total_liability IS 'Combined signed driver deduction: negative_balance + pending_dues + damage_penalty.';
 COMMENT ON COLUMN public.core_dropoffs.remarks IS 'Inspection notes and handover comments.';
 COMMENT ON COLUMN public.core_dropoffs.data_source IS 'Provenance of dropoff record: GOOGLE_SHEET, PORTAL_FORM, or MERGED.';
-COMMENT ON COLUMN public.core_dropoffs.source_reference_id IS 'Pointer back to source row in sheet_dropoffs or july_vehicle_dropoffs.';
+COMMENT ON COLUMN public.core_dropoffs.source_reference_id IS 'Plain numerical pointer back to source row in sheet_dropoffs or july_vehicle_dropoffs.';
 COMMENT ON COLUMN public.core_dropoffs.is_deleted IS 'Soft-delete flag protecting historical ledger entries.';
 COMMENT ON COLUMN public.core_dropoffs.deleted_at IS 'IST timestamp when row was soft-deleted.';
 COMMENT ON COLUMN public.core_dropoffs.created_at IS 'IST timestamp when record was created.';
@@ -769,73 +931,18 @@ FROM public.core_dropoffs;
 SELECT 
     MIN(id) AS min_id,
     MAX(id) AS max_id,
-    COUNT(*) AS total_rows,
-    MAX(id) - COUNT(*) AS gap_count,
-    CASE 
-        WHEN COUNT(*) = MAX(id) AND MIN(id) = 1 
-        THEN 'PASSED: 100% Gapless Continuous Sequential IDs'
-        ELSE 'FAILED: Sequence Gaps Detected'
-    END AS sequence_status
+    COUNT(*) AS total_records,
+    (SELECT COUNT(*) FROM generate_series(1, (SELECT MAX(id) FROM public.core_dropoffs)) s(i) 
+     LEFT JOIN public.core_dropoffs c ON s.i = c.id WHERE c.id IS NULL) AS sequence_gaps
 FROM public.core_dropoffs;
 
--- Query 3: Missing Sequence Gaps Enumeration (Returns 0 rows if perfect)
-SELECT s.i AS missing_id
-FROM generate_series(1, COALESCE((SELECT MAX(id) FROM public.core_dropoffs), 0)) s(i)
-LEFT JOIN public.core_dropoffs c ON s.i = c.id
-WHERE c.id IS NULL;
-
--- Query 4: Data Source Distribution
-SELECT 
-    data_source,
-    COUNT(*) AS total_records,
-    COUNT(*) FILTER (WHERE is_deleted = FALSE) AS active_records,
-    COUNT(DISTINCT vehicle_number) AS unique_vehicles,
-    ROUND(SUM(total_liability), 2) AS total_liability_incurred
+-- Query 3: Plain Numerical ID Validation (Zero String Prefixes)
+SELECT COUNT(*) AS invalid_dropoff_ids
 FROM public.core_dropoffs
-GROUP BY data_source
-ORDER BY total_records DESC;
+WHERE dropoff_id !~ '^[0-9]+$';
 
--- Query 5: Financial Liability Formula Verification
-SELECT 
-    COUNT(*) AS formula_mismatches
+-- Query 4: Polarity and Financial Balance Validation
+SELECT COUNT(*) AS liability_violations
 FROM public.core_dropoffs
-WHERE ABS(total_liability - (negative_balance + pending_dues + damage_penalty)) > 0.01;
-
--- Query 6: Zero Duplicate Drop-offs on (vehicle_number, return_date) in Active View
-SELECT 
-    vehicle_number, 
-    return_date, 
-    COUNT(*) AS duplicate_count
-FROM public.active_core_dropoffs
-GROUP BY vehicle_number, return_date
-HAVING COUNT(*) > 1;
-
--- Query 7: Timestamp Format & Timezone Integrity Audit
-SELECT 
-    column_name, 
-    data_type, 
-    is_nullable
-FROM information_schema.columns
-WHERE table_schema = 'public' 
-  AND table_name = 'core_dropoffs'
-  AND data_type LIKE '%timestamp%'
-ORDER BY column_name;
-
--- Query 8: City Distribution in Active Master
-SELECT 
-    city,
-    COUNT(*) AS dropoff_events,
-    COUNT(DISTINCT vehicle_number) AS unique_vehicles,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS percentage_share
-FROM public.active_core_dropoffs
-GROUP BY city
-ORDER BY dropoff_events DESC;
-
--- Query 9: Return Reason Breakdown
-SELECT 
-    return_type,
-    COUNT(*) AS count,
-    ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 2) AS percentage_share
-FROM public.active_core_dropoffs
-GROUP BY return_type
-ORDER BY count DESC;
+WHERE total_liability > 0 
+   OR ABS(total_liability - (-1.0 * (ABS(COALESCE(negative_balance, 0.00)) + ABS(COALESCE(pending_dues, 0.00)) + ABS(COALESCE(damage_penalty, 0.00))))) > 0.01;
