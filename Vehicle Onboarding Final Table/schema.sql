@@ -18,7 +18,7 @@
 --   - Zero Changes to Upstream Tables: sheet_vehicle_onboarding and july_vehicle_onboarding
 --     remain 100% untouched.
 --   - Clean IST Timestamps: All timestamps stored as TIMESTAMP WITHOUT TIME ZONE in Asia/Kolkata.
---   - Gapless Sequencing: Uses transactional advisory locks (lock ID 777999111) for continuous IDs.
+--   - High-Throughput Sequencing: Native BIGSERIAL sequence generation without lock contention.
 --   - Soft Delete & Archival: Source deletions trigger is_deleted = TRUE without hard data destruction.
 -- =============================================================================
 
@@ -289,7 +289,6 @@ DECLARE
     v_cng_date DATE;
     v_existing_id BIGINT;
     v_existing_sheet_id BIGINT;
-    v_next_id BIGINT;
 BEGIN
     -- Handle DELETE (Soft-Delete)
     IF TG_OP = 'DELETE' THEN
@@ -412,17 +411,13 @@ BEGIN
             is_migrated = COALESCE(NEW.is_migrated, is_migrated),
             created_by = COALESCE(NEW.created_by, created_by),
             updated_by = COALESCE(NEW.updated_by, updated_by),
-            is_deleted = FALSE,
-            deleted_at = NULL,
+            is_deleted = CASE WHEN is_deleted THEN is_deleted ELSE FALSE END,
+            deleted_at = CASE WHEN is_deleted THEN deleted_at ELSE NULL END,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE id = v_existing_id;
     ELSE
         -- INSERT New Master Row from Portal
-        PERFORM pg_advisory_xact_lock(777999111);
-        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_vehicle_onboarding;
-        
         INSERT INTO public.core_vehicle_onboarding (
-            id,
             source_system, source_table, portal_vehicle_id,
             registration_no, letzryd_unique_no, chassis_no, engine_no,
             city, model, fuel_type, color, dealer_name, registered_owner_name,
@@ -447,7 +442,6 @@ BEGIN
             chassis_review_flag, is_migrated, created_by, updated_by,
             is_deleted, created_at, updated_at
         ) VALUES (
-            v_next_id,
             'PORTAL_FORM', 'july_vehicle_onboarding', NEW.id,
             v_clean_plate, LEFT(NEW.letzryd_unique_no, 100), LEFT(NEW.chassis_number, 100), LEFT(NEW.engine_number, 100),
             v_clean_city, LEFT(NEW.model, 100), LEFT(COALESCE(NEW.fuel_type, 'CNG'), 50), LEFT(NEW.color, 100), LEFT(NEW.dealer_name, 255), LEFT(NEW.registered_owner_name, 255),
@@ -472,7 +466,6 @@ BEGIN
             (LENGTH(TRIM(COALESCE(NEW.chassis_number, ''))) != 17), COALESCE(NEW.is_migrated, FALSE), NEW.created_by, NEW.updated_by,
             FALSE, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
-        PERFORM setval('public.core_vehicle_onboarding_id_seq', v_next_id, true);
     END IF;
 
     RETURN NEW;
@@ -490,7 +483,6 @@ DECLARE
     v_clean_city VARCHAR(100);
     v_existing_id BIGINT;
     v_existing_portal_id INTEGER;
-    v_next_id BIGINT;
 BEGIN
     -- Handle DELETE (Soft-Delete)
     IF TG_OP = 'DELETE' THEN
@@ -524,11 +516,10 @@ BEGIN
             -- Non-conflicting Operational & Financial Fields
             ownership = COALESCE(ownership, NULLIF(NEW.ownership, '')),
             financier = COALESCE(financier, NULLIF(NEW.financier, '')),
-            payment_date = COALESCE(payment_date, NEW.payment_date),
-            delivery_date = COALESCE(delivery_date, NEW.delivery_date),
-            delivery_month = COALESCE(delivery_month, NULLIF(NEW.delivered_month_y, '')),
             ageing = COALESCE(ageing, NULLIF(NEW.ageing, '')),
             vehicle_status = COALESCE(vehicle_status, NULLIF(NEW.vehicle_status, ''), 'ACTIVE'),
+            delivery_date = COALESCE(delivery_date, NEW.delivery_date),
+            payment_date = COALESCE(payment_date, NEW.payment_date),
             gps_status = COALESCE(gps_status, NULLIF(NEW.gps, '')),
             pdi_status = COALESCE(pdi_status, NULLIF(NEW.pdi_status, '')),
             platform = COALESCE(platform, NULLIF(NEW.platform, '')),
@@ -553,7 +544,9 @@ BEGIN
             battery_sl_no = COALESCE(battery_sl_no, NULLIF(NEW.battery_sl_no, '')),
             comments = COALESCE(comments, NULLIF(NEW.comments, '')),
             sheet_row_number = NEW.sheet_row_number,
-            chassis_review_flag = COALESCE(NEW.chassis_review_flag, FALSE),
+            chassis_review_flag = (LENGTH(TRIM(COALESCE(
+                CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.chassis_no, ''), chassis_no) ELSE chassis_no END
+            , ''))) != 17),
             -- If not from portal, update primary specs from sheet
             letzryd_unique_no = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.letzryd_unique_vehicle_no, ''), NULLIF(NEW.letzryd_serial_number, ''), letzryd_unique_no) ELSE letzryd_unique_no END,
             chassis_no = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.chassis_no, ''), chassis_no) ELSE chassis_no END,
@@ -565,6 +558,7 @@ BEGIN
             hp_details = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.hp, ''), hp_details) ELSE hp_details END,
             mfg_date = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.mfg_mm_yy, ''), mfg_date) ELSE mfg_date END,
             received_allocated = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.received_or_allocated, ''), received_allocated) ELSE received_allocated END,
+            delivery_month = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.delivered_month_y, ''), delivery_month) ELSE delivery_month END,
             registration_date = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NEW.registration_date, registration_date) ELSE registration_date END,
             rto_tax_validity = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NEW.rto_tax_validity, rto_tax_validity) ELSE rto_tax_validity END,
             permit_validity = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NEW.permit_validity, permit_validity) ELSE permit_validity END,
@@ -584,17 +578,13 @@ BEGIN
             cng_installation_date = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NEW.cng_installation_date, cng_installation_date) ELSE cng_installation_date END,
             tracking_device_vendor = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.tracking_device_vendor, ''), tracking_device_vendor) ELSE tracking_device_vendor END,
             tracking_device_type = CASE WHEN v_existing_portal_id IS NULL THEN COALESCE(NULLIF(NEW.tracking_device_type, ''), tracking_device_type) ELSE tracking_device_type END,
-            is_deleted = FALSE,
-            deleted_at = NULL,
+            is_deleted = CASE WHEN is_deleted THEN is_deleted ELSE FALSE END,
+            deleted_at = CASE WHEN is_deleted THEN deleted_at ELSE NULL END,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE id = v_existing_id;
     ELSE
         -- INSERT New Master Row from Sheet
-        PERFORM pg_advisory_xact_lock(777999111);
-        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_vehicle_onboarding;
-        
         INSERT INTO public.core_vehicle_onboarding (
-            id,
             source_system, source_table, sheet_vehicle_id,
             registration_no, letzryd_unique_no, chassis_no, engine_no,
             city, model, fuel_type, dealer_name, registered_owner_name,
@@ -616,7 +606,6 @@ BEGIN
             comments, chassis_review_flag,
             is_deleted, created_at, updated_at
         ) VALUES (
-            v_next_id,
             'GOOGLE_SHEET', 'sheet_vehicle_onboarding', NEW.id,
             v_clean_plate, LEFT(COALESCE(NEW.letzryd_unique_vehicle_no, NEW.letzryd_serial_number), 100), LEFT(NEW.chassis_no, 100), LEFT(NEW.engine_no, 100),
             v_clean_city, LEFT(NEW.model, 100), 'CNG', LEFT(NEW.dealer, 255), LEFT(NEW.registered_owner_name, 255),
@@ -637,10 +626,9 @@ BEGIN
             NEW.fast_tag_image_from_inside, NEW.music_system_image,
             NEW.rh_fr_tyre_brand_sl_no, NEW.lh_fr_tyre_brand_sl_no, NEW.rh_rear_tyre_brand_sl_no,
             NEW.lh_rear_tyre_brand_sl_no, NEW.spare_wheel_brand_sl_no, LEFT(NEW.battery_sl_no, 100),
-            NEW.comments, COALESCE(NEW.chassis_review_flag, FALSE),
+            NEW.comments, (LENGTH(TRIM(COALESCE(NEW.chassis_no, ''))) != 17),
             FALSE, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
-        PERFORM setval('public.core_vehicle_onboarding_id_seq', v_next_id, true);
     END IF;
 
     RETURN NEW;

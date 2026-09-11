@@ -74,11 +74,11 @@ The **Master Vehicle Onboarding Pipeline** unifies two independent, operational 
 3. **Deterministic Conflict Priority**:
    - Natural Key = Standardized Registration Number (`registration_no`).
    - If a plate appears in both sources, **Portal Form (`july_vehicle_onboarding`) takes top priority**, while Google Sheet fields enrich non-conflicting operational attributes (PDI status, payment date, ageing, comments).
-4. **Gapless Sequential Primary Keys (`1, 2, 3... N`)**:
-   - Enforced via transactional advisory locks (`pg_advisory_xact_lock(777999111)`) assigning `SELECT COALESCE(MAX(id), 0) + 1`.
-5. **Permanent Archival & Soft Deletes (Zero Data Loss)**:
+4. **High-Throughput Primary Key Sequence**:
+   - Enforced via native PostgreSQL `BIGSERIAL` sequence (`core_vehicle_onboarding_id_seq`), guaranteeing zero lock contention and instantaneous sub-millisecond trigger execution.
+5. **Permanent Archival & Soft Deletes (Zero Data Loss & Resurrection Safeguard)**:
    - Source deletions trigger `is_deleted = TRUE` and record `deleted_at = NOW()`.
-   - No hard data destruction.
+   - Update triggers are guarded against accidental resurrection of decommissioned/deleted assets.
 6. **Standardized Clean Timestamps (IST without `+05:30`)**:
    - Timestamps stored as `TIMESTAMP WITHOUT TIME ZONE` strictly in Indian Standard Time (`Asia/Kolkata`).
 

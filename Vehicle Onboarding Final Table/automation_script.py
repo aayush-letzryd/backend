@@ -265,7 +265,7 @@ def run_backfill():
                 s.spare_wheel_brand_sl_no,
                 s.battery_sl_no,
                 s.comments,
-                COALESCE(s.chassis_review_flag, FALSE),
+                (LENGTH(TRIM(COALESCE(s.chassis_no, ''))) != 17),
                 FALSE,
                 COALESCE((s.created_at AT TIME ZONE 'Asia/Kolkata')::TIMESTAMP, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
                 COALESCE((s.updated_at AT TIME ZONE 'Asia/Kolkata')::TIMESTAMP, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'))
@@ -286,10 +286,6 @@ def run_backfill():
                 j RECORD;
             BEGIN
                 FOR j IN SELECT * FROM public.july_vehicle_onboarding ORDER BY id ASC LOOP
-                    -- Call the portal sync trigger function directly for each portal row
-                    -- Simulated by an update or insert
-                    PERFORM pg_advisory_xact_lock(777999111);
-                    
                     IF EXISTS (SELECT 1 FROM public.core_vehicle_onboarding WHERE registration_no = public.fn_clean_plate(j.vehicle_number)) THEN
                         UPDATE public.core_vehicle_onboarding
                         SET 
@@ -373,16 +369,16 @@ def run_backfill():
                             current_approver_id = COALESCE(j.current_approver_id, current_approver_id),
                             approved_by = COALESCE(j.approved_by, approved_by),
                             approval_remarks = COALESCE(NULLIF(j.approval_remarks, ''), approval_remarks),
+                            chassis_review_flag = (LENGTH(TRIM(COALESCE(j.chassis_number, ''))) != 17),
                             is_migrated = COALESCE(j.is_migrated, is_migrated),
                             created_by = COALESCE(j.created_by, created_by),
                             updated_by = COALESCE(j.updated_by, updated_by),
-                            is_deleted = FALSE,
-                            deleted_at = NULL,
+                            is_deleted = CASE WHEN is_deleted THEN is_deleted ELSE FALSE END,
+                            deleted_at = CASE WHEN is_deleted THEN deleted_at ELSE NULL END,
                             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                         WHERE registration_no = public.fn_clean_plate(j.vehicle_number);
                     ELSE
                         INSERT INTO public.core_vehicle_onboarding (
-                            id,
                             source_system, source_table, portal_vehicle_id,
                             registration_no, letzryd_unique_no, chassis_no, engine_no,
                             city, model, fuel_type, color, dealer_name, registered_owner_name,
@@ -404,10 +400,9 @@ def run_backfill():
                             fast_tag_img, music_system_img,
                             rh_fr_tyre_img, lh_fr_tyre_img, rh_rear_tyre_img, lh_rear_tyre_img, spare_wheel_img,
                             approval_status, current_approver_id, approved_by, approval_remarks,
-                            is_migrated, created_by, updated_by,
+                            chassis_review_flag, is_migrated, created_by, updated_by,
                             is_deleted, created_at, updated_at
                         ) VALUES (
-                            (SELECT COALESCE(MAX(id), 0) + 1 FROM public.core_vehicle_onboarding),
                             'PORTAL_FORM', 'july_vehicle_onboarding', j.id,
                             public.fn_clean_plate(j.vehicle_number), j.letzryd_unique_no, j.chassis_number, j.engine_number,
                             public.fn_clean_city_name(j.city_name), j.model, COALESCE(j.fuel_type, 'CNG'), j.color, j.dealer_name, j.registered_owner_name,
@@ -430,11 +425,12 @@ def run_backfill():
                             j.fast_tag_img, j.music_system_img,
                             j.rh_fr_tyre_img, j.lh_fr_tyre_img, j.rh_rear_tyre_img, j.lh_rear_tyre_img, j.spare_wheel_img,
                             COALESCE(j.approval_status, 'APPROVED'), j.current_approver_id, j.approved_by, j.approval_remarks,
-                            COALESCE(j.is_migrated, FALSE), j.created_by, j.updated_by,
+                            (LENGTH(TRIM(COALESCE(j.chassis_number, ''))) != 17), COALESCE(j.is_migrated, FALSE), j.created_by, j.updated_by,
                             FALSE, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
                         );
                     END IF;
                 END LOOP;
+                PERFORM setval('public.core_vehicle_onboarding_id_seq', (SELECT COALESCE(MAX(id), 1) FROM public.core_vehicle_onboarding), true);
             END $$;
         """)
         print("[+] Portal backfill & overlay completed.")
