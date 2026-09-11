@@ -209,6 +209,12 @@ BEGIN
         RETURN NEW;
     END IF;
 
+    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (handles drop-off, drop off, dropoff, drop_off)
+    IF REGEXP_REPLACE(LOWER(TRIM(COALESCE(NEW.allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff' THEN
+        DELETE FROM public.core_vehicle_allocation WHERE sheet_record_id = NEW.id;
+        RETURN NEW;
+    END IF;
+
     -- City canonicalization
     v_clean_city := CASE 
         WHEN LOWER(TRIM(COALESCE(NEW.city, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
@@ -380,6 +386,12 @@ BEGIN
     v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
     v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
+
+    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (handles drop-off, drop off, dropoff, drop_off)
+    IF REGEXP_REPLACE(LOWER(TRIM(COALESCE(NEW.allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff' THEN
+        DELETE FROM public.core_vehicle_allocation WHERE portal_record_id = NEW.id;
+        RETURN NEW;
+    END IF;
 
     -- Gatekeeper check (Rejects 51 test records!)
     IF NEW.allocation_date IS NULL OR LENGTH(v_clean_vnum) NOT BETWEEN 8 AND 12 OR v_norm_partner_id !~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$' THEN
@@ -703,7 +715,8 @@ BEGIN
     FROM public.sheet_vehicle_allocations s
     WHERE s.allocation_date IS NOT NULL
       AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(s.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
-      AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$';
+      AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+      AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(s.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff';
 
     GET DIAGNOSTICS v_sheet_count = ROW_COUNT;
 
@@ -722,6 +735,7 @@ BEGIN
         WHERE p.allocation_date IS NOT NULL
           AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
           AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+          AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(p.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff'
     ),
     portal_clean AS (
         SELECT * FROM portal_ranked WHERE rn = 1
@@ -820,6 +834,7 @@ BEGIN
         WHERE p.allocation_date IS NOT NULL
           AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
           AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+          AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(p.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff'
     ),
     portal_clean AS (
         SELECT * FROM portal_ranked WHERE rn = 1

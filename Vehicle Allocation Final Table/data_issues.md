@@ -102,3 +102,22 @@ The company's standard Operator/Driver ID format embeds the driver's phone numbe
 
 ### Resolution Logic:
 * Add `submission_timestamp` / `created_at` ordering so that when multiple entries exist for the same vehicle on the same day, the latest verified submission takes precedence.
+
+---
+
+## 7. Portal Drop-Off Leakage Isolation (Multi-Variant Exclusion)
+
+### The Issue:
+* The web portal table `public.july_allocation_form` contains 119 records where `allocation_type` is logged as a vehicle return/drop-off.
+* In initial sync configurations, 85 of these records leaked into `public.core_vehicle_allocation`.
+* Drop-offs belong strictly to the vehicle drop-off domain (`public.core_dropoffs`) and must not contaminate active allocations.
+
+### Resolution Logic:
+* Implement multi-variant drop-off filtering in trigger `sync_core_allocation_from_portal()` and backfill procedure `sp_backfill_core_vehicle_allocation()`:
+  ```sql
+  REGEXP_REPLACE(LOWER(TRIM(COALESCE(allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff'
+  ```
+* This catches all user entry variations: `Drop-Off`, `drop off`, `Drop Off`, `dropoff`, `Dropoff`, `drop_off`.
+* Any matching record is blocked at the gate and never enters `core_vehicle_allocation`. If an existing allocation is modified to a drop-off, it is automatically removed from core.
+* Removing these 85 leaked drop-offs reconciled `core_vehicle_allocation` from 7,335 down to exactly **7,251 clean, continuous allocations** with zero sequence gaps.
+

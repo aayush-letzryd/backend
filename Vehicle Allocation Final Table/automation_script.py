@@ -64,13 +64,14 @@ def audit_health():
     cur.execute("SELECT count(*) as count FROM public.july_allocation_form;")
     portal_total = cur.fetchone()["count"]
 
-    # Portal valid vs rejected
+    # Portal valid vs rejected (excluding drop-offs and invalid formats)
     cur.execute("""
         SELECT count(*) as count 
         FROM public.july_allocation_form
         WHERE allocation_date IS NOT NULL
           AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
-          AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$';
+          AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+          AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(allocation_type, ''))), '[\\s\\-_]', '', 'g') != 'dropoff';
     """)
     portal_valid = cur.fetchone()["count"]
     portal_rejected = portal_total - portal_valid
@@ -256,8 +257,27 @@ def verify_triggers():
     assert merged_core["status"] == "Approved", "Status not updated from portal"
     print(f"   [PASS] Successfully merged (origin={merged_core['source_origin']}, sheet_id={merged_core['sheet_record_id']}, portal_id={merged_core['portal_record_id']})")
 
-    # Step 4: Soft-Delete
-    print("\n4. Testing Soft-Delete Protection (DELETE on public.sheet_vehicle_allocations)...")
+    # Step 4: Drop-Off Rejection Verification
+    print("\n4. Testing Drop-Off Rejection (INSERT Drop-Off on public.july_allocation_form)...")
+    test_dropoff_veh = "TESTDROPOFF99"
+    cur.execute("""
+        INSERT INTO public.july_allocation_form (
+            allocation_date, vehicle_number, driver_id, driver_phone,
+            driver_name, city_name, allocation_type, status, created_at, updated_at
+        ) VALUES (
+            %s, %s, %s, %s,
+            'DROPOFF TEST DRIVER', 'Bangalore', 'Drop-Off',
+            'Approved', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        ) RETURNING id;
+    """, (test_date, test_dropoff_veh, test_did, test_phone))
+    cur.execute("SELECT count(*) as count FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_dropoff_veh,))
+    dropoff_in_core = cur.fetchone()["count"]
+    assert dropoff_in_core == 0, f"Failed: Drop-Off entered core_vehicle_allocation! Found {dropoff_in_core} rows"
+    cur.execute("DELETE FROM public.july_allocation_form WHERE vehicle_number = %s;", (test_dropoff_veh,))
+    print(f"   [PASS] Drop-off successfully blocked from entering core (count in core = {dropoff_in_core})")
+
+    # Step 5: Soft-Delete
+    print("\n5. Testing Soft-Delete Protection (DELETE on public.sheet_vehicle_allocations)...")
     cur.execute("DELETE FROM public.sheet_vehicle_allocations WHERE id = %s;", (sheet_id,))
     cur.execute("SELECT is_deleted, deleted_at FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))
     deleted_core = cur.fetchone()
@@ -265,8 +285,8 @@ def verify_triggers():
     assert deleted_core["deleted_at"] is not None, "Soft-delete failed: deleted_at is NULL"
     print(f"   [PASS] Soft-delete verified (is_deleted={deleted_core['is_deleted']}, deleted_at={deleted_core['deleted_at']})")
 
-    # Step 5: Cleanup & Sequence Realignment (Non-Destructive)
-    print("\n5. Cleaning Up Test Artifacts & Realigning Sequence...")
+    # Step 6: Cleanup & Sequence Realignment (Non-Destructive)
+    print("\n6. Cleaning Up Test Artifacts & Realigning Sequence...")
     cur.execute("DELETE FROM public.sheet_vehicle_allocations WHERE vehicle_number = %s;", (test_veh,))
     cur.execute("DELETE FROM public.july_allocation_form WHERE vehicle_number = %s;", (test_veh,))
     cur.execute("DELETE FROM public.core_vehicle_allocation WHERE vehicle_number = %s;", (test_veh,))

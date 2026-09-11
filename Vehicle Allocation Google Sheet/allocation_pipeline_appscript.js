@@ -418,10 +418,6 @@ function extractRecord(row, excelRow, hMap) {
   if (!dateClean || vehClean === "UNKNOWN") return null;
 
   const allocTypeRaw = cleanPlaceholder(get("Allocation Type", 6));
-  // Explicitly guard against drop-offs entering the allocation table:
-  if (allocTypeRaw && allocTypeRaw.toLowerCase().trim() === "drop-off") {
-    return null;
-  }
 
   return {
     ts: cleanTimestamp(tsRaw),

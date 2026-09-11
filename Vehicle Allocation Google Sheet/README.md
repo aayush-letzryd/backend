@@ -107,4 +107,4 @@ The complete DDL is documented in [`schema.sql`](./schema.sql).
 
 ## 5. Standardization Issues Catalog
 
-All 25 data quality issues identified during dataset profiling and their resolution rules are cataloged in [`data_issues.md`](./data_issues.md).
+All 24 data quality issues identified during dataset profiling and their resolution rules are cataloged in [`data_issues.md`](./data_issues.md).

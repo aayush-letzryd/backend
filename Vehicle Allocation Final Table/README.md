@@ -7,10 +7,10 @@ The **Master Vehicle Allocation Pipeline** unifies vehicle allocation and driver
 ### Upstream Source Systems
 1. **Google Sheets Operational Pipeline (`public.sheet_vehicle_allocations`)**:
    * Form submissions from fleet operations executives across Bangalore, Hyderabad, and Mumbai hubs.
-   * Total volume: 7,143 records (39 columns).
+   * Total volume: 7,229 records (39 columns).
 2. **Web Portal Digital Allocation Form (`public.july_allocation_form`)**:
    * Digital vehicle handover workflow containing comprehensive inspection checklists, 4-sided photos, security cheques, FASTag balances, and multi-tier operational approvals.
-   * Total volume: 306 records (76 columns), including 51 legacy test/dummy submissions and 255 valid production handovers.
+   * Total volume: 347 records (76 columns), including 119 drop-off records (isolated) and test/dummy submissions.
 
 ### End-to-End System Architecture
 
@@ -26,7 +26,7 @@ The **Master Vehicle Allocation Pipeline** unifies vehicle allocation and driver
                           v                                                  v
 +----------------------------------------------------+----------------------------------------------+
 | public.sheet_vehicle_allocations                   | public.july_allocation_form                  |
-| (7,143 rows - 39 columns)                          | (306 rows - 76 columns)                      |
+| (7,229 rows - 39 columns)                          | (347 rows - 76 columns)                      |
 +----------------------------------------------------+----------------------------------------------+
                           |                                                  |
                 AFTER INSERT/UPDATE/DELETE                         AFTER INSERT/UPDATE/DELETE
@@ -38,6 +38,7 @@ The **Master Vehicle Allocation Pipeline** unifies vehicle allocation and driver
                                  +-----------------------------------+
                                  |     POSTGRESQL TRIGGER ENGINE     |
                                  |  * Gatekeeper Check (Regex/Plates)|
+                                 |  * Drop-Off Multi-Variant Filter  |
                                  |  * Auto-Merge on Composite Key    |
                                  |  * Gapless Sequence: MAX(id) + 1  |
                                  |  * Clean IST Timestamp Parsing    |
@@ -48,7 +49,7 @@ The **Master Vehicle Allocation Pipeline** unifies vehicle allocation and driver
                                  +-----------------------------------+
                                  |        MASTER DESTINATION         |
                                  |  public.core_vehicle_allocation   |
-                                 |    (7,231 Consolidated Rows)      |
+                                 |    (7,251 Consolidated Rows)      |
                                  +-----------------------------------+
                                                    |
                                                    +---------------+
@@ -297,33 +298,33 @@ python automation_script.py --verify-triggers
 =================================================================
 
 1. Upstream Source Volume:
-   - Google Sheets (sheet_vehicle_allocations) : 7,143 rows
-   - Web Portal    (july_allocation_form)       : 306 rows (Valid: 255, Test/Rejected: 51)
+   - Google Sheets (sheet_vehicle_allocations) : 7,229 rows
+   - Web Portal    (july_allocation_form)       : 347 rows (Valid: 202, Test/Rejected: 145)
 
 2. Master Table Volume (core_vehicle_allocation):
-   - Total Records     : 7,231
-   - Active Records    : 7,231
+   - Total Records     : 7,251
+   - Active Records    : 7,251
    - Soft-Deleted Rows : 0
 
 3. Provenance Distribution (source_origin):
-   - GOOGLE_SHEET       : 6,987 rows
-   - MERGED             : 156 rows
-   - PORTAL_FORM        : 88 rows
+   - GOOGLE_SHEET       : 7,051 rows
+   - MERGED             : 178 rows
+   - PORTAL_FORM        : 22 rows
 
 4. City Distribution (Standardized):
-   - Bengaluru          : 4,306 rows
-   - Mumbai             : 1,622 rows
-   - Hyderabad          : 1,303 rows
+   - Bengaluru          : 4,366 rows
+   - Mumbai             : 1,581 rows
+   - Hyderabad          : 1,304 rows
 
 5. Allocation Type Distribution (Standardized):
-   - New Allocation     : 5,644 rows
-   - Reallocation       : 1,143 rows
-   - Car Swap           : 379 rows
-   - Drop-Off           : 65 rows
+   - New Allocation     : 5,720 rows
+   - Reallocation       : 1,149 rows
+   - Car Swap           : 382 rows
+   - Drop-Off           : 0 rows (100% Isolated to Drop-off Pipeline)
 
 6. ID Sequence Continuity Integrity:
-   - ID Range          : 1 to 7,231
-   - Total Rows        : 7,231
+   - ID Range          : 1 to 7,251
+   - Total Rows        : 7,251
    - Sequence Gaps     : 0
    - Gapless Status    : PASSED (Continuous 1..N Sequence, Zero Gaps)
 
