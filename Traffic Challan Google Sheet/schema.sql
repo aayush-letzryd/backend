@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS public.sheet_challans (
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     
     -- Composite Natural Key for Idempotent Ingestion
-    CONSTRAINT uq_sheet_challans_reg_notice UNIQUE (vehicle_reg_no, notice_no, week_cycle)
+    CONSTRAINT uq_sheet_challans_reg_notice UNIQUE (vehicle_reg_no, notice_no)
 );
 
 -- Performance B-Tree Indexes

@@ -26,11 +26,11 @@
 function getDbConfig() {
   const props = PropertiesService.getScriptProperties();
   return {
-    host: props.getProperty("DB_HOST") || "35.200.196.113",
+    host: props.getProperty("DB_HOST") || "YOUR_DB_HOST",
     port: props.getProperty("DB_PORT") || "5432",
     database: props.getProperty("DB_NAME") || "postgres",
     user: props.getProperty("DB_USER") || "postgres",
-    password: props.getProperty("DB_PASSWORD") || "8S5]U3@L^Xz)\\FH}",
+    password: props.getProperty("DB_PASSWORD") || "YOUR_DB_PASSWORD",
     sheetUrl: props.getProperty("SHEET_URL") || "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
   };
 }
@@ -41,11 +41,11 @@ function getDbConfig() {
 function setupScriptProperties() {
   const props = PropertiesService.getScriptProperties();
   props.setProperties({
-    "DB_HOST": "35.200.196.113",
+    "DB_HOST": "YOUR_DB_HOST",
     "DB_PORT": "5432",
     "DB_NAME": "postgres",
     "DB_USER": "postgres",
-    "DB_PASSWORD": "8S5]U3@L^Xz)\\FH}",
+    "DB_PASSWORD": "YOUR_DB_PASSWORD",
     "SHEET_URL": "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
   });
   Logger.log("Script properties set successfully.");
@@ -310,26 +310,15 @@ function parseTime(val) {
 }
 
 /**
- * Generates deterministic MD5-based synthetic notice number.
- * (Fix 3.1: Fully deterministic notice ID across re-syncs, eliminating collisions)
+ * Generates clean, human-readable synthetic notice number.
+ * (Format: NOT-{plate}-{date}-{amount} or BAL-{plate}-{weekCycle})
  */
 function generateDeterministicNoticeNo(regNo, vioDate, updDate, vioTime, fineAmt, weekCycle, sheetRowNum) {
   const datePart = vioDate || updDate || "NODATE";
-  const timePart = vioTime ? vioTime.replace(/:/g, "") : "000000";
-  const payload = `${regNo}_${datePart}_${timePart}_${fineAmt}_${weekCycle}_${sheetRowNum}`;
-  const rawDigest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, payload);
-  let hex = "";
-  for (let i = 0; i < 4; i++) {
-    let b = rawDigest[i];
-    if (b < 0) b += 256;
-    let h = b.toString(16);
-    if (h.length === 1) h = "0" + h;
-    hex += h;
-  }
   if (vioDate || fineAmt > 0) {
-    return `NOT-${regNo}-${datePart}-${timePart.substring(0, 4)}-${hex.toUpperCase()}`;
+    return `NOT-${regNo}-${datePart}-${Math.round(fineAmt)}`;
   }
-  return `BAL-${regNo}-${datePart}-${hex.toUpperCase()}`;
+  return `BAL-${regNo}-${weekCycle}`;
 }
 
 // --- DATABASE CTE UPSERT SQL (ZERO SEQUENCE BURNING) ---
@@ -337,6 +326,7 @@ const UPSERT_SQL = `
 WITH upd AS (
   UPDATE public.sheet_challans
   SET city = ?,
+      week_cycle = ?,
       previous_balance = ?,
       audit_date = CAST(? AS date),
       notice_date = CAST(? AS date),
@@ -347,11 +337,12 @@ WITH upd AS (
       amount_paid = ?,
       total_pending = ?,
       remarks = ?,
+      source_tab = ?,
       sheet_row_number = ?,
       is_deleted = FALSE,
       deleted_at = NULL,
       updated_at = CURRENT_TIMESTAMP
-  WHERE vehicle_reg_no = ? AND notice_no = ? AND week_cycle = ?
+  WHERE vehicle_reg_no = ? AND notice_no = ?
   RETURNING 1
 )
 INSERT INTO public.sheet_challans (
@@ -402,39 +393,40 @@ function bindChallanRow(pstmt, row, rowNumber, tabName, colMap) {
   let p = 1;
   // --- UPDATE SET ---
   pstmt.setString(p++, city); // 1
-  pstmt.setDouble(p++, prevBal); // 2
-  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 3
-  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
-  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
-  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 6
-  pstmt.setDouble(p++, fineAmt); // 7
-  pstmt.setDouble(p++, stkFine); // 8
-  pstmt.setDouble(p++, amtPaid); // 9
-  pstmt.setDouble(p++, totPend); // 10
-  pstmt.setString(p++, remarks); // 11
-  pstmt.setInt(p++, rowNumber); // 12
+  pstmt.setString(p++, tabName); // 2: week_cycle
+  pstmt.setDouble(p++, prevBal); // 3
+  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
+  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
+  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6
+  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 7
+  pstmt.setDouble(p++, fineAmt); // 8
+  pstmt.setDouble(p++, stkFine); // 9
+  pstmt.setDouble(p++, amtPaid); // 10
+  pstmt.setDouble(p++, totPend); // 11
+  pstmt.setString(p++, remarks); // 12
+  pstmt.setString(p++, tabName); // 13: source_tab
+  pstmt.setInt(p++, rowNumber); // 14: sheet_row_number
   // --- UPDATE WHERE ---
-  pstmt.setString(p++, regNo); // 13
-  pstmt.setString(p++, noticeNo); // 14
-  pstmt.setString(p++, tabName); // 15
+  pstmt.setString(p++, regNo); // 15
+  pstmt.setString(p++, noticeNo); // 16
 
   // --- INSERT SELECT ---
-  pstmt.setString(p++, regNo); // 16
-  pstmt.setString(p++, noticeNo); // 17
-  pstmt.setString(p++, city); // 18
-  pstmt.setString(p++, tabName); // 19
-  pstmt.setDouble(p++, prevBal); // 20
-  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 21
-  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
-  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
-  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 24
-  pstmt.setDouble(p++, fineAmt); // 25
-  pstmt.setDouble(p++, stkFine); // 26
-  pstmt.setDouble(p++, amtPaid); // 27
-  pstmt.setDouble(p++, totPend); // 28
-  pstmt.setString(p++, remarks); // 29
-  pstmt.setString(p++, tabName); // 30
-  pstmt.setInt(p++, rowNumber); // 31
+  pstmt.setString(p++, regNo); // 17
+  pstmt.setString(p++, noticeNo); // 18
+  pstmt.setString(p++, city); // 19
+  pstmt.setString(p++, tabName); // 20: week_cycle
+  pstmt.setDouble(p++, prevBal); // 21
+  if (updDate) pstmt.setString(p++, updDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
+  if (notDate) pstmt.setString(p++, notDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
+  if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 24
+  if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 25
+  pstmt.setDouble(p++, fineAmt); // 26
+  pstmt.setDouble(p++, stkFine); // 27
+  pstmt.setDouble(p++, amtPaid); // 28
+  pstmt.setDouble(p++, totPend); // 29
+  pstmt.setString(p++, remarks); // 30
+  pstmt.setString(p++, tabName); // 31: source_tab
+  pstmt.setInt(p++, rowNumber); // 32: sheet_row_number
 
   return true;
 }
@@ -691,8 +683,16 @@ function handleOnEdit(e) {
   if (name.toLowerCase().includes("form responses") || name.toLowerCase().includes("template")) return;
 
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(30000)) {
-    Logger.log("handleOnEdit skipped: Lock busy.");
+  let acquired = false;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (lock.tryLock(10000)) {
+      acquired = true;
+      break;
+    }
+    Utilities.sleep(1000 * Math.pow(2, attempt));
+  }
+  if (!acquired) {
+    Logger.log("handleOnEdit skipped: Lock busy after retries.");
     return;
   }
 
@@ -821,39 +821,40 @@ function syncUnifiedChallansMasterToPostgres() {
         let p = 1;
         // UPDATE SET
         pstmt.setString(p++, city); // 1
-        pstmt.setDouble(p++, prevBal); // 2
-        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 3
-        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
-        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
-        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 6
-        pstmt.setDouble(p++, fineAmt); // 7
-        pstmt.setDouble(p++, stkFine); // 8
-        pstmt.setDouble(p++, amtPaid); // 9
-        pstmt.setDouble(p++, totPend); // 10
-        pstmt.setString(p++, remarks); // 11
-        pstmt.setInt(p++, sourceRow); // 12
+        pstmt.setString(p++, weekCycle); // 2: week_cycle
+        pstmt.setDouble(p++, prevBal); // 3
+        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 4
+        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 5
+        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 6
+        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 7
+        pstmt.setDouble(p++, fineAmt); // 8
+        pstmt.setDouble(p++, stkFine); // 9
+        pstmt.setDouble(p++, amtPaid); // 10
+        pstmt.setDouble(p++, totPend); // 11
+        pstmt.setString(p++, remarks); // 12
+        pstmt.setString(p++, sourceTab); // 13: source_tab
+        pstmt.setInt(p++, sourceRow); // 14: sheet_row_number
         // UPDATE WHERE
-        pstmt.setString(p++, regNo); // 13
-        pstmt.setString(p++, noticeNo); // 14
-        pstmt.setString(p++, weekCycle); // 15
+        pstmt.setString(p++, regNo); // 15
+        pstmt.setString(p++, noticeNo); // 16
 
         // INSERT SELECT
-        pstmt.setString(p++, regNo); // 16
-        pstmt.setString(p++, noticeNo); // 17
-        pstmt.setString(p++, city); // 18
-        pstmt.setString(p++, weekCycle); // 19
-        pstmt.setDouble(p++, prevBal); // 20
-        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 21
-        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
-        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
-        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 24
-        pstmt.setDouble(p++, fineAmt); // 25
-        pstmt.setDouble(p++, stkFine); // 26
-        pstmt.setDouble(p++, amtPaid); // 27
-        pstmt.setDouble(p++, totPend); // 28
-        pstmt.setString(p++, remarks); // 29
-        pstmt.setString(p++, sourceTab); // 30
-        pstmt.setInt(p++, sourceRow); // 31
+        pstmt.setString(p++, regNo); // 17
+        pstmt.setString(p++, noticeNo); // 18
+        pstmt.setString(p++, city); // 19
+        pstmt.setString(p++, weekCycle); // 20: week_cycle
+        pstmt.setDouble(p++, prevBal); // 21
+        if (auditDate) pstmt.setString(p++, auditDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 22
+        if (noticeDate) pstmt.setString(p++, noticeDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 23
+        if (vioDate) pstmt.setString(p++, vioDate); else pstmt.setNull(p++, SQL_TYPES.DATE); // 24
+        if (vioTime) pstmt.setString(p++, vioTime); else pstmt.setNull(p++, SQL_TYPES.TIME); // 25
+        pstmt.setDouble(p++, fineAmt); // 26
+        pstmt.setDouble(p++, stkFine); // 27
+        pstmt.setDouble(p++, amtPaid); // 28
+        pstmt.setDouble(p++, totPend); // 29
+        pstmt.setString(p++, remarks); // 30
+        pstmt.setString(p++, sourceTab); // 31: source_tab
+        pstmt.setInt(p++, sourceRow); // 32: sheet_row_number
         
         pstmt.addBatch();
         pendingBatch++;
