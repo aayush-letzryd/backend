@@ -29,11 +29,11 @@ function getDbConfig() {
   } catch(e) {}
 
   return {
-    host: (props && props.getProperty("DB_HOST")) || "35.200.196.113",
+    host: (props && props.getProperty("DB_HOST")) || "YOUR_DB_HOST",
     port: (props && props.getProperty("DB_PORT")) || "5432",
     database: (props && props.getProperty("DB_NAME")) || "postgres",
     user: (props && props.getProperty("DB_USER")) || "postgres",
-    password: (props && props.getProperty("DB_PASSWORD")) || "8S5]U3@L^Xz)\\FH}",
+    password: (props && props.getProperty("DB_PASSWORD")) || "YOUR_DB_PASSWORD",
     
     // Source Spreadsheet with raw form responses ('Onboarding form_V2')
     sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_SPREADSHEET_URL")) || "https://docs.google.com/spreadsheets/d/1ix6iKa9nEh4li44ZRcpkAvEMLo4r94mT4VbwRCfNZIM/edit",
@@ -240,6 +240,10 @@ function sanitizeDL(val) {
   let text = sanitizeText(val);
   if (!text) return null;
   let cleaned = text.toUpperCase().replace(/[\s\-\/\.#_]/g, "");
+  // Explicitly reject dummy placeholders
+  if (cleaned === "NA" || cleaned === "NIL" || cleaned === "NONE" || cleaned === "NULL" || /^0+$/.test(cleaned)) {
+    return null;
+  }
   // If string contains date markers like GMT or standard date representation, reject it
   if (cleaned.indexOf("GMT") !== -1 || cleaned.indexOf("INDIASTANDARDTIME") !== -1) {
     return null;
@@ -404,10 +408,10 @@ function parseDateTime(val, isDob, minYear, maxYear) {
     let year = parseInt(ymdMatch[1], 10);
     let month = parseInt(ymdMatch[2], 10) - 1;
     let day = parseInt(ymdMatch[3], 10);
-    let hour = ymdMatch[4] ? parseInt(ymdMatch[4], 10) : 0;
+    let hour = ymdMatch[4] ? parseInt(ymdMatch[4], 10) : 12;
     let min = ymdMatch[5] ? parseInt(ymdMatch[5], 10) : 0;
     let sec = ymdMatch[6] ? parseInt(ymdMatch[6], 10) : 0;
-    let dt = new Date(year, month, day, hour, min, sec);
+    let dt = new Date(Date.UTC(year, month, day, hour, min, sec) - (5.5 * 3600 * 1000));
     return clampDate(dt);
   }
   
@@ -420,10 +424,10 @@ function parseDateTime(val, isDob, minYear, maxYear) {
     if (year < 100) {
       year = resolveTwoDigitYear(year, isDob);
     }
-    let hour = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 0;
+    let hour = dmyMatch[4] ? parseInt(dmyMatch[4], 10) : 12;
     let min = dmyMatch[5] ? parseInt(dmyMatch[5], 10) : 0;
     let sec = dmyMatch[6] ? parseInt(dmyMatch[6], 10) : 0;
-    let dt = new Date(year, month, day, hour, min, sec);
+    let dt = new Date(Date.UTC(year, month, day, hour, min, sec) - (5.5 * 3600 * 1000));
     return clampDate(dt);
   }
   
@@ -437,7 +441,7 @@ function parseDateTime(val, isDob, minYear, maxYear) {
     let year = parseInt(dMmmYMatch[3], 10);
     if (year < 100) year = resolveTwoDigitYear(year, isDob);
     if (month !== -1) {
-      let dt = new Date(year, month, day);
+      let dt = new Date(Date.UTC(year, month, day, 12, 0, 0) - (5.5 * 3600 * 1000));
       return clampDate(dt);
     }
   }
@@ -449,7 +453,7 @@ function parseDateTime(val, isDob, minYear, maxYear) {
     let year = resolveTwoDigitYear(yy, isDob);
     let month = parseInt(yyMdMatch[2], 10) - 1;
     let day = parseInt(yyMdMatch[3], 10);
-    let dt = new Date(year, month, day);
+    let dt = new Date(Date.UTC(year, month, day, 12, 0, 0) - (5.5 * 3600 * 1000));
     return clampDate(dt);
   }
 
@@ -723,7 +727,7 @@ function sqlEscapeDate(dt) {
 
 function sqlEscapeTimestamp(dt) {
   let s = formatTimestamp(dt);
-  return s ? ("'" + s + "'::timestamp without time zone") : "NULL::timestamp";
+  return s ? ("'" + s + "+05:30'::timestamp with time zone") : "NULL::timestamp with time zone";
 }
 
 function sqlEscapeNum(val) {
@@ -747,7 +751,7 @@ function upsertRecordsToDatabase(records, skipCoreMerge) {
   
   let conn = null;
   let stmt = null;
-  const BATCH_SIZE = 5; // Reduced to 5 rows per SQL statement to prevent Google Apps Script JDBC 'Argument too large: sql' limit
+  const BATCH_SIZE = 25; // 25 rows per CTE statement optimizes throughput while safely staying well below Google Apps Script JDBC SQL size limit
   let totalCount = 0;
   
   try {
@@ -1081,6 +1085,7 @@ function handleOnEdit(e) {
     const rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
     
     const records = [];
+    const targetRows = [];
     const nowStr = formatTimestamp(new Date());
     const targetSs = getTargetSpreadsheet();
     const targetSheet = targetSs.getSheetByName(cfg.targetSheetName);
@@ -1090,11 +1095,14 @@ function handleOnEdit(e) {
       if (parsed) {
         records.push(parsed);
         if (targetSheet) {
-          let sheetRow = formatRecordForSheet(parsed, nowStr);
-          // Write directly at corresponding row coordinate
-          targetSheet.getRange(actualStart + i, 1, 1, sheetRow.length).setValues([sheetRow]);
+          targetRows.push(formatRecordForSheet(parsed, nowStr));
         }
       }
+    }
+    
+    // Batched single RPC write to target sheet
+    if (targetSheet && targetRows.length > 0) {
+      targetSheet.getRange(actualStart, 1, targetRows.length, targetRows[0].length).setValues(targetRows);
     }
     
     if (records.length > 0) {
