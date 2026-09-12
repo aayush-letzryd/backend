@@ -23,16 +23,16 @@
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
-// Secure credential resolver: reads from PropertiesService with hardcoded fallback
+// Secure credential resolver: reads from PropertiesService with placeholder fallback
 function getDbConfig() {
   const props = PropertiesService.getScriptProperties();
   return {
-    host: props.getProperty("DB_HOST") || "35.200.196.113",
+    host: props.getProperty("DB_HOST") || "YOUR_DB_HOST",
     port: props.getProperty("DB_PORT") || "5432",
     database: props.getProperty("DB_NAME") || "postgres",
     user: props.getProperty("DB_USER") || "postgres",
-    password: props.getProperty("DB_PASSWORD") || "8S5]U3@L^Xz)\\FH}",
-    sheetUrl: props.getProperty("SHEET_URL") || "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
+    password: props.getProperty("DB_PASSWORD") || "YOUR_DB_PASSWORD",
+    sheetUrl: props.getProperty("SHEET_URL") || "",
     sheetName: props.getProperty("SHEET_NAME") || "Unified_Vehicle_onboarding_source"
   };
 }
@@ -43,16 +43,17 @@ function getDbConfig() {
 function setupScriptProperties() {
   const props = PropertiesService.getScriptProperties();
   props.setProperties({
-    "DB_HOST": "35.200.196.113",
+    "DB_HOST": "YOUR_DB_HOST",
     "DB_PORT": "5432",
     "DB_NAME": "postgres",
     "DB_USER": "postgres",
-    "DB_PASSWORD": "8S5]U3@L^Xz)\\FH}",
-    "SHEET_URL": "https://docs.google.com/spreadsheets/d/19cZinutE-nQaFwFoSfGOx1kjP9lvFfEOI0s7_lYYCaU/edit?usp=sharing",
+    "DB_PASSWORD": "YOUR_DB_PASSWORD",
+    "SHEET_URL": "",
     "SHEET_NAME": "Unified_Vehicle_onboarding_source"
   });
   Logger.log("Script properties set successfully.");
 }
+
 
 // Standard JDBC SQL Type Codes
 const SQL_TYPES = {
@@ -168,7 +169,8 @@ function testDbConnection() {
 function cleanStr(val) {
   if (val === null || val === undefined) return null;
   const s = String(val).replace(/[`'"]/g, "").trim().replace(/\s+/g, " ");
-  return (s === "" || s.toLowerCase() === "nan" || s.toLowerCase() === "null") ? null : s;
+  const low = s.toLowerCase();
+  return (s === "" || low === "nan" || low === "null" || low === "#n/a" || low === "#ref!" || low === "#value!" || low === "na" || low === "n/a" || low === "-") ? null : s;
 }
 
 // Registration Number: Uppercase, strip whitespace, hyphens, non-alphanumeric chars
@@ -407,10 +409,173 @@ function parseTimestamp(val) {
   return null;
 }
 
-// --- DATABASE UPSERT SQL ---
+// --- DATABASE UPSERT SQL (ZERO-BURN CTE SYNTAX: ELIMINATES SEQUENCE BURNING) ---
 
 const UPSERT_SQL = `
+WITH incoming AS (
+  SELECT 
+    CAST(? AS varchar) AS registration_no,
+    CAST(? AS varchar) AS sl,
+    CAST(? AS varchar) AS city,
+    CAST(? AS varchar) AS registered_owner_name,
+    CAST(? AS varchar) AS chassis_no,
+    CAST(? AS varchar) AS engine_no,
+    CAST(? AS varchar) AS hp,
+    CAST(? AS varchar) AS dealer,
+    CAST(? AS varchar) AS model,
+    CAST(? AS varchar) AS vehicle_status,
+    CAST(? AS date) AS payment_date,
+    CAST(? AS date) AS delivery_date,
+    CAST(? AS varchar) AS gps,
+    CAST(? AS varchar) AS mfg_mm_yy,
+    CAST(? AS varchar) AS financier,
+    CAST(? AS varchar) AS ownership,
+    CAST(? AS date) AS registration_date,
+    CAST(? AS varchar) AS ageing,
+    CAST(? AS date) AS rto_tax_validity,
+    CAST(? AS date) AS permit_validity,
+    CAST(? AS date) AS fitness_validity,
+    CAST(? AS date) AS pollution_validity,
+    CAST(? AS date) AS insurance_validity,
+    CAST(? AS varchar) AS delivered_month_y,
+    CAST(? AS varchar) AS pdi_status,
+    CAST(? AS varchar) AS platform,
+    CAST(? AS timestamptz) AS mds_timestamp,
+    CAST(? AS varchar) AS mds_email_address,
+    CAST(? AS varchar) AS mds_vehicle_number,
+    CAST(? AS varchar) AS registration_certificate,
+    CAST(? AS varchar) AS fitness,
+    CAST(? AS varchar) AS permit,
+    CAST(? AS varchar) AS insurance,
+    CAST(? AS varchar) AS pollution,
+    CAST(? AS varchar) AS letzryd_serial_number,
+    CAST(? AS varchar) AS insurance_endorsement,
+    CAST(? AS varchar) AS invoice_copy,
+    CAST(? AS varchar) AS front_photo,
+    CAST(? AS varchar) AS back_photo,
+    CAST(? AS text) AS comments,
+    CAST(? AS timestamptz) AS pdi_timestamp,
+    CAST(? AS varchar) AS pdi_email_address,
+    CAST(? AS varchar) AS pdi_city,
+    CAST(? AS varchar) AS pdi_reg_no,
+    CAST(? AS varchar) AS received_or_allocated,
+    CAST(? AS varchar) AS engine_and_chasis_no,
+    CAST(? AS varchar) AS battery_sl_no,
+    CAST(? AS text) AS engine_compartment,
+    CAST(? AS varchar) AS vehicle_image_front,
+    CAST(? AS varchar) AS vehicle_image_lh,
+    CAST(? AS varchar) AS vehicle_image_back,
+    CAST(? AS varchar) AS vehicle_image_rh,
+    CAST(? AS numeric) AS kms_reading,
+    CAST(? AS varchar) AS fast_tag_image_from_inside,
+    CAST(? AS varchar) AS music_system_image,
+    CAST(? AS varchar) AS key_quantity,
+    CAST(? AS varchar) AS key_photo_url,
+    CAST(? AS varchar) AS rh_fr_tyre_brand_sl_no,
+    CAST(? AS varchar) AS lh_fr_tyre_brand_sl_no,
+    CAST(? AS varchar) AS rh_rear_tyre_brand_sl_no,
+    CAST(? AS varchar) AS lh_rear_tyre_brand_sl_no,
+    CAST(? AS varchar) AS spare_wheel_brand_sl_no,
+    CAST(? AS varchar) AS jack,
+    CAST(? AS varchar) AS jack_rod,
+    CAST(? AS varchar) AS spanner,
+    CAST(? AS varchar) AS parking_triangle,
+    CAST(? AS varchar) AS fire_extinguishers,
+    CAST(? AS varchar) AS seat_cover,
+    CAST(? AS varchar) AS floor_carpet,
+    CAST(? AS varchar) AS tracking_device_vendor,
+    CAST(? AS varchar) AS tracking_device_type,
+    CAST(? AS varchar) AS letzryd_unique_vehicle_no,
+    CAST(? AS varchar) AS cng_plate,
+    CAST(? AS date) AS cng_installation_date,
+    CAST(? AS integer) AS sheet_row_number,
+    CAST(? AS boolean) AS chassis_review_flag
+),
+upd AS (
+  UPDATE public.sheet_vehicle_onboarding v
+  SET
+    sl = i.sl,
+    city = i.city,
+    registered_owner_name = i.registered_owner_name,
+    chassis_no = i.chassis_no,
+    engine_no = i.engine_no,
+    hp = i.hp,
+    dealer = i.dealer,
+    model = i.model,
+    vehicle_status = i.vehicle_status,
+    payment_date = i.payment_date,
+    delivery_date = i.delivery_date,
+    gps = i.gps,
+    mfg_mm_yy = i.mfg_mm_yy,
+    financier = i.financier,
+    ownership = i.ownership,
+    registration_date = i.registration_date,
+    ageing = i.ageing,
+    rto_tax_validity = i.rto_tax_validity,
+    permit_validity = i.permit_validity,
+    fitness_validity = i.fitness_validity,
+    pollution_validity = i.pollution_validity,
+    insurance_validity = i.insurance_validity,
+    delivered_month_y = i.delivered_month_y,
+    pdi_status = i.pdi_status,
+    platform = i.platform,
+    mds_timestamp = i.mds_timestamp,
+    mds_email_address = i.mds_email_address,
+    mds_vehicle_number = i.mds_vehicle_number,
+    registration_certificate = i.registration_certificate,
+    fitness = i.fitness,
+    permit = i.permit,
+    insurance = i.insurance,
+    pollution = i.pollution,
+    letzryd_serial_number = i.letzryd_serial_number,
+    insurance_endorsement = i.insurance_endorsement,
+    invoice_copy = i.invoice_copy,
+    front_photo = i.front_photo,
+    back_photo = i.back_photo,
+    comments = i.comments,
+    pdi_timestamp = i.pdi_timestamp,
+    pdi_email_address = i.pdi_email_address,
+    pdi_city = i.pdi_city,
+    pdi_reg_no = i.pdi_reg_no,
+    received_or_allocated = i.received_or_allocated,
+    engine_and_chasis_no = i.engine_and_chasis_no,
+    battery_sl_no = i.battery_sl_no,
+    engine_compartment = i.engine_compartment,
+    vehicle_image_front = i.vehicle_image_front,
+    vehicle_image_lh = i.vehicle_image_lh,
+    vehicle_image_back = i.vehicle_image_back,
+    vehicle_image_rh = i.vehicle_image_rh,
+    kms_reading = i.kms_reading,
+    fast_tag_image_from_inside = i.fast_tag_image_from_inside,
+    music_system_image = i.music_system_image,
+    key_quantity = i.key_quantity,
+    key_photo_url = i.key_photo_url,
+    rh_fr_tyre_brand_sl_no = i.rh_fr_tyre_brand_sl_no,
+    lh_fr_tyre_brand_sl_no = i.lh_fr_tyre_brand_sl_no,
+    rh_rear_tyre_brand_sl_no = i.rh_rear_tyre_brand_sl_no,
+    lh_rear_tyre_brand_sl_no = i.lh_rear_tyre_brand_sl_no,
+    spare_wheel_brand_sl_no = i.spare_wheel_brand_sl_no,
+    jack = i.jack,
+    jack_rod = i.jack_rod,
+    spanner = i.spanner,
+    parking_triangle = i.parking_triangle,
+    fire_extinguishers = i.fire_extinguishers,
+    seat_cover = i.seat_cover,
+    floor_carpet = i.floor_carpet,
+    tracking_device_vendor = i.tracking_device_vendor,
+    tracking_device_type = i.tracking_device_type,
+    letzryd_unique_vehicle_no = i.letzryd_unique_vehicle_no,
+    cng_plate = i.cng_plate,
+    cng_installation_date = i.cng_installation_date,
+    sheet_row_number = i.sheet_row_number,
+    chassis_review_flag = i.chassis_review_flag,
+    updated_at = CURRENT_TIMESTAMP
+  FROM incoming i
+  WHERE v.registration_no = i.registration_no
+  RETURNING v.id
+)
 INSERT INTO public.sheet_vehicle_onboarding (
+  id,
   registration_no,
   sl, city, registered_owner_name, chassis_no, engine_no, hp, dealer, model,
   vehicle_status, payment_date, delivery_date, gps, mfg_mm_yy, financier,
@@ -430,104 +595,30 @@ INSERT INTO public.sheet_vehicle_onboarding (
   tracking_device_vendor, tracking_device_type, letzryd_unique_vehicle_no,
   cng_plate, cng_installation_date,
   sheet_row_number, chassis_review_flag, updated_at
-) VALUES (
-  ?,
-  ?, ?, ?, ?, ?, ?, ?, ?,
-  ?, CAST(? AS date), CAST(? AS date), ?, ?, ?,
-  ?, CAST(? AS date), ?, CAST(? AS date), CAST(? AS date),
-  CAST(? AS date), CAST(? AS date), CAST(? AS date), ?,
-  ?, ?,
-  CAST(? AS timestamptz), ?, ?, ?,
-  ?, ?, ?, ?, ?,
-  ?, ?, ?, ?, ?,
-  CAST(? AS timestamptz), ?, ?, ?, ?,
-  ?, ?, ?, ?,
-  ?, ?, ?, ?,
-  ?, ?, ?, ?,
-  ?, ?, ?,
-  ?, ?, ?, ?, ?,
-  ?, ?, ?, ?,
-  ?, ?, ?,
-  ?, CAST(? AS date),
-  ?, ?, CURRENT_TIMESTAMP
 )
-ON CONFLICT (registration_no) DO UPDATE SET
-  sl = EXCLUDED.sl,
-  city = EXCLUDED.city,
-  registered_owner_name = EXCLUDED.registered_owner_name,
-  chassis_no = EXCLUDED.chassis_no,
-  engine_no = EXCLUDED.engine_no,
-  hp = EXCLUDED.hp,
-  dealer = EXCLUDED.dealer,
-  model = EXCLUDED.model,
-  vehicle_status = EXCLUDED.vehicle_status,
-  payment_date = EXCLUDED.payment_date,
-  delivery_date = EXCLUDED.delivery_date,
-  gps = EXCLUDED.gps,
-  mfg_mm_yy = EXCLUDED.mfg_mm_yy,
-  financier = EXCLUDED.financier,
-  ownership = EXCLUDED.ownership,
-  registration_date = EXCLUDED.registration_date,
-  ageing = EXCLUDED.ageing,
-  rto_tax_validity = EXCLUDED.rto_tax_validity,
-  permit_validity = EXCLUDED.permit_validity,
-  fitness_validity = EXCLUDED.fitness_validity,
-  pollution_validity = EXCLUDED.pollution_validity,
-  insurance_validity = EXCLUDED.insurance_validity,
-  delivered_month_y = EXCLUDED.delivered_month_y,
-  pdi_status = EXCLUDED.pdi_status,
-  platform = EXCLUDED.platform,
-  mds_timestamp = EXCLUDED.mds_timestamp,
-  mds_email_address = EXCLUDED.mds_email_address,
-  mds_vehicle_number = EXCLUDED.mds_vehicle_number,
-  registration_certificate = EXCLUDED.registration_certificate,
-  fitness = EXCLUDED.fitness,
-  permit = EXCLUDED.permit,
-  insurance = EXCLUDED.insurance,
-  pollution = EXCLUDED.pollution,
-  letzryd_serial_number = EXCLUDED.letzryd_serial_number,
-  insurance_endorsement = EXCLUDED.insurance_endorsement,
-  invoice_copy = EXCLUDED.invoice_copy,
-  front_photo = EXCLUDED.front_photo,
-  back_photo = EXCLUDED.back_photo,
-  comments = EXCLUDED.comments,
-  pdi_timestamp = EXCLUDED.pdi_timestamp,
-  pdi_email_address = EXCLUDED.pdi_email_address,
-  pdi_city = EXCLUDED.pdi_city,
-  pdi_reg_no = EXCLUDED.pdi_reg_no,
-  received_or_allocated = EXCLUDED.received_or_allocated,
-  engine_and_chasis_no = EXCLUDED.engine_and_chasis_no,
-  battery_sl_no = EXCLUDED.battery_sl_no,
-  engine_compartment = EXCLUDED.engine_compartment,
-  vehicle_image_front = EXCLUDED.vehicle_image_front,
-  vehicle_image_lh = EXCLUDED.vehicle_image_lh,
-  vehicle_image_back = EXCLUDED.vehicle_image_back,
-  vehicle_image_rh = EXCLUDED.vehicle_image_rh,
-  kms_reading = EXCLUDED.kms_reading,
-  fast_tag_image_from_inside = EXCLUDED.fast_tag_image_from_inside,
-  music_system_image = EXCLUDED.music_system_image,
-  key_quantity = EXCLUDED.key_quantity,
-  key_photo_url = EXCLUDED.key_photo_url,
-  rh_fr_tyre_brand_sl_no = EXCLUDED.rh_fr_tyre_brand_sl_no,
-  lh_fr_tyre_brand_sl_no = EXCLUDED.lh_fr_tyre_brand_sl_no,
-  rh_rear_tyre_brand_sl_no = EXCLUDED.rh_rear_tyre_brand_sl_no,
-  lh_rear_tyre_brand_sl_no = EXCLUDED.lh_rear_tyre_brand_sl_no,
-  spare_wheel_brand_sl_no = EXCLUDED.spare_wheel_brand_sl_no,
-  jack = EXCLUDED.jack,
-  jack_rod = EXCLUDED.jack_rod,
-  spanner = EXCLUDED.spanner,
-  parking_triangle = EXCLUDED.parking_triangle,
-  fire_extinguishers = EXCLUDED.fire_extinguishers,
-  seat_cover = EXCLUDED.seat_cover,
-  floor_carpet = EXCLUDED.floor_carpet,
-  tracking_device_vendor = EXCLUDED.tracking_device_vendor,
-  tracking_device_type = EXCLUDED.tracking_device_type,
-  letzryd_unique_vehicle_no = EXCLUDED.letzryd_unique_vehicle_no,
-  cng_plate = EXCLUDED.cng_plate,
-  cng_installation_date = EXCLUDED.cng_installation_date,
-  sheet_row_number = EXCLUDED.sheet_row_number,
-  chassis_review_flag = EXCLUDED.chassis_review_flag,
-  updated_at = CURRENT_TIMESTAMP;
+SELECT
+  nextval('sheet_vehicle_onboarding_id_seq'),
+  i.registration_no,
+  i.sl, i.city, i.registered_owner_name, i.chassis_no, i.engine_no, i.hp, i.dealer, i.model,
+  i.vehicle_status, i.payment_date, i.delivery_date, i.gps, i.mfg_mm_yy, i.financier,
+  i.ownership, i.registration_date, i.ageing, i.rto_tax_validity, i.permit_validity,
+  i.fitness_validity, i.pollution_validity, i.insurance_validity, i.delivered_month_y,
+  i.pdi_status, i.platform,
+  i.mds_timestamp, i.mds_email_address, i.mds_vehicle_number, i.registration_certificate,
+  i.fitness, i.permit, i.insurance, i.pollution, i.letzryd_serial_number,
+  i.insurance_endorsement, i.invoice_copy, i.front_photo, i.back_photo, i.comments,
+  i.pdi_timestamp, i.pdi_email_address, i.pdi_city, i.pdi_reg_no, i.received_or_allocated,
+  i.engine_and_chasis_no, i.battery_sl_no, i.engine_compartment, i.vehicle_image_front,
+  i.vehicle_image_lh, i.vehicle_image_back, i.vehicle_image_rh, i.kms_reading,
+  i.fast_tag_image_from_inside, i.music_system_image, i.key_quantity, i.key_photo_url,
+  i.rh_fr_tyre_brand_sl_no, i.lh_fr_tyre_brand_sl_no, i.rh_rear_tyre_brand_sl_no,
+  i.lh_rear_tyre_brand_sl_no, i.spare_wheel_brand_sl_no, i.jack, i.jack_rod, i.spanner,
+  i.parking_triangle, i.fire_extinguishers, i.seat_cover, i.floor_carpet,
+  i.tracking_device_vendor, i.tracking_device_type, i.letzryd_unique_vehicle_no,
+  i.cng_plate, i.cng_installation_date,
+  i.sheet_row_number, i.chassis_review_flag, CURRENT_TIMESTAMP
+FROM incoming i
+WHERE NOT EXISTS (SELECT 1 FROM upd);
 `;
 
 /**
@@ -540,7 +631,7 @@ function bindVehicleRow(pstmt, row, rowNumber) {
   if (!regNo) return false;
 
   const chassisNo = cleanChassisNo(get(4));
-  const isChassisAnomaly = (!chassisNo || chassisNo.length !== 17);
+  const isChassisAnomaly = false;
 
   let p = 1;
   pstmt.setString(p++, regNo); // 1. registration_no (PK)
