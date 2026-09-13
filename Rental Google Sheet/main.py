@@ -3,7 +3,13 @@ import io
 import requests
 import openpyxl
 import psycopg2
-import functions_framework
+try:
+    import functions_framework
+except ImportError:
+    class functions_framework:
+        @staticmethod
+        def http(f):
+            return f
 
 def get_db_connection():
     return psycopg2.connect(
@@ -93,9 +99,10 @@ def sync_rental_data():
                 if 'All Platform' in ptype or 'All Platform' in plat: rent = 1050.00
                 if "900" in vname or "900" in plan: rent = 900.00
                 if "970" in vname or "970" in plan: rent = 970.00
-                if vcode == 'LETZHYDIP9885838038': rent, indem = 900.00, 0.00
-                elif vcode == 'LETZHYDIP9848529242': rent = 900.00
-                elif vcode == 'LETZHYDIP7396655106': rent = 970.00
+                if vcode in ('LETZHYDIP9885838038', 'LETZHYDIP9701685282', 'LETZHYDIP9848529242'):
+                    rent, indem = 900.00, 0.00
+                elif vcode in ('LETZHYDIP7396655106', 'LETZHYD8897187692'):
+                    rent, indem = 970.00, 30.00
                 add_partner(vcode, vname, 'Hyderabad', vtype, plan, plat, ptype, rent, indem)
 
         # MUM - Driver platform
@@ -118,7 +125,9 @@ def sync_rental_data():
                 vtype = str(r[2]).strip() if len(r) > 2 and r[2] else 'Individual'
                 ptype = str(r[3]).strip() if len(r) > 3 and r[3] else ''
                 rent = 1050.00 if ('All Platform' in ptype) else None
-                indem = 15.00 if vcode == 'LETZBLRIP9036461336' else None
+                indem = None
+                if vcode == 'LETZBLRIP9036461336': indem = 15.00
+                elif vcode == 'LETZBLRIP9656907001': indem = 20.00
                 add_partner(vcode, vname, 'Bengaluru', vtype, '', 'Uber', ptype, rent, indem)
 
         # Side table in HYD - Rental Slab (Columns L to Q: Fixed Rent Drivers)
@@ -143,6 +152,14 @@ def sync_rental_data():
                     try: frent = float(r[10]) if len(r) > 10 else None
                     except: frent = None
                     add_partner(vcode, vname, 'Mumbai', vtype, 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None)
+
+        # Guarantee critical partner exceptions are always included
+        add_partner('LETZHYDIP9701685282', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00)
+        add_partner('LETZHYDIP9885838038', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00)
+        add_partner('LETZHYD8897187692', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00)
+        add_partner('LETZHYDIP7396655106', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00)
+        add_partner('LETZBLRIP9656907001', 'Rishad P V', 'Bengaluru', 'Operator', 'Operator Reducing Slabs', 'Uber', 'Tiered', None, 20.00)
+        add_partner('LETZBLRIP9036461336', 'Nisamudeen K P', 'Bengaluru', 'Operator', 'Standard Slabs', 'Uber', 'Tiered', None, 15.00)
 
         upsert_partner_sql = """
         INSERT INTO sheet_rental_partners (
@@ -267,6 +284,50 @@ def sync_rental_data():
                         rent = float(r[6])
                         add_slab('Bengaluru', 'Maruti Wagonr Tour H3 CNG', 'TBS', 'All Platform', 'All', '0+', 0, 9999, rent, 'All Platform', 'yes')
                     except: pass
+
+        # Fleet Models Baseline Slabs (Xcent, Tigor EV, Nexon EV, Aura, Xpres T, Dzire in BLR/MUM)
+        baseline_fleet_slabs = [
+            ('Hyderabad', 'XCENT CRDI PRIME T BSIV', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 900.00, 'All Platform', 'no'),
+            ('Hyderabad', 'XCENT CRDI PRIME T BSIV', 'TBS', 'Uber Reducing Rent', 'All', '0+', 0, 9999, 900.00, 'Uber', 'no'),
+            ('Hyderabad', 'Hyundai Xcent', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 900.00, 'All Platform', 'no'),
+            ('Hyderabad', 'Hyundai Xcent', 'TBS', 'Uber Reducing Rent', 'All', '0+', 0, 9999, 900.00, 'Uber', 'no'),
+            ('Hyderabad', 'Tigor EV', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1300.00, 'All Platform', 'yes'),
+            ('Hyderabad', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1300.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '50-69', 50, 69, 1200.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '70-89', 70, 89, 1100.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '90+', 90, 9999, 950.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tigor EV', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1300.00, 'All Platform', 'yes'),
+            ('Bengaluru', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1300.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '50-69', 50, 69, 1200.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '70-89', 70, 89, 1100.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tigor EV', 'TBS', 'Uber Reducing Rent', 'All', '90+', 90, 9999, 950.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tata Nexon EV Test', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1500.00, 'All Platform', 'yes'),
+            ('Hyderabad', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1500.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '50-69', 50, 69, 1400.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '70+', 70, 9999, 1250.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tata Nexon EV Test', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1500.00, 'All Platform', 'yes'),
+            ('Bengaluru', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1500.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '50-69', 50, 69, 1400.00, 'Uber', 'yes'),
+            ('Bengaluru', 'Tata Nexon EV Test', 'TBS', 'Uber Reducing Rent', 'All', '70+', 70, 9999, 1250.00, 'Uber', 'yes'),
+            ('Hyderabad', 'Hyundai Aura CNG', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1200.00, 'All Platform', 'no'),
+            ('Hyderabad', 'Hyundai Aura CNG', 'TBS', 'Uber Reducing Rent', 'All', '0+', 0, 9999, 1100.00, 'Uber', 'no'),
+            ('Bengaluru', 'Xpres T CNG XM', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1050.00, 'All Platform', 'no'),
+            ('Bengaluru', 'Xpres T CNG XM', 'TBS', 'Uber Reducing Rent', 'All', '0+', 0, 9999, 929.00, 'Uber', 'no'),
+            ('Hyderabad', 'Xpres T CNG XM', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1050.00, 'All Platform', 'no'),
+            ('Hyderabad', 'Xpres T CNG XM', 'TBS', 'Uber Reducing Rent', 'All', '0+', 0, 9999, 989.00, 'Uber', 'no'),
+            ('Bengaluru', 'Dzire Tour S CNG', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1200.00, 'All Platform', 'no'),
+            ('Bengaluru', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1100.00, 'Uber', 'no'),
+            ('Bengaluru', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '50-59', 50, 59, 1009.00, 'Uber', 'no'),
+            ('Bengaluru', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '60-69', 60, 69, 959.00, 'Uber', 'no'),
+            ('Bengaluru', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '70+', 70, 9999, 899.00, 'Uber', 'no'),
+            ('Mumbai', 'Dzire Tour S CNG', 'TBS', 'All Platform', 'All', '0+', 0, 9999, 1200.00, 'All Platform', 'no'),
+            ('Mumbai', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '0-49', 0, 49, 1100.00, 'Uber', 'no'),
+            ('Mumbai', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '50-59', 50, 59, 1009.00, 'Uber', 'no'),
+            ('Mumbai', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '60-69', 60, 69, 959.00, 'Uber', 'no'),
+            ('Mumbai', 'Dzire Tour S CNG', 'TBS', 'Uber Reducing Rent', 'All', '70+', 70, 9999, 899.00, 'Uber', 'no'),
+        ]
+        for bfs in baseline_fleet_slabs:
+            add_slab(*bfs)
 
         upsert_slab_sql = """
         INSERT INTO sheet_rental_slabs (

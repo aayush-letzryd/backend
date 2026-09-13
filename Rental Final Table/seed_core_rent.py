@@ -74,7 +74,7 @@ def seed_core_rent():
         partner_id = alloc['partner_id'].strip() if alloc['partner_id'] else f"PARTNER_{veh_num}"
         city = alloc['city'].strip() if alloc['city'] else "Bengaluru"
         model = alloc['vehicle_model'].strip() if alloc['vehicle_model'] else "Maruti Wagonr Tour H3 CNG"
-        eff_from = alloc['allocation_date'] if alloc['allocation_date'] else date(2026, 1, 1)
+        eff_from = date(2026, 1, 1)
 
         # Plan scheme & custom daily rent resolution
         custom_rent = None
@@ -96,6 +96,14 @@ def seed_core_rent():
         elif 'TBS' in driver_plan or 'TBS' in type_of_plan:
             plan_scheme = 'Uber TBS'
 
+        # Partner-specific rent overrides
+        if partner_id in ("LETZHYDIP9701685282", "LETZHYDIP9885838038", "LETZHYDIP9848529242") or 'xcent' in model.lower():
+            custom_rent = 900.00
+            plan_scheme = 'Operator Custom Flat'
+        elif partner_id in ("LETZHYD8897187692", "LETZHYDIP7396655106"):
+            custom_rent = 970.00
+            plan_scheme = 'Operator Custom Flat'
+
         # Indemnity determination
         city_lower = city.lower()
         if 'bengaluru' in city_lower or 'bangalore' in city_lower:
@@ -106,7 +114,7 @@ def seed_core_rent():
             else:
                 indemnity = 30.00 # Standard BLR rate
         elif 'hyderabad' in city_lower:
-            if 'xcent' in model.lower() or partner_id == "LETZHYDIP9701685282":
+            if 'xcent' in model.lower() or partner_id in ("LETZHYDIP9701685282", "LETZHYDIP9885838038"):
                 indemnity = 0.00  # Retired Xcents & Shaik Kareem: 0 indemnity
             else:
                 indemnity = 30.00 # Standard HYD rate
