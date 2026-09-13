@@ -440,6 +440,7 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_sync_core_maintenance_from_portal_in ON public.july_maintenance_in;
+DROP TRIGGER IF EXISTS trg_sync_core_maintenance_portal_in ON public.july_maintenance_in;
 CREATE TRIGGER trg_sync_core_maintenance_from_portal_in
 AFTER INSERT OR UPDATE OR DELETE ON public.july_maintenance_in
 FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_maintenance_from_portal_in();
@@ -519,6 +520,8 @@ END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_sync_core_maintenance_from_portal_out ON public.july_maintenance_out;
+DROP TRIGGER IF EXISTS trg_sync_core_maintenance_portal_out ON public.july_maintenance_out;
+DROP FUNCTION IF EXISTS public.sync_core_maintenance_from_portal() CASCADE;
 CREATE TRIGGER trg_sync_core_maintenance_from_portal_out
 AFTER INSERT OR UPDATE OR DELETE ON public.july_maintenance_out
 FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_maintenance_from_portal_out();
