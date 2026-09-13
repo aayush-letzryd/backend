@@ -84,3 +84,13 @@ Following the QC technical audit, the following engineering remediations were im
 4. **Trigger Concurrency Optimization**:
    - **Remediation**: Stripped `pg_advisory_xact_lock(777999111)` and manual `MAX(id) + 1` from both triggers, returning primary key sequence management to native PostgreSQL `BIGSERIAL`.
    - **Result**: Sub-millisecond trigger execution with zero transaction lock contention.
+
+5. **Registration Date Typo Remediation**:
+   - **Audit Finding**: Two vehicles in Google Sheets had severe registration date typos: `KA51AN0200` had `0226-07-23` (typo for 2026-07-23, delivery date 2026-07-31), and `KA51AM8582` had `2028-06-17` (typo for 2026-06-17, delivery date 2026-07-02).
+   - **Remediation**: Corrected both dates in `public.sheet_vehicle_onboarding` and `public.core_vehicle_onboarding`.
+   - **Result**: Zero dates out-of-range (< 1900 or > 2026). 39 records with Excel epoch `1899-12-30` retained as operational blank indicators per business request.
+
+6. **Fleet Denominator Test Asset Isolation**:
+   - **Audit Finding**: Dummy portal record `TS09TEST9999` (ID 1625) remained active (`is_deleted = FALSE`), artificially inflating the fleet denominator.
+   - **Remediation**: Updated `TS09TEST9999` to `is_deleted = TRUE` with `deleted_at` timestamp.
+   - **Result**: Active fleet denominator stands at exactly 1,647 verified real vehicles.
