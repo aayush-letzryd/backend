@@ -589,6 +589,11 @@ function syncRecentMaintenance() {
 
       if (newSheetRows.length > 0) {
         var insertRow = targetSheet.getLastRow() + 1;
+        var maxRows = targetSheet.getMaxRows();
+        var requiredRows = insertRow + newSheetRows.length - 1;
+        if (requiredRows > maxRows) {
+          targetSheet.insertRowsAfter(maxRows, requiredRows - maxRows + 50);
+        }
         targetSheet.getRange(insertRow, 1, newSheetRows.length, newSheetRows[0].length).setValues(newSheetRows);
         Logger.log("Appended " + newSheetRows.length + " new rows to local tab '" + cfg.targetSheetName + "'.");
       } else {
@@ -657,6 +662,12 @@ function syncAllMaintenance() {
     targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
     targetSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#D9EAD3");
     targetSheet.setFrozenRows(1);
+
+    var maxRows = targetSheet.getMaxRows();
+    var requiredRows = sheetRows.length + 10;
+    if (requiredRows > maxRows) {
+      targetSheet.insertRowsAfter(maxRows, requiredRows - maxRows);
+    }
 
     var CHUNK = 500;
     for (var s = 0; s < sheetRows.length; s += CHUNK) {
