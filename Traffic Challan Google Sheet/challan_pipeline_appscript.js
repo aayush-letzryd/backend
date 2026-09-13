@@ -24,14 +24,32 @@
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
 function getDbConfig() {
-  const props = PropertiesService.getScriptProperties();
+  let props = null;
+  try {
+    props = PropertiesService.getScriptProperties();
+  } catch(e) {}
+
+  let host = (props && props.getProperty("DB_HOST")) || "YOUR_DB_HOST";
+  let port = (props && props.getProperty("DB_PORT")) || "5432";
+  let database = (props && props.getProperty("DB_NAME")) || "postgres";
+  let user = (props && props.getProperty("DB_USER")) || "postgres";
+  let password = (props && props.getProperty("DB_PASSWORD")) || "YOUR_DB_PASSWORD";
+
+  // Self-heal corrupted or unescaped password in Script Properties
+  if (!password || password.indexOf("YOUR_") !== -1 || password === "8S5]U3@L^Xz)FH}") {
+    password = "YOUR_DB_PASSWORD";
+  }
+  if (!host || host.indexOf("YOUR_") !== -1) {
+    host = "YOUR_DB_HOST";
+  }
+
   return {
-    host: props.getProperty("DB_HOST") || "YOUR_DB_HOST",
-    port: props.getProperty("DB_PORT") || "5432",
-    database: props.getProperty("DB_NAME") || "postgres",
-    user: props.getProperty("DB_USER") || "postgres",
-    password: props.getProperty("DB_PASSWORD") || "YOUR_DB_PASSWORD",
-    sheetUrl: props.getProperty("SHEET_URL") || "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
+    host: host,
+    port: port,
+    database: database,
+    user: user,
+    password: password,
+    sheetUrl: (props && props.getProperty("SHEET_URL")) || "https://docs.google.com/spreadsheets/d/1jE6H8Uw0SLFgBKxnrFd9kHGNT26pFw0etiwpCeCrLQo/edit?usp=sharing"
   };
 }
 
