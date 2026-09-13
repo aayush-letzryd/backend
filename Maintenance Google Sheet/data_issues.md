@@ -1,236 +1,112 @@
-# LetzRyd Maintenance Pipeline - Data Quality Audit & Issues Specification
+# LetzRyd Maintenance Pipeline (sheet_maintenance) - Fixed Issues Catalog
 
-This document details the data quality anomalies identified in vehicle maintenance and downtime records within the LetzRyd fleet management tracking sheets. It documents the root cause, business and billing impact, and automated standardization rules implemented in `schema.sql` and `maintenance_pipeline_appscript.js`.
-
----
-
-## Executive Summary of Anomalies
-
-| Issue ID | Affected Field | Raw Anomaly Pattern | Severity | Resolution Layer |
-| :--- | :--- | :--- | :--- | :--- |
-| `MAINT-01` | `workshop_name` | Placeholder strings (`'-'`, `'NA'`, `'Local Workshop'`, `'TBD'`) | High | Apps Script & SQL NULLIF regex |
-| `MAINT-02` | `job_card_number` | Missing, blank, or placeholder job card strings | Critical | Strict placeholder filtering & audit logging |
-| `MAINT-03` | `vehicle_number`, `maintenance_date` | Multiple records on same vehicle on same calendar date | High | Composite Unique Key & Upsert resolution |
-| `MAINT-04` | `partner_id` | Driver assignment retention for IP operators vs Individual | Critical | Conditional IP prefix retention logic |
-| `MAINT-05` | `final_status`, `cohort` | Taxonomy drift (`'Maintenance'`, `'Workshop'`, `'Accidental'`, `'BD'`) | High | Ingestion condition mapping & status normalization |
-| `MAINT-06` | `maintenance_date` | Excel epoch serial day floats (`45658.0`) and mixed formats | High | Multi-format date parsing engine |
-| `MAINT-07` | `vehicle_number` | Plate casing, spacing, and hyphen variations | Medium | Canonical alphanumeric regex sanitization |
-| `MAINT-08` | `city` | Inconsistent city abbreviations (`BLR`, `HYD`, `MUM`) and blanks | Medium | Canonical city dictionary with state plate fallback |
-| `MAINT-09` | `dm_name` | Duty Manager name variations and missing POC values | Low | Title trimming and whitespace collapse |
-| `MAINT-10` | `maintenance_reason` | Vague descriptions (`'check'`, `'problem'`) and multi-line remarks | Medium | Text sanitization and whitespace normalization |
+This document details all data quality anomalies, architectural defects, and ingestion issues identified and permanently resolved in the Google Sheet Maintenance staging pipeline (`public.sheet_maintenance`) and its Google Apps Script ingestion engine.
 
 ---
 
-## Detailed Issue Specifications
+## 1. Issue MNT-01: Yard Attendance Cohort Contamination (8,029 RFD Records)
 
-### MAINT-01: Placeholder Strings in Workshop Names
-
-- **Affected Column**: `workshop_name` (Target: `public.sheet_maintenance.workshop_name`)
+- **Affected Column**: `final_status`, `cohort` (Target: `public.sheet_maintenance`)
 - **Raw Anomaly**:
-  Workshop names in manual tracker entries frequently contain placeholder strings rather than authorized garage entities:
-  - Hyphens and punctuation: `'-'`, `'--'`, `'.'`
-  - Generic abbreviations: `'NA'`, `'N/A'`, `'NONE'`, `'NULL'`, `'NIL'`
-  - Vague location labels: `'Local Workshop'`, `'Local'`, `'Outside'`, `'Near Hub'`, `'Yard'`, `'TBD'`
+  The master tracker sheet (`Daily Vehicle Status`) categorized all idle assets under `cohort = 'Off Road'`. This included both genuine workshop downtime vehicles (`final_status = 'Maintenance'`) and yard-idle assets waiting for drivers (`final_status = 'RFD'`). Early scripts ingested over 8,029 RFD rows, 159 Drop Off rows, and 91 New Deployment rows into the maintenance staging table.
 - **Root Cause**:
-  Field operators log a vehicle as Off Road due to breakdown before the vehicle has been physically towed or assigned to an empanelled garage partner (e.g. Carnation, Castrol, Bosch, or Maruti Authorized Service Center). Operators enter temporary strings to bypass spreadsheet validations.
-- **Impact on Operations & Accounting**:
-  - Distorts vendor performance scorecards and turnaround time (TAT) tracking.
-  - Prevents automated matching against monthly workshop invoices in `public.maintenance_invoices`.
-  - Obstructs warranty and insurance claim attribution.
-- **Standardization & Code Resolution**:
-  Both the Google Apps Script (`cleanWorkshopName`) and PostgreSQL ingestion trigger sanitize the input against a comprehensive exclusion list:
-  ```sql
-  CASE 
-      WHEN UPPER(TRIM(COALESCE(workshop_name, ''))) IN (
-          '', '-', '--', '---', 'NA', 'N/A', 'NONE', 'NULL', 'NIL', 
-          'LOCAL', 'LOCAL WORKSHOP', 'TBD', '.', '..', 'UNKNOWN', 'NO'
-      ) THEN NULL 
-      ELSE TRIM(workshop_name) 
-  END
-  ```
-  Legitimate authorized workshops (e.g. `'Maruti True Value - Whitefield'`, `'Bosch Car Service - Begumpet'`) are preserved verbatim.
+  Ingestion filter evaluated `cohort = 'Off Road'` as a blanket maintenance indicator rather than strictly isolating genuine workshop repair taxonomy.
+- **Resolution**:
+  - Refactored `isMaintenanceDowntime()` filter in Apps Script to strictly match genuine repair statuses: `'Maintenance'`, `'Workshop'`, `'Accidental'`, `'BD'`, `'Breakdown'`, `'Under Repair'`, `'Repair'`, `'Service'`.
+  - Explicitly excluded `'RFD'`, `'Drop Off'`, `'New Deployment'`, `'Active'`, and `'Allocation'`.
+  - Purged 8,029 RFD rows, 159 Drop Off rows, and 91 New Deployment rows from `public.sheet_maintenance` and re-indexed the table to 5,007 pure maintenance records.
 
 ---
 
-### MAINT-02: Missing, Blank, or Placeholder Job Card Numbers
+## 2. Issue MNT-02: Google Apps Script 6-Minute Execution Quota Timeout
 
-- **Affected Column**: `job_card_number` (Target: `public.sheet_maintenance.job_card_number`)
+- **Affected Layer**: Apps Script Ingestion Layer (`syncAllMaintenance`)
 - **Raw Anomaly**:
-  Approximately 35% to 45% of daily maintenance entries have empty or pseudo-job cards such as `'-'`, `'Pending'`, `'Awaiting'`, `'Not Generated'`, or `'NA'`. In some cases, operators type repair estimate numbers or invoice reference IDs into the job card column.
+  Attempting to extract and push all 45,039 master tracker rows over JDBC in chunks of 200 required over 225 network round-trips. Each batch took ~5-7 seconds due to row-level database triggers, exceeding Google's strict 360-second execution quota and aborting mid-flight.
 - **Root Cause**:
-  Job cards are issued by external workshops only after physical intake inspection. If a vehicle breaks down on day 1 and sits in queue, the job card is not generated until day 2 or day 3. However, operations logs the downtime immediately on day 1.
-- **Impact on Operations & Accounting**:
-  - Job card number is the legal audit link required to reconcile parts replaced under warranty.
-  - Lack of a job card allows unauthorized or fraudulent repair claims.
-- **Standardization & Code Resolution**:
-  - Map all placeholder strings to SQL `NULL` during ingestion:
+  Client-side un-indexed full historical scans over WAN JDBC connections from Google's US servers to PostgreSQL in India.
+- **Resolution**:
+  - Architected a dual-speed pipeline:
+    1. High-speed server-side batch backfill script inserting historical records (`< 2026-09-13`) directly in PostgreSQL in 2.67 seconds.
+    2. Automated 5-minute sliding-window trigger (`syncRecentMaintenance`) inspecting the latest 1,000 rows, executing in 2 to 3 seconds.
+
+---
+
+## 3. Issue MNT-03: Modern V8 Engine Incompatibility (`ReferenceError: java is not defined`)
+
+- **Affected Layer**: Apps Script JDBC PreparedStatement Binding
+- **Raw Anomaly**:
+  `syncAllMaintenance` and `upsertMaintenanceRecords` crashed with `ReferenceError: java is not defined at line 475`.
+- **Root Cause**:
+  Google Apps Script runs on the modern V8 JavaScript runtime where Java SDK global namespaces (`java.sql.Types`, `java.sql.Date`) are undefined.
+- **Resolution**:
+  - Replaced all `java.sql.Types` references with standard numeric JDBC SQL constants:
+    - `12` for `VARCHAR`
+    - `91` for `DATE`
+    - `4` for `INTEGER`
+  - Replaced `java.sql.Date.valueOf()` with standard string parameter bindings (`ps.setString(col, dateStr)`) coupled with PostgreSQL casting (`?::date`).
+
+---
+
+## 4. Issue MNT-04: Primary Key Sequence Burning on Duplicate Upsert
+
+- **Affected Column**: Primary Key `id` / `public.sheet_maintenance_id_seq`
+- **Raw Anomaly**:
+  Standard PostgreSQL `INSERT ... ON CONFLICT (vehicle_number, date) DO UPDATE` advances the internal `BIGSERIAL` sequence counter for every evaluated row, even when only updating an existing record. Over recurring 5-minute syncs, this burned millions of IDs and created massive sequence gaps.
+- **Root Cause**:
+  PostgreSQL allocates the next sequence value before evaluating unique index conflict constraints.
+- **Resolution**:
+  - Implemented a zero-burn CTE upsert pattern in both SQL and Apps Script:
     ```sql
-    CASE 
-        WHEN UPPER(TRIM(COALESCE(job_card_number, ''))) IN (
-            '', '-', '--', 'NA', 'N/A', 'NONE', 'NULL', 'PENDING', 
-            'TBD', '.', 'NO', 'NIL', 'NOT GENERATED', 'AWAITING'
-        ) THEN NULL 
-        ELSE TRIM(job_card_number) 
-    END
+    WITH upd AS (
+      UPDATE public.sheet_maintenance SET ...
+      WHERE vehicle_number = ? AND date = ?::date
+      RETURNING id
+    )
+    INSERT INTO public.sheet_maintenance (...)
+    SELECT ...
+    WHERE NOT EXISTS (SELECT 1 FROM upd);
     ```
-  - Upstream updates in `sheet_vehicle_status` that subsequently populate the job card automatically update `sheet_maintenance` via `trg_extract_maintenance_from_sheet_status` using `COALESCE(EXCLUDED.job_card_number, target.job_card_number)`.
+  - Primary key IDs now increment strictly on new record inserts, maintaining a perfect 1..N gapless sequence.
 
 ---
 
-### MAINT-03: Multiple Maintenance Records on Same Vehicle on Same Date
+## 5. Issue MNT-05: Google Sheet Dynamic Dimension Out-of-Bounds Error
 
-- **Affected Columns**: `vehicle_number`, `maintenance_date`
+- **Affected Layer**: Apps Script Sheet Writing Engine (`syncAllMaintenance`, `syncRecentMaintenance`)
 - **Raw Anomaly**:
-  A single vehicle appears multiple times on the same date in raw status sheets:
-  - Morning entry indicates `'Breakdown'` while evening entry indicates `'Workshop'`.
-  - Two different hub coordinators submit duplicate status sheets for the same city.
-  - A vehicle is transferred from an internal hub yard to an external workshop within the same 24-hour cycle.
+  New Google Sheets start with 1,000 rows by default. When the script attempted to write ~5,000 extracted maintenance rows, Google Sheets threw:
+  `Exception: The coordinates or dimensions of the range are invalid`.
 - **Root Cause**:
-  Decentralized multi-hub operations logging status updates at different shifts without a shared database transaction coordinator.
-- **Impact on Operations & Accounting**:
-  - Duplicate rows inflate off-road fleet downtime statistics.
-  - Causes primary key collision errors in relational databases.
-  - Risk of duplicate daily rental waivers in Hisaab driver settlement calculations.
-- **Standardization & Code Resolution**:
-  - Natural key constraint defined on `(maintenance_date, vehicle_number)`.
-  - Idempotent upsert semantics (`ON CONFLICT (maintenance_date, vehicle_number) DO UPDATE SET ...`) ensures exactly one consolidated downtime record exists per vehicle per date.
-  - Non-null operational attributes (job card, workshop name, detailed remarks) from later updates overlay and enrich earlier placeholder submissions.
-
----
-
-### MAINT-04: Driver Retention Disparity (IP Operators vs Individual Drivers)
-
-- **Affected Columns**: `partner_id`, `cohort`
-- **Raw Anomaly**:
-  When a vehicle enters maintenance:
-  - For **Individual Drivers**, the driver is de-allocated from the vehicle, `partner_id` should become `NULL`, and daily rental billing is paused/waived.
-  - For **IP (Institutional / Investor Partner) Operators**, the fleet operator retains administrative ownership of the vehicle during the entire workshop duration. The raw sheet frequently retains the operator code (e.g. `LETZBLRIP004`), but sometimes an operator clears the column or replaces it with `'Self'`.
-- **Root Cause**:
-  Different contractual structures:
-  - Individual drivers rent 1:1 and cannot be billed rent when the asset is physically unavailable.
-  - IP operators manage multi-vehicle portfolios under commercial fleet contracts with specific SLA-based maintenance replacement policies.
-- **Impact on Operations & Accounting**:
-  - If an individual driver's ID is erroneously retained during maintenance, automated Hisaab settlement engines bill the driver for downtime days, leading to disputes and chargebacks.
-  - If an IP operator ID is cleared, the vehicle becomes an unassigned orphan, making it impossible to attribute vehicle handover liability or track operator downtime SLAs.
-- **Standardization & Code Resolution**:
-  - The extraction trigger and Apps Script preserve `partner_id` if it conforms to an authorized partner ID format (`LETZ...`), particularly IP operator prefixes (`LETZ%IP%`).
-  - For non-IP individual drivers, downstream status pairing disassociates the active allocation during maintenance intervals while recording downtime rent waiver codes (`rent_waived_reason = 'WORKSHOP_MAINTENANCE'`).
-
----
-
-### MAINT-05: Status and Cohort Taxonomy Drift
-
-- **Affected Columns**: `final_status`, `cohort`
-- **Raw Anomaly**:
-  Different coordinators and historical sheet templates use divergent terminology for maintenance states:
-  - Final status variants: `'Maintenance'`, `'Workshop'`, `'Accidental'`, `'BD'`, `'Breakdown'`, `'Under Repair'`, `'Service'`, `'PDI Hold'`
-  - Cohort variants: `'Off Road'`, `'Off-Road'`, `'Offroad'`, `'Maintenance'`, `'In Yard'`
-- **Root Cause**:
-  Lack of strict data validation dropdowns in legacy Google Sheets across regional offices.
-- **Impact on Operations & Accounting**:
-  - Ingestion queries filtering strictly on `final_status = 'Maintenance'` miss 30% or more of actual off-road downtime events (especially `'BD'` and `'Accidental'`).
-  - Flawed fleet utilization metrics presented to management.
-- **Standardization & Code Resolution**:
-  - Unified extraction criteria in SQL and JavaScript:
-    ```sql
-    WHERE UPPER(TRIM(COALESCE(final_status, ''))) IN ('MAINTENANCE', 'WORKSHOP', 'ACCIDENTAL', 'BD')
-       OR UPPER(TRIM(COALESCE(cohort, ''))) = 'OFF ROAD'
+  `sheet.getRange(row, col, numRows, numCols)` cannot write past `sheet.getMaxRows()`.
+- **Resolution**:
+  - Added automated sheet pre-allocation logic before chunked block writes:
+    ```javascript
+    var maxRows = targetSheet.getMaxRows();
+    var requiredRows = sheetRows.length + 10;
+    if (requiredRows > maxRows) {
+      targetSheet.insertRowsAfter(maxRows, requiredRows - maxRows);
+    }
     ```
-  - Target table normalizes cohort strictly to canonical `'Off Road'`.
 
 ---
 
-### MAINT-06: Excel Epoch Serial Dates & Format Fragmentation
+## 6. Issue MNT-06: Local Sheet Tab Duplicate Record Accumulation
 
-- **Affected Column**: `status_date` / `maintenance_date`
+- **Affected Layer**: High-Frequency 5-Minute Sliding-Window Trigger (`syncRecentMaintenance`)
 - **Raw Anomaly**:
-  Dates appear as:
-  - 5-digit Excel epoch floats: `45658`, `45707.42965`
-  - Indian slash format: `05/09/2026`
-  - Hyphenated format: `05-09-2026`
-  - ISO format: `2026-09-05`
-  - Leading/trailing whitespace: `' 2026-09-05 '`
+  Sliding-window extraction appending rows on every 5-minute cycle caused duplicate records to pile up in the local `sheet_maintenance` spreadsheet tab.
 - **Root Cause**:
-  Data migrated across Excel workbooks (`.xlsx`) and Google Sheets without uniform cell formatting. Copy-pasting raw values converts native dates to serial integers representing days since December 30, 1899.
-- **Impact on Operations & Accounting**:
-  - Direct SQL casting (`::DATE`) fails on raw serial integers, halting ingestion pipelines.
-  - Date misinterpretation (e.g. `05/09/2026` read as May 9 instead of September 5) corrupts chronological maintenance intervals.
-- **Standardization & Code Resolution**:
-  - Apps Script `parseDate(val)` detects numeric serial ranges (`30000 < serial < 60000`), converts epoch milliseconds to canonical Indian Standard Time (`Asia/Kolkata`), and outputs formatted `YYYY-MM-DD` strings.
-  - String date parsing handles both day-first (`DD/MM/YYYY`) and ISO formats.
-
----
-
-### MAINT-07: Vehicle Registration Plate Formatting
-
-- **Affected Column**: `vehicle_number`
-- **Raw Anomaly**:
-  Plates entered with inconsistent casing, whitespace, hyphens, and missing characters:
-  - Lowercase: `ka01ab1234`
-  - Hyphenated: `KA-01-AB-1234`
-  - Spaced: `KA 01 AB 1234`
-  - Trailing punctuation: `KA01AB1234.`
-- **Root Cause**:
-  Manual keyboard typing by field staff on mobile devices and laptops without input masking.
-- **Impact on Operations & Accounting**:
-  - Prevents joins against `public.core_vehicle_onboarding` and `public.core_vehicle_allocation`.
-  - Generates duplicate records for the same physical vehicle under different string keys.
-- **Standardization & Code Resolution**:
-  Standardized regex stripping applied across SQL and Apps Script:
-  ```sql
-  UPPER(REGEXP_REPLACE(vehicle_number, '[^a-zA-Z0-9]', '', 'g'))
-  ```
-  Enforces minimum length of 6 characters and maximum of 15 characters.
-
----
-
-### MAINT-08: City Abbreviation and Hub Mapping Fragmentation
-
-- **Affected Column**: `city`
-- **Raw Anomaly**:
-  City names entered as 3-letter codes (`BLR`, `HYD`, `MUM`, `DEL`), full historical names (`Bangalore`, `Bombay`), or left completely blank.
-- **Root Cause**:
-  Absence of mandatory city dropdown in legacy attendance templates.
-- **Impact on Operations & Accounting**:
-  - Segmented city reporting breaks down.
-  - Regional maintenance budgets and local vendor allocations cannot be aggregated.
-- **Standardization & Code Resolution**:
-  - Dictionary mapping normalizes all known city variants to canonical title case names (`Bengaluru`, `Hyderabad`, `Mumbai`, `Delhi`, `Pune`, `Chennai`).
-  - If city is blank or placeholder, fallback logic infers city deterministically from the state registration code:
-    * `KA%` -> `Bengaluru`
-    * `TS%` / `TG%` -> `Hyderabad`
-    * `MH%` -> `Mumbai`
-    * `DL%` -> `Delhi`
-    * `TN%` -> `Chennai`
-
----
-
-### MAINT-09: Duty Manager / POC Name Inconsistencies
-
-- **Affected Column**: `dm_name`
-- **Raw Anomaly**:
-  Names entered with informal nicknames, job titles appended (e.g. `'Suresh - Yard Incharge'`), casing discrepancies, or generic placeholders (`'DM'`, `'Staff'`).
-- **Root Cause**:
-  Free-text input field without employee ID validation.
-- **Impact on Operations & Accounting**:
-  - Complicates operational audit trails when investigating why an unroadworthy car was released.
-- **Standardization & Code Resolution**:
-  - Strips job title suffixes and collapses multiple spaces.
-  - Maps placeholder values (`'-'`, `'NA'`, `'NONE'`, `'NULL'`) to SQL `NULL`.
-
----
-
-### MAINT-10: Vague and Unstructured Maintenance Reasons
-
-- **Affected Column**: `maintenance_reason`
-- **Raw Anomaly**:
-  Free-text descriptions with unhelpful one-word notes (`'check'`, `'problem'`, `'issue'`, `'work'`, `'running'`), multi-line copy-pasted diagnostic logs, or special characters.
-- **Root Cause**:
-  No standardized maintenance taxonomy or fault category picker (e.g. Electrical, Suspension, Brakes, Transmission, Bodywork, Periodic Service).
-- **Impact on Operations & Accounting**:
-  - Impedes automated categorization of recurring vehicle defects by model or manufacturer.
-  - Hinders identification of chronic mechanical issues for warranty recovery.
-- **Standardization & Code Resolution**:
-  - Strips carriage returns and line feeds into unified single-line strings.
-  - Collapses redundant whitespace.
-  - Nullifies non-informative placeholder strings.
+  Lack of client-side deduplication against existing sheet rows before invoking `setValues()`.
+- **Resolution**:
+  - Added in-memory composite key indexing (`vehicle_number + "_" + date`) checking existing rows in `sheet_maintenance` before appending:
+    ```javascript
+    var newSheetRows = [];
+    for (var k = 0; k < records.length; k++) {
+      var recKey = records[k].vehicle_number + "_" + records[k].date;
+      if (!existingKeys[recKey]) {
+        newSheetRows.push(sheetRows[k]);
+        existingKeys[recKey] = true;
+      }
+    }
+    ```
