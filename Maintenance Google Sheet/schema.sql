@@ -49,21 +49,28 @@ CREATE INDEX IF NOT EXISTS idx_svs_cohort ON public.sheet_vehicle_status (cohort
 -- ------------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.sheet_maintenance (
     id BIGSERIAL PRIMARY KEY,
+    city VARCHAR(20),
     vehicle_number VARCHAR(20) NOT NULL,
-    city VARCHAR(20) NOT NULL,
-    maintenance_date DATE NOT NULL,
-    workshop_name VARCHAR(150),
-    job_card_number VARCHAR(100),
-    maintenance_reason TEXT,
+    date DATE NOT NULL,
+    allocation_date DATE,
+    drop_off_date DATE,
+    final_status VARCHAR(50) NOT NULL DEFAULT 'Maintenance',
     cohort VARCHAR(50) DEFAULT 'Off Road',
-    partner_id VARCHAR(50),
-    dm_name VARCHAR(100),
+    mapping VARCHAR(100),
+    partner_name VARCHAR(150),
+    partner_ids VARCHAR(50),
+    new_partner_name_default VARCHAR(150),
     vehicle_model VARCHAR(100),
-    sheet_status_id BIGINT,
+    dm_name VARCHAR(100),
+    type VARCHAR(50),
     sheet_row_number INTEGER,
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_sheet_maintenance UNIQUE (maintenance_date, vehicle_number)
+    source_tab VARCHAR(50) DEFAULT 'Daily Vehicle Status',
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+    deleted_at TIMESTAMP WITHOUT TIME ZONE,
+    extra_attributes JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+    CONSTRAINT uq_sheet_maintenance UNIQUE (vehicle_number, date)
 );
 
 -- ------------------------------------------------------------------------------
