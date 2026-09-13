@@ -305,3 +305,20 @@ This document provides a comprehensive audit of all 47 data quality anomalies (I
 - **Raw Anomaly**: Empty export columns and local lookup tables.
 - **Standardization Rule**:
   Dropped during ETL ingestion.
+
+
+---
+
+## 8. Technical QC Audit & Database Remediation Log
+
+Following the technical audit of `public.core_partner_onboarding`, the following production remediations were executed:
+
+1. **City Name Standardization (`Bangalore` -> `Bengaluru`)**:
+   - **Finding**: 9 records originating from Web Portal form submissions (`public.july_form_onboarding`) stored city as `Bangalore`, while 1,659 records from Google Sheets used canonical `Bengaluru`.
+   - **Remediation**: Standardized all 9 records to `Bengaluru` across both `public.core_partner_onboarding` and `public.july_form_onboarding`.
+   - **Result**: 100% unified city taxonomy for analytics, slicing, and reporting.
+
+2. **Primary Key Sequence Resynchronization**:
+   - **Finding**: Sequence `public.core_partner_onboarding_id_seq` was lagging at `last_value = 2349` while the table `MAX(id)` was `2367`.
+   - **Remediation**: Executed `SELECT setval('public.core_partner_onboarding_id_seq', 2367);`.
+   - **Result**: Sequence is in exact lockstep with table `MAX(id)`, guaranteeing conflict-free ID generation for future inserts.
