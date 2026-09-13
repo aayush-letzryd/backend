@@ -74,9 +74,9 @@ def audit_rental_engine():
     conn.close()
     print("Integrity audit complete.")
 
-def calculate_daily_rent_record(cur, vehicle_number, log_date, week_id, attendance_status, weekly_trips=0):
+def calculate_daily_rent_record(cur, vehicle_number, log_date, week_id, attendance_status, weekly_trips=0, ola_trips=0):
     """
-    Computes daily rent & indemnity for a vehicle based on attendance, plan, and slabs.
+    Computes daily rent & indemnity for a vehicle based on attendance, plan, slabs, and multi-app rules.
     """
     cur.execute("""
         SELECT * FROM core_rent 
@@ -95,6 +95,7 @@ def calculate_daily_rent_record(cur, vehicle_number, log_date, week_id, attendan
     custom_rent = contract['custom_daily_rent']
     custom_indemnity = contract['custom_daily_indemnity']
 
+    # 1. Golden Rule #2: Off-road / Maintenance attendance
     is_billable = (attendance_status.strip().lower() in ('on-road', 'on road', 'active'))
     if not is_billable:
         return {
@@ -113,31 +114,43 @@ def calculate_daily_rent_record(cur, vehicle_number, log_date, week_id, attendan
             'calculation_rule': f'Non-billable status: {attendance_status}'
         }
 
-    # Custom rent override
+    # 2. Priority 1: Custom partner deal override
     if custom_rent is not None and custom_rent > 0:
         applied_rent = float(custom_rent)
-        calc_rule = f'{plan_scheme} (Custom Daily Rent: {applied_rent})'
+        calc_rule = f'Priority 1: Partner Contract ({applied_rent}/day)'
+    # 3. Priority 2: Multi-app Ola Penalty (Bangalore)
+    elif 'bengaluru' in city.lower() and float(ola_trips or 0) >= 1.0 and 'operator' not in plan_scheme.lower():
+        applied_rent = 1050.00
+        calc_rule = 'Priority 2: Ola Multi-App Penalty Base Rate (1050/day)'
+    # 4. Priority 2: Allocated Plan from sheet_rental_slabs
     else:
-        # Match against sheet_rental_slabs
+        # Determine driver type
+        driver_type = 'Operator' if ('operator' in plan_scheme.lower() or 'fleet' in plan_scheme.lower()) else 'Individual'
+        
         cur.execute("""
             SELECT daily_rent, trip_slab_label 
             FROM sheet_rental_slabs
             WHERE city ILIKE %s 
               AND vehicle_model ILIKE %s
+              AND (driver_type = %s OR driver_type = 'All')
               AND %s >= min_trips
               AND (%s <= max_trips OR max_trips IS NULL)
             ORDER BY min_trips DESC
             LIMIT 1;
-        """, (f"%{city}%", f"%{model.split()[0]}%", weekly_trips, weekly_trips))
+        """, (f"%{city}%", f"%{model.split()[0]}%", driver_type, weekly_trips, weekly_trips))
         slab = cur.fetchone()
         if slab:
             applied_rent = float(slab['daily_rent'])
-            calc_rule = f"Slab Tier: {slab['trip_slab_label']} ({applied_rent}/day)"
+            calc_rule = f"Priority 2: Slab Tier {slab['trip_slab_label']} ({applied_rent}/day)"
         else:
-            applied_rent = 1050.00 if 'wagon' in model.lower() else (1200.00 if 'dzire' in model.lower() else 1400.00)
-            calc_rule = f"Default Model Rate ({applied_rent}/day)"
+            # 5. Priority 3: Fallback Base Rate
+            if 'dzire' in model.lower(): applied_rent = 1200.00
+            elif 'ec3' in model.lower() or 'ev' in model.lower(): applied_rent = 1400.00
+            elif 'xcent' in model.lower(): applied_rent = 900.00
+            else: applied_rent = 1050.00
+            calc_rule = f"Priority 3: Fallback Base ({applied_rent}/day)"
 
-    # Indemnity
+    # Indemnity calculation
     if custom_indemnity is not None:
         applied_indemnity = float(custom_indemnity)
     else:
