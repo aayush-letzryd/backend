@@ -6,52 +6,68 @@
  * Source Sheet : 'Adjustment-Form' (Raw Form Responses)
  * Target Sheet : 'sheet_adjustments' (Standardized Tab in Spreadsheet)
  * Target Table : public.sheet_adjustments & public.core_adjustments
- * Host         : YOUR_DB_HOST_HERE:5432
  * 
- * Features:
- *  - Dual Ingestion: Populates standardized 'sheet_adjustments' tab AND PostgreSQL database
- *  - Real-time live ingestion on form submit (handleOnFormSubmit) and cell edit (handleOnEdit)
- *  - 1-Minute Time-Driven Catch-Up Sync (syncRecentAdjustments) with sliding window
- *  - Full Historical Backfill (syncAllAdjustments) with chunked JDBC batches
- *  - 11-Issue standardization engine (ADJ-01 through ADJ-11)
- *  - Complete connection leak prevention (try-catch-finally with conn.close())
- *  - Deterministic Partner ID generation (LETZ + CITY + PHONE)
- *  - Multi-level approval resolution with timestamp preservation
- *  - Phone number float & scientific notation normalization
- *  - Free-text hisaab week string parsing into canonical ISO week numbers
- *  - Automated trigger installer (setupTriggers) and custom spreadsheet UI menu
+ * Key Features & Audit Fixes:
+ *  - Fix 1: Parameterized JDBC PreparedStatement CTE Upsert (Zero Sequence Burning)
+ *  - Fix 2: Elimination of SQL Injection & raw string concatenation
+ *  - Fix 3: Concurrency script locking with 3-attempt exponential backoff
+ *  - Fix 4: Strict IST timezone date/timestamp extraction (+05:30) preventing 1-day backward shift
+ *  - Fix 5: Empty-row validator in transformAdjustmentRow preventing ghost records
+ *  - Fix 6: API optimization avoiding openByUrl cross-service RPC overhead
+ *  - Fix 7: PropertiesService credential management with automated self-healing
+ *  - Fix 8: Comprehensive testDbConnection and custom spreadsheet UI menu
  * ==============================================================================
  */
 
 // --- CONFIGURATION & DATABASE CREDENTIALS ---
-const DB_CONFIG = {
-  host: "35.200.196.113",
-  port: "5432",
-  database: "postgres",
-  user: "postgres",
-  password: "8S5]U3@L^Xz)\\FH}",
-  
-  sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
-  sourceSheetName: "Adjustment-Form",
-  targetSheetName: "sheet_adjustments"
-};
-
 function getDbConfig() {
   var props = null;
   try {
     props = PropertiesService.getScriptProperties();
   } catch(e){}
   
+  var host = (props && props.getProperty("DB_HOST")) || "YOUR_DB_HOST";
+  var port = (props && props.getProperty("DB_PORT")) || "5432";
+  var database = (props && props.getProperty("DB_NAME")) || "postgres";
+  var user = (props && props.getProperty("DB_USER")) || "postgres";
+  var password = (props && props.getProperty("DB_PASSWORD")) || "YOUR_DB_PASSWORD";
+
+  // Self-heal corrupted or unescaped password in Script Properties
+  if (!password || password.indexOf("YOUR_") !== -1 || password === "8S5]U3@L^Xz)FH}") {
+    password = "YOUR_DB_PASSWORD";
+  }
+  if (!host || host.indexOf("YOUR_") !== -1) {
+    host = "YOUR_DB_HOST";
+  }
+
   return {
-    host: (props && props.getProperty("DB_HOST")) || DB_CONFIG.host,
-    port: (props && props.getProperty("DB_PORT")) || DB_CONFIG.port,
-    database: (props && props.getProperty("DB_NAME")) || DB_CONFIG.database,
-    user: (props && props.getProperty("DB_USER")) || DB_CONFIG.user,
-    password: (props && props.getProperty("DB_PASSWORD")) || DB_CONFIG.password,
-    sourceSpreadsheetUrl: DB_CONFIG.sourceSpreadsheetUrl,
-    sourceSheetName: DB_CONFIG.sourceSheetName,
-    targetSheetName: DB_CONFIG.targetSheetName
+    host: host,
+    port: port,
+    database: database,
+    user: user,
+    password: password,
+    sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_SPREADSHEET_URL")) || "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
+    sourceSheetName: (props && props.getProperty("SOURCE_SHEET_NAME")) || "Adjustment-Form",
+    targetSheetName: (props && props.getProperty("TARGET_SHEET_NAME")) || "sheet_adjustments"
   };
+}
+
+/**
+ * Run once manually to store credentials securely in Script Properties.
+ */
+function setupScriptProperties() {
+  var props = PropertiesService.getScriptProperties();
+  props.setProperties({
+    "DB_HOST": "YOUR_DB_HOST",
+    "DB_PORT": "5432",
+    "DB_NAME": "postgres",
+    "DB_USER": "postgres",
+    "DB_PASSWORD": "YOUR_DB_PASSWORD",
+    "SOURCE_SPREADSHEET_URL": "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
+    "SOURCE_SHEET_NAME": "Adjustment-Form",
+    "TARGET_SHEET_NAME": "sheet_adjustments"
+  });
+  Logger.log("Script properties configured successfully.");
 }
 
 // Standard JDBC SQL Type Codes
@@ -81,13 +97,68 @@ const CITY_PREFIX_MAP = {
 };
 
 // =============================================================================
+// DATABASE CONNECTION & VERIFICATION
+// =============================================================================
+
+function getDbConnection() {
+  var cfg = getDbConfig();
+  var url = "jdbc:postgresql://" + cfg.host + ":" + cfg.port + "/" + cfg.database;
+  return Jdbc.getConnection(url, cfg.user, cfg.password);
+}
+
+/**
+ * Test DB Connection utility with leak-proof cleanup.
+ */
+function testDbConnection() {
+  var cfg = getDbConfig();
+  var conn = null;
+  var stmt = null;
+  var rs = null;
+  try {
+    conn = getDbConnection();
+    stmt = conn.createStatement();
+    rs = stmt.executeQuery("SELECT count(*) FROM public.sheet_adjustments;");
+    rs.next();
+    var count = rs.getInt(1);
+    
+    Logger.log("Connection Successful. Current rows in sheet_adjustments: " + count);
+    try {
+      SpreadsheetApp.getUi().alert(
+        "Connection Successful",
+        "Connected to PostgreSQL on " + cfg.host + ".\nCurrent rows in sheet_adjustments: " + count,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch(e) {}
+  } catch (err) {
+    Logger.log("Connection Failed: " + err.message);
+    try {
+      SpreadsheetApp.getUi().alert(
+        "Connection Failed",
+        "Error: " + err.message,
+        SpreadsheetApp.getUi().ButtonSet.OK
+      );
+    } catch(e) {}
+  } finally {
+    if (rs) { try { rs.close(); } catch(e) {} }
+    if (stmt) { try { stmt.close(); } catch(e) {} }
+    if (conn) { try { conn.close(); } catch(e) {} }
+  }
+}
+
+// =============================================================================
 // SPREADSHEET GETTERS
 // =============================================================================
 
 function getSourceSpreadsheet() {
-  if (DB_CONFIG.sourceSpreadsheetUrl && DB_CONFIG.sourceSpreadsheetUrl.trim() !== "") {
+  try {
+    var active = SpreadsheetApp.getActiveSpreadsheet();
+    if (active) return active;
+  } catch(e) {}
+
+  var cfg = getDbConfig();
+  if (cfg.sourceSpreadsheetUrl && cfg.sourceSpreadsheetUrl.trim() !== "") {
     try {
-      return SpreadsheetApp.openByUrl(DB_CONFIG.sourceSpreadsheetUrl);
+      return SpreadsheetApp.openByUrl(cfg.sourceSpreadsheetUrl);
     } catch(e) {
       Logger.log("openByUrl notice: " + e.message);
     }
@@ -96,14 +167,15 @@ function getSourceSpreadsheet() {
 }
 
 function getSourceSheet() {
+  var cfg = getDbConfig();
   var ss = getSourceSpreadsheet();
   if (!ss) throw new Error("Could not access spreadsheet.");
 
-  var sheet = ss.getSheetByName(DB_CONFIG.sourceSheetName);
+  var sheet = ss.getSheetByName(cfg.sourceSheetName);
   if (sheet) return sheet;
 
   var sheets = ss.getSheets();
-  var targetKey = DB_CONFIG.sourceSheetName.trim().toLowerCase();
+  var targetKey = cfg.sourceSheetName.trim().toLowerCase();
   for (var i = 0; i < sheets.length; i++) {
     var sName = sheets[i].getName().trim().toLowerCase();
     if (sName === targetKey || sName.indexOf("adjustment") !== -1) {
@@ -123,16 +195,17 @@ function getSourceSheet() {
     }
   }
 
-  throw new Error("Source tab '" + DB_CONFIG.sourceSheetName + "' not found in spreadsheet.");
+  throw new Error("Source tab '" + cfg.sourceSheetName + "' not found in spreadsheet.");
 }
 
 function getTargetSheet() {
+  var cfg = getDbConfig();
   var ss = SpreadsheetApp.getActiveSpreadsheet() || getSourceSpreadsheet();
-  var targetSheet = ss.getSheetByName(DB_CONFIG.targetSheetName);
+  var targetSheet = ss.getSheetByName(cfg.targetSheetName);
   
   if (!targetSheet) {
-    Logger.log("Creating target sheet tab '" + DB_CONFIG.targetSheetName + "'...");
-    targetSheet = ss.insertSheet(DB_CONFIG.targetSheetName);
+    Logger.log("Creating target sheet tab '" + cfg.targetSheetName + "'...");
+    targetSheet = ss.insertSheet(cfg.targetSheetName);
     var headers = [
       "Submission Timestamp", "Submitter Email", "City Name", "Partner Type", "Adjustment Type",
       "Partner Name", "Partner Phone", "Partner Code", "Vehicle Number", "Remittance Towards",
@@ -149,37 +222,48 @@ function getTargetSheet() {
 }
 
 // =============================================================================
-// DATA SANITIZATION & STANDARDIZATION ENGINE (ADJ-01 THROUGH ADJ-11)
+// STANDARDIZATION & CLEANING HELPERS
 // =============================================================================
 
-function standardizeCityName(rawCity) {
-  if (!rawCity) return "Bengaluru";
-  var str = String(rawCity).trim().toLowerCase();
-  if (str.indexOf("blr") !== -1 || str.indexOf("bang") !== -1 || str.indexOf("beng") !== -1) return "Bengaluru";
-  if (str.indexOf("mum") !== -1) return "Mumbai";
-  if (str.indexOf("hyd") !== -1) return "Hyderabad";
-  if (str.indexOf("del") !== -1) return "Delhi";
-  if (str.indexOf("chn") !== -1 || str.indexOf("chen") !== -1) return "Chennai";
-  if (str.indexOf("pun") !== -1) return "Pune";
-  return str.charAt(0).toUpperCase() + str.slice(1);
+function standardizeCityName(val) {
+  if (!val) return "Bengaluru";
+  var s = String(val).trim().toLowerCase();
+  if (s.indexOf("bengaluru") !== -1 || s.indexOf("bangalore") !== -1 || s === "blr") return "Bengaluru";
+  if (s.indexOf("hyderabad") !== -1 || s === "hyd") return "Hyderabad";
+  if (s.indexOf("mumbai") !== -1 || s === "mum") return "Mumbai";
+  if (s.indexOf("delhi") !== -1 || s === "del") return "Delhi";
+  if (s.indexOf("chennai") !== -1 || s === "chn") return "Chennai";
+  if (s.indexOf("pune") !== -1 || s === "pun") return "Pune";
+  return val.trim();
 }
 
-function sanitizePhoneNumber(rawPhone) {
-  if (!rawPhone) return null;
-  var str = String(rawPhone).trim();
-  if (["NA", "NAN", "NULL", "NONE", "-"].indexOf(str.toUpperCase()) !== -1) return null;
-  var digits = str.replace(/\D/g, "");
-  if (digits.length >= 10) {
-    return digits.slice(-10);
+function sanitizePhoneNumber(val) {
+  if (val === null || val === undefined) return null;
+  var s = String(val).trim();
+  if (!s || s.toLowerCase() === "null" || s.toLowerCase() === "nan") return null;
+
+  var cleaned = s.replace(/[^0-9]/g, "");
+  if (cleaned.length === 12 && cleaned.indexOf("91") === 0) {
+    cleaned = cleaned.substring(2);
+  }
+  if (cleaned.length > 10) {
+    cleaned = cleaned.slice(-10);
+  }
+  if (cleaned.length === 10 && /^[6-9]/.test(cleaned)) {
+    return cleaned;
   }
   return null;
 }
 
-function generatePartnerId(cityName, phone) {
-  if (!phone) return null;
-  var cityKey = String(cityName).trim().toLowerCase();
-  var prefix = CITY_PREFIX_MAP[cityKey] || "LETZBLR";
-  return prefix + phone;
+function generatePartnerId(city, phone) {
+  var prefix = "LETZBLR";
+  if (city) {
+    var c = city.trim().toLowerCase();
+    if (CITY_PREFIX_MAP[c]) prefix = CITY_PREFIX_MAP[c];
+  }
+  var cleanPhone = phone ? String(phone).replace(/[^0-9]/g, "").slice(-10) : "";
+  if (cleanPhone.length < 10) cleanPhone = "0000000000";
+  return prefix + cleanPhone;
 }
 
 function parseDateOrTimestamp(val, isDateOnly) {
@@ -187,17 +271,17 @@ function parseDateOrTimestamp(val, isDateOnly) {
   if (val instanceof Date) {
     return isDateOnly ? formatDateOnly(val) : formatTimestamp(val);
   }
-  var str = String(val).trim();
-  if (!str || ["NA", "NAN", "NULL", "0", "#N/A", "#VALUE!", "#REF!"].indexOf(str.toUpperCase()) !== -1) return null;
-  
-  var num = parseFloat(str);
-  if (!isNaN(num) && num > 30000 && num < 60000 && /^\d+(\.\d+)?$/.test(str)) {
+  var num = Number(val);
+  if (!isNaN(num) && num > 30000 && num < 60000) {
     var ms = Math.round((num - 25569) * 86400 * 1000);
     var d = new Date(ms);
     return isDateOnly ? formatDateOnly(d) : formatTimestamp(d);
   }
 
-  // DD/MM/YYYY or DD-MM-YYYY (prevents Google Apps Script V8 date swapping)
+  var str = String(val).trim();
+  if (!str || str.toLowerCase() === "null" || str === "-") return null;
+
+  // DD/MM/YYYY or DD-MM-YYYY
   var dmy = str.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})(?:\s+(\d{1,2}):(\d{1,2})(?::(\d{1,2}))?)?/);
   if (dmy) {
     var day = parseInt(dmy[1], 10);
@@ -236,9 +320,10 @@ function formatDateOnly(d) {
   if (typeof Utilities !== "undefined" && Utilities.formatDate) {
     return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd");
   }
-  var y = d.getFullYear();
-  var m = ("0" + (d.getMonth() + 1)).slice(-2);
-  var day = ("0" + d.getDate()).slice(-2);
+  var istTime = new Date(d.getTime() + (330 * 60 * 1000));
+  var y = istTime.getUTCFullYear();
+  var m = ("0" + (istTime.getUTCMonth() + 1)).slice(-2);
+  var day = ("0" + istTime.getUTCDate()).slice(-2);
   return y + "-" + m + "-" + day;
 }
 
@@ -247,12 +332,13 @@ function formatTimestamp(d) {
   if (typeof Utilities !== "undefined" && Utilities.formatDate) {
     return Utilities.formatDate(d, "Asia/Kolkata", "yyyy-MM-dd HH:mm:ssXXX");
   }
-  var y = d.getFullYear();
-  var m = ("0" + (d.getMonth() + 1)).slice(-2);
-  var day = ("0" + d.getDate()).slice(-2);
-  var hh = ("0" + d.getHours()).slice(-2);
-  var mm = ("0" + d.getMinutes()).slice(-2);
-  var ss = ("0" + d.getSeconds()).slice(-2);
+  var istTime = new Date(d.getTime() + (330 * 60 * 1000));
+  var y = istTime.getUTCFullYear();
+  var m = ("0" + (istTime.getUTCMonth() + 1)).slice(-2);
+  var day = ("0" + istTime.getUTCDate()).slice(-2);
+  var hh = ("0" + istTime.getUTCHours()).slice(-2);
+  var mm = ("0" + istTime.getUTCMinutes()).slice(-2);
+  var ss = ("0" + istTime.getUTCSeconds()).slice(-2);
   return y + "-" + m + "-" + day + " " + hh + ":" + mm + ":" + ss + "+05:30";
 }
 
@@ -277,19 +363,27 @@ function parseHisaabWeek(weekStr, weekNumVal) {
 }
 
 function transformAdjustmentRow(row, rowIndex) {
+  if (!row || row.length === 0) return null;
+  
+  // Empty-row guard to prevent phantom ghost records
+  var hasContent = row.some(function(cell) { return cell !== "" && cell !== null && cell !== undefined; });
+  if (!hasContent) return null;
+
+  var rawPhone = row[6];
+  var rawVeh = row[8];
+  var rawPName = row[5];
+  var rawAmt = row[12];
+  if (!rawPhone && !rawVeh && !rawPName && !rawAmt) return null;
+
   var rawTimestamp = row[0];  // Col A: Timestamp
   var submitterEmail = row[1];// Col B: Email address
   var rawCity = row[2];       // Col C: City Name
   var rawPType = row[3];      // Col D: Partner Type
   var rawAType = row[4];      // Col E: Adjustment Type
-  var rawPName = row[5];      // Col F: Partner Name
-  var rawPhone = row[6];      // Col G: Partner Number
   var rawPCode = row[7];      // Col H: Partner Code
-  var rawVeh = row[8];        // Col I: Vehicle number
   var rawRemit = row[9];      // Col J: Remittance Towards
   var rawRentDed = row[10];   // Col K: Rent Deduction
   var rawAdjDate = row[11];   // Col L: Adjustment Date
-  var rawAmt = row[12];       // Col M: Enter Amount
   var photoUrl = row[13];     // Col N: Photo
   var remarks = row[14];      // Col O: Remarks
   var adjRelated = row[15];   // Col P: Adjustment Related to
@@ -307,13 +401,26 @@ function transformAdjustmentRow(row, rowIndex) {
 
   var city = standardizeCityName(rawCity);
   var phone = sanitizePhoneNumber(rawPhone);
-  var partnerCode = rawPCode && String(rawPCode).indexOf("LETZ") !== -1 ? String(rawPCode).trim() : generatePartnerId(city, phone);
+  
+  // Recover phone from partner code if rawPhone was missing
+  if (!phone && rawPCode && /^[A-Z]+(?:IP)?[0-9]{10}$/.test(String(rawPCode).trim())) {
+    phone = String(rawPCode).trim().slice(-10);
+  }
+
+  var partnerCode = rawPCode && /^LETZ(BLR|HYD|MUM|DEL|CHN|PUN)[0-9]{10}$/.test(String(rawPCode).trim()) 
+    ? String(rawPCode).trim() 
+    : generatePartnerId(city, phone);
   
   var subTimestamp = parseDateOrTimestamp(rawTimestamp, false) || formatTimestamp(new Date());
   var adjDate = parseDateOrTimestamp(rawAdjDate, true) || formatDateOnly(new Date());
   
   var cleanVeh = rawVeh ? String(rawVeh).trim().toUpperCase().replace(/[^A-Z0-9]/g, "") : null;
   if (cleanVeh && cleanVeh.length < 6) cleanVeh = null;
+
+  var resolvedFinalStatus = finalStatus ? String(finalStatus).trim() : null;
+  if (!resolvedFinalStatus) {
+    resolvedFinalStatus = (firstStatus === "Rejected") ? "Rejected" : "Pending";
+  }
 
   return {
     submission_timestamp: subTimestamp,
@@ -339,7 +446,7 @@ function transformAdjustmentRow(row, rowIndex) {
     finance_team_status: finStatus ? String(finStatus).trim() : null,
     finance_team_remarks: finRemarks ? String(finRemarks).trim() : null,
     final_level_approver: finalApprover ? String(finalApprover).trim() : null,
-    final_status: finalStatus ? String(finalStatus).trim() : null,
+    final_status: resolvedFinalStatus,
     final_timestamp: parseDateOrTimestamp(finalTs, false),
     hisaab_week_str: hisaabDoneWk ? String(hisaabDoneWk).trim() : null,
     hisaab_week_number: parseHisaabWeek(hisaabDoneWk, hisaabWkNum),
@@ -350,200 +457,197 @@ function transformAdjustmentRow(row, rowIndex) {
 function formatRecordForSheet(r, nowStr) {
   return [
     r.submission_timestamp,
-    r.submitter_email || "",
+    r.submitter_email,
     r.city_name,
     r.partner_type,
     r.adjustment_type,
-    r.partner_name || "",
-    r.partner_phone || "",
-    r.partner_code || "",
-    r.vehicle_number || "",
-    r.remittance_towards || "",
+    r.partner_name,
+    r.partner_phone,
+    r.partner_code,
+    r.vehicle_number,
+    r.remittance_towards,
     r.rent_deduction,
     r.adjustment_date,
     r.amount,
-    r.photo_url || "",
-    r.remarks || "",
-    r.adjustment_related_to || "",
-    r.gps_data || "",
-    r.first_level_approver || "",
-    r.first_level_status || "",
-    r.first_level_timestamp || "",
-    r.finance_team_status || "",
-    r.finance_team_remarks || "",
-    r.final_level_approver || "",
+    r.photo_url,
+    r.remarks,
+    r.adjustment_related_to,
+    r.gps_data,
+    r.first_level_approver,
+    r.first_level_status,
+    r.first_level_timestamp,
+    r.finance_team_status,
+    r.finance_team_remarks,
+    r.final_level_approver,
     r.final_status,
-    r.final_timestamp || "",
-    r.hisaab_week_str || "",
-    r.hisaab_week_number || "",
+    r.final_timestamp,
+    r.hisaab_week_str,
+    r.hisaab_week_number,
     r.source_row,
     nowStr || formatTimestamp(new Date())
   ];
 }
 
 // =============================================================================
-// DATABASE UPSERT ENGINE
+// DATABASE CTE UPSERT ENGINE (ZERO SEQUENCE BURNING)
 // =============================================================================
 
-// Helper SQL formatters to eliminate V8-JDBC bridge RPC latency
-function sqlStr(val) {
-  if (val === null || val === undefined) return "NULL::text";
-  var s = String(val).trim();
-  if (s === "") return "NULL::text";
-  return "'" + s.replace(/\\/g, "\\\\").replace(/'/g, "''") + "'::text";
-}
+const UPSERT_SQL = `
+WITH upd AS (
+  UPDATE public.sheet_adjustments
+  SET submitter_email = ?,
+      city_name = ?,
+      partner_type = ?,
+      partner_name = ?,
+      partner_code = ?,
+      vehicle_number = ?,
+      remittance_towards = ?,
+      rent_deduction = ?,
+      amount = ?,
+      photo_url = ?,
+      remarks = ?,
+      adjustment_related_to = ?,
+      gps_data = ?,
+      first_level_approver = ?,
+      first_level_status = ?,
+      first_level_timestamp = CAST(? AS timestamptz),
+      finance_team_status = ?,
+      finance_team_remarks = ?,
+      final_level_approver = ?,
+      final_status = ?,
+      final_timestamp = CAST(? AS timestamptz),
+      hisaab_week_str = ?,
+      hisaab_week_number = ?,
+      updated_at = CURRENT_TIMESTAMP
+  WHERE submission_timestamp = CAST(? AS timestamptz)
+    AND partner_phone IS NOT DISTINCT FROM ?
+    AND adjustment_date = CAST(? AS date)
+    AND adjustment_type = ?
+  RETURNING 1
+)
+INSERT INTO public.sheet_adjustments (
+  submission_timestamp, submitter_email, city_name, partner_type, adjustment_type,
+  partner_name, partner_phone, partner_code, vehicle_number, remittance_towards,
+  rent_deduction, adjustment_date, amount, photo_url, remarks,
+  adjustment_related_to, gps_data, first_level_approver, first_level_status, first_level_timestamp,
+  finance_team_status, finance_team_remarks, final_level_approver, final_status, final_timestamp,
+  hisaab_week_str, hisaab_week_number, ingested_at, updated_at
+)
+SELECT CAST(? AS timestamptz), ?, ?, ?, ?,
+       ?, ?, ?, ?, ?,
+       ?, CAST(? AS date), ?, ?, ?,
+       ?, ?, ?, ?, CAST(? AS timestamptz),
+       ?, ?, ?, ?, CAST(? AS timestamptz),
+       ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+WHERE NOT EXISTS (SELECT 1 FROM upd);
+`;
 
-function sqlNum(val) {
-  if (val === null || val === undefined || val === "") return "0.00::numeric";
-  var n = parseFloat(val);
-  return (isNaN(n) ? "0.00" : n.toFixed(2)) + "::numeric";
-}
+function bindAdjustmentRow(pstmt, r) {
+  var p = 1;
 
-function sqlInt(val) {
-  if (val === null || val === undefined || val === "") return "NULL::integer";
-  var n = parseInt(val, 10);
-  return (isNaN(n) ? "NULL::integer" : String(n)) + "::integer";
-}
+  // --- UPDATE SET (23 parameters) ---
+  if (r.submitter_email) pstmt.setString(p++, r.submitter_email); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 1
+  pstmt.setString(p++, r.city_name); // 2
+  pstmt.setString(p++, r.partner_type); // 3
+  if (r.partner_name) pstmt.setString(p++, r.partner_name); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 4
+  if (r.partner_code) pstmt.setString(p++, r.partner_code); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 5
+  if (r.vehicle_number) pstmt.setString(p++, r.vehicle_number); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 6
+  if (r.remittance_towards) pstmt.setString(p++, r.remittance_towards); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 7
+  pstmt.setDouble(p++, r.rent_deduction || 0.0); // 8
+  pstmt.setDouble(p++, r.amount || 0.0); // 9
+  if (r.photo_url) pstmt.setString(p++, r.photo_url); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 10
+  if (r.remarks) pstmt.setString(p++, r.remarks); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 11
+  if (r.adjustment_related_to) pstmt.setString(p++, r.adjustment_related_to); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 12
+  if (r.gps_data) pstmt.setString(p++, r.gps_data); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 13
+  if (r.first_level_approver) pstmt.setString(p++, r.first_level_approver); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 14
+  if (r.first_level_status) pstmt.setString(p++, r.first_level_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 15
+  if (r.first_level_timestamp) pstmt.setString(p++, r.first_level_timestamp); else pstmt.setNull(p++, SQL_TYPES.TIMESTAMP); // 16
+  if (r.finance_team_status) pstmt.setString(p++, r.finance_team_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 17
+  if (r.finance_team_remarks) pstmt.setString(p++, r.finance_team_remarks); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 18
+  if (r.final_level_approver) pstmt.setString(p++, r.final_level_approver); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 19
+  if (r.final_status) pstmt.setString(p++, r.final_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 20
+  if (r.final_timestamp) pstmt.setString(p++, r.final_timestamp); else pstmt.setNull(p++, SQL_TYPES.TIMESTAMP); // 21
+  if (r.hisaab_week_str) pstmt.setString(p++, r.hisaab_week_str); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 22
+  if (r.hisaab_week_number !== null && r.hisaab_week_number !== undefined) pstmt.setInt(p++, r.hisaab_week_number); else pstmt.setNull(p++, SQL_TYPES.INTEGER); // 23
 
-function sqlDate(val) {
-  if (!val) return "NULL::date";
-  return "'" + String(val).replace(/'/g, "") + "'::date";
-}
+  // --- UPDATE WHERE (4 parameters) ---
+  pstmt.setString(p++, r.submission_timestamp); // 24
+  if (r.partner_phone) pstmt.setString(p++, r.partner_phone); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 25
+  pstmt.setString(p++, r.adjustment_date); // 26
+  pstmt.setString(p++, r.adjustment_type); // 27
 
-function sqlTimestamp(val) {
-  if (!val) return "NULL::timestamptz";
-  return "'" + String(val).replace(/'/g, "") + "'::timestamptz";
+  // --- INSERT SELECT (27 parameters) ---
+  pstmt.setString(p++, r.submission_timestamp); // 28
+  if (r.submitter_email) pstmt.setString(p++, r.submitter_email); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 29
+  pstmt.setString(p++, r.city_name); // 30
+  pstmt.setString(p++, r.partner_type); // 31
+  pstmt.setString(p++, r.adjustment_type); // 32
+  if (r.partner_name) pstmt.setString(p++, r.partner_name); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 33
+  if (r.partner_phone) pstmt.setString(p++, r.partner_phone); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 34
+  if (r.partner_code) pstmt.setString(p++, r.partner_code); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 35
+  if (r.vehicle_number) pstmt.setString(p++, r.vehicle_number); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 36
+  if (r.remittance_towards) pstmt.setString(p++, r.remittance_towards); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 37
+  pstmt.setDouble(p++, r.rent_deduction || 0.0); // 38
+  pstmt.setString(p++, r.adjustment_date); // 39
+  pstmt.setDouble(p++, r.amount || 0.0); // 40
+  if (r.photo_url) pstmt.setString(p++, r.photo_url); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 41
+  if (r.remarks) pstmt.setString(p++, r.remarks); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 42
+  if (r.adjustment_related_to) pstmt.setString(p++, r.adjustment_related_to); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 43
+  if (r.gps_data) pstmt.setString(p++, r.gps_data); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 44
+  if (r.first_level_approver) pstmt.setString(p++, r.first_level_approver); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 45
+  if (r.first_level_status) pstmt.setString(p++, r.first_level_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 46
+  if (r.first_level_timestamp) pstmt.setString(p++, r.first_level_timestamp); else pstmt.setNull(p++, SQL_TYPES.TIMESTAMP); // 47
+  if (r.finance_team_status) pstmt.setString(p++, r.finance_team_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 48
+  if (r.finance_team_remarks) pstmt.setString(p++, r.finance_team_remarks); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 49
+  if (r.final_level_approver) pstmt.setString(p++, r.final_level_approver); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 50
+  if (r.final_status) pstmt.setString(p++, r.final_status); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 51
+  if (r.final_timestamp) pstmt.setString(p++, r.final_timestamp); else pstmt.setNull(p++, SQL_TYPES.TIMESTAMP); // 52
+  if (r.hisaab_week_str) pstmt.setString(p++, r.hisaab_week_str); else pstmt.setNull(p++, SQL_TYPES.VARCHAR); // 53
+  if (r.hisaab_week_number !== null && r.hisaab_week_number !== undefined) pstmt.setInt(p++, r.hisaab_week_number); else pstmt.setNull(p++, SQL_TYPES.INTEGER); // 54
 }
 
 function upsertAdjustmentRecords(records) {
   if (!records || records.length === 0) return 0;
 
-  var cfg = getDbConfig();
   var conn = null;
-  var stmt = null;
-  var url = "jdbc:postgresql://" + cfg.host + ":" + cfg.port + "/" + cfg.database;
-  var BATCH_SIZE = 25;
+  var pstmt = null;
+  var BATCH_SIZE = 200;
   var totalCount = 0;
 
   try {
-    conn = Jdbc.getConnection(url, cfg.user, cfg.password);
+    conn = getDbConnection();
     conn.setAutoCommit(false);
-    stmt = conn.createStatement();
+    pstmt = conn.prepareStatement(UPSERT_SQL);
 
-    for (var b = 0; b < records.length; b += BATCH_SIZE) {
-      var chunk = records.slice(b, b + BATCH_SIZE);
-      var valuesList = [];
+    var pendingInBatch = 0;
+    for (var i = 0; i < records.length; i++) {
+      bindAdjustmentRow(pstmt, records[i]);
+      pstmt.addBatch();
+      pendingInBatch++;
+      totalCount++;
 
-      for (var i = 0; i < chunk.length; i++) {
-        var r = chunk[i];
-        var finalStatus = r.final_status;
-        if (!finalStatus) {
-          finalStatus = (r.first_level_status === "Rejected") ? "Rejected" : "Pending";
-        }
-        var rowSql = "(" +
-          sqlTimestamp(r.submission_timestamp || "CURRENT_TIMESTAMP") + ", " +
-          sqlStr(r.submitter_email) + ", " +
-          sqlStr(r.city_name) + ", " +
-          sqlStr(r.partner_type) + ", " +
-          sqlStr(r.adjustment_type) + ", " +
-          sqlStr(r.partner_name) + ", " +
-          sqlStr(r.partner_phone) + ", " +
-          sqlStr(r.partner_code) + ", " +
-          sqlStr(r.vehicle_number) + ", " +
-          sqlStr(r.remittance_towards) + ", " +
-          sqlNum(r.rent_deduction) + ", " +
-          sqlDate(r.adjustment_date) + ", " +
-          sqlNum(r.amount) + ", " +
-          sqlStr(r.photo_url) + ", " +
-          sqlStr(r.remarks) + ", " +
-          sqlStr(r.adjustment_related_to) + ", " +
-          sqlStr(r.gps_data) + ", " +
-          sqlStr(r.first_level_approver) + ", " +
-          sqlStr(r.first_level_status) + ", " +
-          sqlTimestamp(r.first_level_timestamp) + ", " +
-          sqlStr(r.finance_team_status) + ", " +
-          sqlStr(r.finance_team_remarks) + ", " +
-          sqlStr(r.final_level_approver) + ", " +
-          sqlStr(finalStatus) + ", " +
-          sqlTimestamp(r.final_timestamp) + ", " +
-          sqlStr(r.hisaab_week_str) + ", " +
-          sqlInt(r.hisaab_week_number) +
-        ")";
-        valuesList.push(rowSql);
+      if (pendingInBatch >= BATCH_SIZE) {
+        pstmt.executeBatch();
+        conn.commit();
+        pendingInBatch = 0;
+        Logger.log("Upserted batch: " + totalCount + "/" + records.length + " adjustment records into PostgreSQL.");
       }
-
-      var sql = 
-        "WITH incoming ( " +
-        "  submission_timestamp, submitter_email, city_name, partner_type, adjustment_type, " +
-        "  partner_name, partner_phone, partner_code, vehicle_number, remittance_towards, " +
-        "  rent_deduction, adjustment_date, amount, photo_url, remarks, " +
-        "  adjustment_related_to, gps_data, first_level_approver, first_level_status, first_level_timestamp, " +
-        "  finance_team_status, finance_team_remarks, final_level_approver, final_status, final_timestamp, " +
-        "  hisaab_week_str, hisaab_week_number " +
-        ") AS ( " +
-        "  VALUES " + valuesList.join(",\n") + " " +
-        "), " +
-        "incoming_deduped AS ( " +
-        "  SELECT DISTINCT ON (submission_timestamp, COALESCE(partner_phone, 'NO_PHONE'), adjustment_date, adjustment_type) * " +
-        "  FROM incoming " +
-        "), " +
-        "upd AS ( " +
-        "  UPDATE public.sheet_adjustments t " +
-        "  SET " +
-        "    partner_name = i.partner_name, " +
-        "    partner_code = i.partner_code, " +
-        "    vehicle_number = i.vehicle_number, " +
-        "    remittance_towards = i.remittance_towards, " +
-        "    amount = i.amount, " +
-        "    final_status = i.final_status, " +
-        "    remarks = i.remarks, " +
-        "    updated_at = CURRENT_TIMESTAMP " +
-        "  FROM incoming_deduped i " +
-        "  WHERE t.submission_timestamp = i.submission_timestamp " +
-        "    AND t.partner_phone IS NOT DISTINCT FROM i.partner_phone " +
-        "    AND t.adjustment_date = i.adjustment_date " +
-        "    AND t.adjustment_type = i.adjustment_type " +
-        "  RETURNING t.submission_timestamp, t.partner_phone, t.adjustment_date, t.adjustment_type " +
-        ") " +
-        "INSERT INTO public.sheet_adjustments ( " +
-        "  submission_timestamp, submitter_email, city_name, partner_type, adjustment_type, " +
-        "  partner_name, partner_phone, partner_code, vehicle_number, remittance_towards, " +
-        "  rent_deduction, adjustment_date, amount, photo_url, remarks, " +
-        "  adjustment_related_to, gps_data, first_level_approver, first_level_status, first_level_timestamp, " +
-        "  finance_team_status, finance_team_remarks, final_level_approver, final_status, final_timestamp, " +
-        "  hisaab_week_str, hisaab_week_number, updated_at " +
-        ") " +
-        "SELECT " +
-        "  i.submission_timestamp, i.submitter_email, i.city_name, i.partner_type, i.adjustment_type, " +
-        "  i.partner_name, i.partner_phone, i.partner_code, i.vehicle_number, i.remittance_towards, " +
-        "  i.rent_deduction, i.adjustment_date, i.amount, i.photo_url, i.remarks, " +
-        "  i.adjustment_related_to, i.gps_data, i.first_level_approver, i.first_level_status, i.first_level_timestamp, " +
-        "  i.finance_team_status, i.finance_team_remarks, i.final_level_approver, i.final_status, i.final_timestamp, " +
-        "  i.hisaab_week_str, i.hisaab_week_number, CURRENT_TIMESTAMP " +
-        "FROM incoming_deduped i " +
-        "WHERE NOT EXISTS ( " +
-        "  SELECT 1 FROM upd u " +
-        "  WHERE u.submission_timestamp = i.submission_timestamp " +
-        "    AND u.partner_phone IS NOT DISTINCT FROM i.partner_phone " +
-        "    AND u.adjustment_date = i.adjustment_date " +
-        "    AND u.adjustment_type = i.adjustment_type " +
-        ");";
-
-      stmt.executeUpdate(sql);
-      totalCount += chunk.length;
-      Logger.log("Upserted batch: " + totalCount + "/" + records.length + " adjustment records into PostgreSQL.");
     }
 
-    conn.commit();
+    if (pendingInBatch > 0) {
+      pstmt.executeBatch();
+      conn.commit();
+    }
+
     Logger.log("Successfully completed PostgreSQL upsert for all " + totalCount + " adjustment records.");
     return totalCount;
   } catch (err) {
-    if (conn) conn.rollback();
+    if (conn) { try { conn.rollback(); } catch(e){} }
     Logger.log("Error in upsertAdjustmentRecords: " + err.message);
     throw err;
   } finally {
-    if (stmt) try { stmt.close(); } catch(e){}
-    if (conn) try { conn.close(); } catch(e){}
+    if (pstmt) { try { pstmt.close(); } catch(e){} }
+    if (conn) { try { conn.close(); } catch(e){} }
   }
 }
 
@@ -552,17 +656,29 @@ function upsertAdjustmentRecords(records) {
 // =============================================================================
 
 /**
- * Real-Time On-Edit Trigger
+ * Real-Time On-Edit Trigger with exponential backoff
  */
 function handleOnEdit(e) {
   if (!e || !e.range) return;
   var sheet = e.range.getSheet();
   var sName = sheet.getName().trim().toLowerCase();
-  // Restrict live edit handling strictly to raw source form tab. Never process edits on target sheet_adjustments tab.
-  if (sName !== DB_CONFIG.sourceSheetName.trim().toLowerCase()) return;
+  var cfg = getDbConfig();
+  if (sName !== cfg.sourceSheetName.trim().toLowerCase()) return;
   
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(10000)) return;
+  var acquired = false;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (lock.tryLock(10000)) {
+      acquired = true;
+      break;
+    }
+    Utilities.sleep(1000 * Math.pow(2, attempt));
+  }
+  if (!acquired) {
+    Logger.log("handleOnEdit skipped: Lock busy.");
+    return;
+  }
+
   try {
     var startRow = e.range.getRow();
     var endRow = e.range.getLastRow();
@@ -598,12 +714,24 @@ function handleOnEdit(e) {
 }
 
 /**
- * Real-Time Form-Submit Trigger
+ * Real-Time Form-Submit Trigger with exponential backoff
  */
 function handleOnFormSubmit(e) {
   if (!e || !e.values) return;
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(15000)) return;
+  var acquired = false;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (lock.tryLock(10000)) {
+      acquired = true;
+      break;
+    }
+    Utilities.sleep(1000 * Math.pow(2, attempt));
+  }
+  if (!acquired) {
+    Logger.log("handleOnFormSubmit skipped: Lock busy.");
+    return;
+  }
+
   try {
     var rowIdx = e.range ? e.range.getRow() : 0;
     var transformed = transformAdjustmentRow(e.values, rowIdx);
@@ -643,10 +771,19 @@ function getTrueLastRow(sheet) {
  */
 function syncRecentAdjustments() {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(15000)) {
+  var acquired = false;
+  for (var attempt = 0; attempt < 3; attempt++) {
+    if (lock.tryLock(10000)) {
+      acquired = true;
+      break;
+    }
+    Utilities.sleep(1000 * Math.pow(2, attempt));
+  }
+  if (!acquired) {
     Logger.log("Another sync is currently in progress. Skipping 1-min catch-up.");
     return;
   }
+
   try {
     var sourceSheet = getSourceSheet();
     var trueLastRow = getTrueLastRow(sourceSheet);
@@ -670,15 +807,12 @@ function syncRecentAdjustments() {
     }
     
     if (records.length > 0) {
-      // 1. Sync recent rows to clean target sheet tab in a single batch write
       var targetSheet = getTargetSheet();
       if (targetSheet && sheetRows.length > 0) {
         targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
       }
-
-      // 2. Sync to PostgreSQL
       upsertAdjustmentRecords(records);
-      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent adjustment records in sheet & database.");
+      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent adjustment records.");
     }
   } finally {
     lock.releaseLock();
@@ -691,7 +825,7 @@ function syncRecentAdjustments() {
 function syncAllAdjustments() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
-    Logger.log("Another full sync is already running. Please wait.");
+    Logger.log("Another sync is already running. Please wait.");
     return;
   }
   try {
@@ -718,16 +852,16 @@ function syncAllAdjustments() {
     
     Logger.log("Transformed " + records.length + " valid adjustment records.");
     
-    // 1. Write clean standardized rows to targetSheet in chunks of 500
+    // Write clean standardized rows to targetSheet in chunks of 500
     var targetSheet = getTargetSheet();
     var CHUNK_SIZE = 500;
     for (var s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
       var sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
       targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
     }
-    Logger.log("Wrote " + sheetRows.length + " rows to tab '" + DB_CONFIG.targetSheetName + "'.");
+    Logger.log("Wrote " + sheetRows.length + " rows to tab '" + getDbConfig().targetSheetName + "'.");
 
-    // 2. Batch upsert into PostgreSQL using single-connection multi-row inserts
+    // Parameterized batch upsert into PostgreSQL
     Logger.log("Starting PostgreSQL upsert for " + records.length + " adjustment records...");
     var totalUpserted = upsertAdjustmentRecords(records);
     Logger.log("Completed syncAllAdjustments! Total records synced to DB: " + totalUpserted);
@@ -741,10 +875,7 @@ function syncAllAdjustments() {
 // =============================================================================
 
 function setupTriggers() {
-  var triggers = ScriptApp.getProjectTriggers();
-  for (var i = 0; i < triggers.length; i++) {
-    ScriptApp.deleteTrigger(triggers[i]);
-  }
+  removeTriggers();
 
   ScriptApp.newTrigger("syncRecentAdjustments")
     .timeBased()
@@ -780,18 +911,31 @@ function setupTriggers() {
 
 function removeTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
+  var adjustmentHandlers = [
+    "handleOnEdit",
+    "handleOnFormSubmit",
+    "syncRecentAdjustments",
+    "syncAllAdjustments"
+  ];
+
   for (var i = 0; i < triggers.length; i++) {
-    ScriptApp.deleteTrigger(triggers[i]);
+    var handler = triggers[i].getHandlerFunction();
+    if (adjustmentHandlers.indexOf(handler) !== -1) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
   }
-  Logger.log("All project triggers removed.");
+  Logger.log("Adjustment pipeline triggers cleanly removed.");
 }
 
 function onOpen() {
   try {
     SpreadsheetApp.getUi()
       .createMenu("LetzRyd Adjustments")
-      .addItem("Sync All Records (Full)", "syncAllAdjustments")
       .addItem("Sync Recent Records (1-Min)", "syncRecentAdjustments")
+      .addItem("Sync All Records (Full)", "syncAllAdjustments")
+      .addSeparator()
+      .addItem("Test Database Connection", "testDbConnection")
+      .addItem("Initialize Script Properties", "setupScriptProperties")
       .addSeparator()
       .addItem("Setup Automated Triggers", "setupTriggers")
       .addItem("Remove Triggers", "removeTriggers")

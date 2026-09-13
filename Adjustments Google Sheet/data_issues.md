@@ -92,3 +92,32 @@ This document provides a comprehensive audit of all 11 data quality anomalies (`
 - **Standardization Rule**:
   Consolidation procedure `refresh_core_adjustments()` merges both sources into `public.core_adjustments`, preserving portal JSON approval metadata and hisaab line items.
 - **Severity**: HIGH | **Capability**: CAN BE FIXED BY STANDARDIZATION (CODE)
+
+#### ADJ-12: Historical 1-Day Date-Shift Zombie Duplicate Cleanup
+- **Affected Table**: `public.sheet_adjustments`
+- **Raw Anomaly**: 67 date-shifted duplicate pairs (134 rows) in the ID range 14,672 to 14,838 escaped an earlier cleanup query because both rows had IDs <= 14,838.
+- **Standardization Rule**:
+  Executed targeted cleanup query deleting 67 shifted lower-ID duplicate rows, stabilizing the table at 14,910 clean rows.
+- **Severity**: HIGH | **Capability**: FULLY RESOLVED (DATABASE MIGRATION)
+
+#### ADJ-13: Blank Sheet Row Ghost Record Prevention
+- **Affected Table**: `public.sheet_adjustments`
+- **Raw Anomaly**: Editing or clicking empty sheet rows at the bottom of the form response sheet caused the pipeline to insert blank phantom records (e.g. ID 29686 with 0.00 amount, NULL phone, and NULL vehicle).
+- **Standardization Rule**:
+  Deleted ghost record ID 29686 and added an empty-row guard clause in `transformAdjustmentRow` returning `null` when identifier fields are empty.
+- **Severity**: MEDIUM | **Capability**: FULLY RESOLVED (DATABASE + CODE)
+
+#### ADJ-14: Missing Partner Phone Recovery from Encapsulated Codes
+- **Affected Table**: `public.sheet_adjustments`
+- **Raw Anomaly**: 11 records had NULL in `partner_phone`, but the phone number was explicitly contained within `partner_code` (e.g. `LETZHYDIP9014405260`).
+- **Standardization Rule**:
+  Backfilled 10-digit mobile numbers from `partner_code` via regex extraction and added fallback recovery logic in the Apps Script transformer.
+- **Severity**: MEDIUM | **Capability**: FULLY RESOLVED (DATABASE + CODE)
+
+#### ADJ-15: Primary Key Continuous Renumbering & Zero-Burn CTE Upsert
+- **Affected Table**: `public.sheet_adjustments` & `adjustments_pipeline_appscript.js`
+- **Raw Anomaly**: Sequence burning and historical batch purges left a 14,671 ID gap at the start of the table. Ingestion script used raw string concatenation (`valuesList.join`) vulnerable to buffer limits and injection.
+- **Standardization Rule**:
+  Compacted and renumbered primary keys continuously from 1 to 14,909, reset sequence to 14,909 (`is_called = true`), and refactored the ingestion script to use parameterized `PreparedStatement` CTE upsert with batch size expanded to 200.
+- **Severity**: CRITICAL | **Capability**: FULLY RESOLVED (DATABASE + CODE)
+
