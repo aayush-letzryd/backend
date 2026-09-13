@@ -59,7 +59,7 @@ function getDbConfig() {
     sourceSheetName: sourceSheet,
     targetSheetName: targetSheet,
     batchSize: 200,
-    recentWindowRows: 500
+    recentWindowRows: 1000
   };
 }
 
@@ -297,21 +297,18 @@ function cleanPartnerId(val) {
 }
 
 /**
- * Checks whether a row qualifies as maintenance downtime.
+ * Checks whether a row qualifies as genuine maintenance downtime.
+ * Strictly checks for maintenance/repair statuses and excludes 'RFD' (yard attendance),
+ * 'Drop Off', 'New Deployment', and general 'Active' operational statuses.
  */
 function isMaintenanceDowntime(finalStatus, cohort) {
   var statusUpper = finalStatus ? String(finalStatus).trim().toUpperCase() : "";
-  var cohortUpper = cohort ? String(cohort).trim().toUpperCase() : "";
 
   var maintStatuses = ["MAINTENANCE", "WORKSHOP", "ACCIDENTAL", "BD", "BREAKDOWN", "UNDER REPAIR", "REPAIR", "SERVICE"];
   for (var i = 0; i < maintStatuses.length; i++) {
     if (statusUpper === maintStatuses[i]) {
       return true;
     }
-  }
-
-  if (cohortUpper === "OFF ROAD") {
-    return true;
   }
 
   return false;
@@ -565,10 +562,38 @@ function syncRecentMaintenance() {
     Logger.log("Extracted " + records.length + " maintenance downtime records from last " + numRows + " rows.");
 
     if (records.length > 0) {
-      // 1. Sync to local sheet_maintenance tab
+      // 1. Sync to local sheet_maintenance tab (deduplicating against existing rows)
       var targetSheet = getTargetSheet();
       var targetLastRow = targetSheet.getLastRow();
-      targetSheet.getRange(targetLastRow + 1, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+      
+      var existingKeys = {};
+      if (targetLastRow > 1) {
+        var existingData = targetSheet.getRange(2, 2, targetLastRow - 1, 2).getValues(); // Col 2 = Vehicle Number, Col 3 = Maintenance Date
+        for (var e = 0; e < existingData.length; e++) {
+          var eVeh = cleanVehicleNumber(existingData[e][0]);
+          var eDate = cleanDate(existingData[e][1]);
+          if (eVeh && eDate) {
+            existingKeys[eVeh + "_" + eDate] = true;
+          }
+        }
+      }
+
+      var newSheetRows = [];
+      for (var k = 0; k < records.length; k++) {
+        var recKey = records[k].vehicle_number + "_" + records[k].date;
+        if (!existingKeys[recKey]) {
+          newSheetRows.push(sheetRows[k]);
+          existingKeys[recKey] = true;
+        }
+      }
+
+      if (newSheetRows.length > 0) {
+        var insertRow = targetSheet.getLastRow() + 1;
+        targetSheet.getRange(insertRow, 1, newSheetRows.length, newSheetRows[0].length).setValues(newSheetRows);
+        Logger.log("Appended " + newSheetRows.length + " new rows to local tab '" + cfg.targetSheetName + "'.");
+      } else {
+        Logger.log("Local sheet tab is already up to date. Zero duplicate rows appended.");
+      }
 
       // 2. Zero-burn CTE upsert into PostgreSQL
       var upserted = upsertMaintenanceRecords(records);
