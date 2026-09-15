@@ -209,6 +209,40 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+---
+
+### 17. [Traffic Challan Final Table](./Traffic%20Challan%20Final%20Table/)
+- **Description**: Real-time unified master Single Source of Truth (`public.core_challans`) consolidating traffic violation events and rolling fine balances across manual Google Sheets (`sheet_challans`, 37,948 rows) and the automated Karnataka One traffic portal scraper (`vehicle_challans`, 1,129 rows).
+- **Key Files**:
+  - [`schema.sql`](./Traffic%20Challan%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_challans`, B-Tree indexes, plate and date parsers, and real-time triggers (`trg_sync_core_challan_from_sheet`, `trg_sync_core_challan_from_automation`).
+  - [`automation_script.py`](./Traffic%20Challan%20Final%20Table/automation_script.py): Production Python health check and audit engine verifying sequence continuity (1..38,710), gapless IDs, scraper priority, and liability breakdowns.
+  - [`data_issues.md`](./Traffic%20Challan%20Final%20Table/data_issues.md): Comprehensive catalog of 8 operational data anomalies (ISS-01 to ISS-08) including scraper precedence, rolling balances, and soft delete mechanics.
+  - [`README.md`](./Traffic%20Challan%20Final%20Table/README.md): Master replication guide, end-to-end architecture diagram, data dictionaries, and operational runbook.
+- **Target Table**: `public.core_challans` (PostgreSQL)
+- **Primary Features**:
+  - Deterministic Scraper Priority: Karnataka One government scraper takes precedence for Bangalore violations (711 active fines, Rs. 464,500).
+  - Multi-city Google Sheet sourcing: Hyderabad (7,738 rows), Mumbai (7,362 rows), and remaining manual logs (37,999 total active records).
+  - Gapless sequential primary key (`id` allocated via advisory lock `pg_advisory_xact_lock(888999222)` guaranteeing 0 sequence gaps).
+  - Non-destructive soft delete preservation (`is_deleted = TRUE`).
+
+---
+
+### 18. [GPS Final Table](./GPS%20Final%20Table/)
+- **Description**: Enterprise fleet telematics Single Source of Truth (`public.core_gps`) unifying daily distance tracking from the Intellicar API, performing intelligent device-suffix (`-A`/`-B`) and chassis VIN-to-registration resolution, enriching telematics with driver attribution from `core_daily_vehicle_status`, and raising instant alerts for unauthorized idle movement.
+- **Key Files**:
+  - [`schema.sql`](./GPS%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_gps`, 6 B-Tree performance indexes, plate cleaning function `fn_clean_gps_vehicle_number()`, and real-time trigger `trg_sync_core_gps_from_telematics`.
+  - [`automation_script.py`](./GPS%20Final%20Table/automation_script.py): Production Python health check engine verifying 15 columns, sequence continuity (1..37,548), geographic coverage, status distribution, and idle movement alerts.
+  - [`data_issues.md`](./GPS%20Final%20Table/data_issues.md): Comprehensive telematics engineering audit detailing device suffix collisions, pre-registration VIN tracking, concurrent multi-stream overwrites, and idle movement thresholds.
+  - [`README.md`](./GPS%20Final%20Table/README.md): Architecture flowcharts, column data dictionary, trigger installation guide, and operational SQL queries.
+- **Target Table**: `public.core_gps` (PostgreSQL)
+- **Primary Features**:
+  - Automated plate and VIN resolution: Strips hardware suffixes (`-A`, `-B`) and maps 189 pre-registration chassis VINs (`MA3...`) to active registration plates.
+  - Real-time driver and custody enrichment: Ingestion triggers dynamically stamp `partner_id`, `partner_name`, `driver_phone`, `vehicle_status`, and `cohort` from `core_daily_vehicle_status`.
+  - Unauthorized idle movement alert: Instant flags for vehicles clocking > 5.0 km while in yard (`RFD`) or workshop (`Maintenance`).
+  - Zero-burn continuous sequence: 37,548 gapless records spanning 6,281,304.58 total fleet kilometers.
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
