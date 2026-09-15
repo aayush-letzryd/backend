@@ -178,6 +178,26 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 14. [Uber Final Table](./Uber%20Final%20Table/)
+- **Description**: Production data pipeline and financial ledger engine aggregating raw Uber trips (`uber_pipeline_trips`), order payment transactions (`uber_pipeline_order_transactions`), and target milestones (`uber_vehicle_incentives_raw`) into standardized core daily and weekly tables.
+- **Key Files**:
+  - [`schema.sql`](./Uber%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_uber_daily` and `public.core_uber_weekly` with unique constraints, B-Tree indexes, and financial audit columns.
+  - [`automation_script.py`](./Uber%20Final%20Table/automation_script.py): Production Python ETL engine implementing 04:00 AM IST shift cutoff, plate normalization, driver cash separation, and ON CONFLICT DO UPDATE upserts.
+  - [`README.md`](./Uber%20Final%20Table/README.md): Architecture documentation, column dictionaries, 04:00 AM shift rule, and operational runbook.
+- **Target Tables**: `public.core_uber_daily`, `public.core_uber_weekly` (PostgreSQL)
+
+---
+
+### 15. [Ola Final Table](./Ola%20Final%20Table/)
+- **Description**: Production data pipeline and financial ledger engine aggregating raw Ola trip telemetry (`ola_raw_crns`) and financial transactions (`ola_raw_transactions`) into standardized core daily and weekly tables.
+- **Key Files**:
+  - [`schema.sql`](./Ola%20Final%20Table/schema.sql): PostgreSQL DDL for `public.core_ola_daily` and `public.core_ola_weekly` with unique constraints, B-Tree indexes, and Hisaab reconciliation columns.
+  - [`automation_script.py`](./Ola%20Final%20Table/automation_script.py): Production Python ETL engine implementing net revenue calculation (`operator_bill_raw`), driver cash deductions, and debit/credit ledger resolution.
+  - [`README.md`](./Ola%20Final%20Table/README.md): Architecture documentation, column dictionaries, and operational runbook.
+- **Target Tables**: `public.core_ola_daily`, `public.core_ola_weekly` (PostgreSQL)
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
