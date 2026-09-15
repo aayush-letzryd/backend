@@ -198,6 +198,17 @@ This repository hosts production scripts, architecture specifications, database 
 
 ---
 
+### 16. [Hisaab Final Table](./Hisaab%20Final%20Table/)
+- **Description**: The definitive financial settlement and payout engine for LetzRyd. Consolidates multi-platform ride revenues (Uber, Ola, Rapido), daily vehicle attendance & rentals, G-form adjustments, and traffic challans into a 3-tier multi-grain ledger (Daily App Feed $\to$ Vehicle Breakdown $\to$ Consolidated Partner Bank Payout).
+- **Key Files**:
+  - [`schema.sql`](./Hisaab%20Final%20Table/schema.sql): PostgreSQL DDL for all 5 dedicated Hisaab tables (`hisaab_settlement_weeks`, `hisaab_adjustments_ledger`, `hisaab_daily_ledger`, `hisaab_vehicle_weekly`, `hisaab_partner_weekly`) with unique composite keys and lock triggers.
+  - [`automation_script.py`](./Hisaab%20Final%20Table/automation_script.py): Production Python ETL pipeline handling daily continuous upserts, Sunday milestone incentive credits, weekly roll-up, partner payout consolidation, and Monday 11:00 AM lock enforcement.
+  - [`audit_rules.md`](./Hisaab%20Final%20Table/audit_rules.md): Codified mathematical formulas, indemnity city exceptions, 1% Section 194C TDS logic, and dead mile GPS telematics rules audited from production Hisaab workbooks (BLR, HYD, MUM).
+  - [`README.md`](./Hisaab%20Final%20Table/README.md): Full architectural runbook, data flow diagrams, schema specifications, and automation CLI instructions.
+- **Target Tables**: `public.hisaab_settlement_weeks`, `public.hisaab_adjustments_ledger`, `public.hisaab_daily_ledger`, `public.hisaab_vehicle_weekly`, `public.hisaab_partner_weekly` (PostgreSQL)
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
