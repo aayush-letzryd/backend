@@ -214,49 +214,46 @@ BEGIN
 
         -- Upsert into public.sheet_maintenance
         INSERT INTO public.sheet_maintenance (
-            vehicle_number,
-            city,
-            maintenance_date,
-            workshop_name,
-            job_card_number,
-            maintenance_reason,
-            cohort,
-            partner_id,
-            dm_name,
-            vehicle_model,
-            sheet_status_id,
-            sheet_row_number,
-            created_at,
-            updated_at
+            city, vehicle_number, date, allocation_date, drop_off_date,
+            final_status, cohort, mapping, partner_name, partner_ids,
+            new_partner_name_default, vehicle_model, dm_name, type,
+            sheet_row_number, source_tab, created_at, updated_at
         ) VALUES (
-            v_clean_vehicle,
             v_clean_city,
+            v_clean_vehicle,
             NEW.status_date,
-            v_clean_workshop,
-            v_clean_job_card,
-            v_clean_reason,
-            v_clean_cohort,
-            v_clean_partner,
-            v_clean_dm,
-            v_clean_model,
-            NEW.id,
+            NEW.allocation_date,
+            NEW.dropoff_date,
+            NEW.final_status,
+            COALESCE(NEW.cohort, 'Off Road'),
+            NEW.mapping_key,
+            NEW.partner_name,
+            NEW.partner_id,
+            NEW.new_partner_name,
+            NEW.vehicle_model,
+            NEW.dm_name,
+            NEW.vehicle_type,
             NEW.sheet_row_number,
-            CURRENT_TIMESTAMP,
-            CURRENT_TIMESTAMP
+            'Daily Vehicle Status',
+            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         )
-        ON CONFLICT (maintenance_date, vehicle_number)
+        ON CONFLICT (vehicle_number, date)
         DO UPDATE SET
             city = EXCLUDED.city,
-            workshop_name = COALESCE(EXCLUDED.workshop_name, public.sheet_maintenance.workshop_name),
-            job_card_number = COALESCE(EXCLUDED.job_card_number, public.sheet_maintenance.job_card_number),
-            maintenance_reason = COALESCE(EXCLUDED.maintenance_reason, public.sheet_maintenance.maintenance_reason),
+            allocation_date = EXCLUDED.allocation_date,
+            drop_off_date = EXCLUDED.drop_off_date,
+            final_status = EXCLUDED.final_status,
             cohort = EXCLUDED.cohort,
-            partner_id = EXCLUDED.partner_id,
-            dm_name = COALESCE(EXCLUDED.dm_name, public.sheet_maintenance.dm_name),
-            vehicle_model = COALESCE(EXCLUDED.vehicle_model, public.sheet_maintenance.vehicle_model),
-            sheet_status_id = EXCLUDED.sheet_status_id,
+            mapping = EXCLUDED.mapping,
+            partner_name = EXCLUDED.partner_name,
+            partner_ids = EXCLUDED.partner_ids,
+            new_partner_name_default = EXCLUDED.new_partner_name_default,
+            vehicle_model = EXCLUDED.vehicle_model,
+            dm_name = EXCLUDED.dm_name,
+            type = EXCLUDED.type,
             sheet_row_number = EXCLUDED.sheet_row_number,
-            updated_at = CURRENT_TIMESTAMP;
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata');
     END IF;
 
     RETURN NEW;
@@ -283,85 +280,54 @@ CREATE OR REPLACE PROCEDURE public.sp_extract_all_sheet_maintenance()
 LANGUAGE plpgsql
 AS $procedure$
 DECLARE
-    v_rows_processed INTEGER := 0;
+    v_rows_inserted INTEGER := 0;
 BEGIN
     INSERT INTO public.sheet_maintenance (
-        vehicle_number,
-        city,
-        maintenance_date,
-        workshop_name,
-        job_card_number,
-        maintenance_reason,
-        cohort,
-        partner_id,
-        dm_name,
-        vehicle_model,
-        sheet_status_id,
-        sheet_row_number,
-        created_at,
-        updated_at
+        city, vehicle_number, date, allocation_date, drop_off_date,
+        final_status, cohort, mapping, partner_name, partner_ids,
+        new_partner_name_default, vehicle_model, dm_name, type,
+        sheet_row_number, source_tab, created_at, updated_at
     )
     SELECT 
-        UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) AS vehicle_number,
         CASE 
             WHEN TRIM(COALESCE(s.city, '')) NOT IN ('', 'NA', 'N/A', '-', 'UNKNOWN') THEN TRIM(s.city)
             WHEN UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) ~ '^KA' THEN 'Bengaluru'
             WHEN UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) ~ '^(TS|TG)' THEN 'Hyderabad'
             WHEN UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) ~ '^MH' THEN 'Mumbai'
             WHEN UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) ~ '^DL' THEN 'Delhi'
-            ELSE 'Unknown'
+            ELSE 'Bengaluru'
         END AS city,
-        s.status_date AS maintenance_date,
-        CASE 
-            WHEN UPPER(TRIM(COALESCE(s.workshop_name, ''))) IN ('', '-', 'NA', 'N/A', 'NONE', 'NULL', 'LOCAL WORKSHOP', 'LOCAL', 'TBD', '.', 'UNKNOWN', 'NO') 
-            THEN NULL 
-            ELSE TRIM(s.workshop_name) 
-        END AS workshop_name,
-        CASE 
-            WHEN UPPER(TRIM(COALESCE(s.job_card_number, ''))) IN ('', '-', 'NA', 'N/A', 'NONE', 'NULL', 'PENDING', 'TBD', '.', 'NO', 'NIL') 
-            THEN NULL 
-            ELSE TRIM(s.job_card_number) 
-        END AS job_card_number,
-        NULLIF(TRIM(COALESCE(s.maintenance_reason, '')), '') AS maintenance_reason,
-        COALESCE(NULLIF(TRIM(s.cohort), ''), 'Off Road') AS cohort,
-        CASE 
-            WHEN UPPER(TRIM(COALESCE(s.partner_id, ''))) IN ('', '-', 'NA', 'N/A', 'NONE', 'NULL', 'UNKNOWN') 
-            THEN NULL 
-            ELSE TRIM(s.partner_id) 
-        END AS partner_id,
-        CASE 
-            WHEN UPPER(TRIM(COALESCE(s.dm_name, ''))) IN ('', '-', 'NA', 'N/A', 'NONE', 'NULL', 'UNKNOWN') 
-            THEN NULL 
-            ELSE TRIM(s.dm_name) 
-        END AS dm_name,
-        CASE 
-            WHEN UPPER(TRIM(COALESCE(s.vehicle_model, ''))) IN ('', '-', 'NA', 'N/A', 'NONE', 'NULL', 'UNKNOWN') 
-            THEN NULL 
-            ELSE TRIM(s.vehicle_model) 
-        END AS vehicle_model,
-        s.id AS sheet_status_id,
+        UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) AS vehicle_number,
+        s.status_date AS date,
+        s.allocation_date,
+        s.dropoff_date AS drop_off_date,
+        s.final_status,
+        COALESCE(s.cohort, 'Off Road') AS cohort,
+        s.mapping_key AS mapping,
+        s.partner_name,
+        s.partner_id AS partner_ids,
+        s.new_partner_name AS new_partner_name_default,
+        s.vehicle_model,
+        s.dm_name,
+        s.vehicle_type AS type,
         s.sheet_row_number,
-        CURRENT_TIMESTAMP AS created_at,
-        CURRENT_TIMESTAMP AS updated_at
+        'Daily Vehicle Status' AS source_tab,
+        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') AS created_at,
+        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') AS updated_at
     FROM public.sheet_vehicle_status s
-    WHERE (
-        UPPER(TRIM(COALESCE(s.final_status, ''))) IN ('MAINTENANCE', 'WORKSHOP', 'ACCIDENTAL', 'BD')
-        OR UPPER(TRIM(COALESCE(s.cohort, ''))) = 'OFF ROAD'
-    )
+    WHERE UPPER(TRIM(COALESCE(s.final_status, ''))) = 'MAINTENANCE'
       AND LENGTH(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g')) >= 6
-    ON CONFLICT (maintenance_date, vehicle_number)
-    DO UPDATE SET
-        city = EXCLUDED.city,
-        workshop_name = COALESCE(EXCLUDED.workshop_name, public.sheet_maintenance.workshop_name),
-        job_card_number = COALESCE(EXCLUDED.job_card_number, public.sheet_maintenance.job_card_number),
-        maintenance_reason = COALESCE(EXCLUDED.maintenance_reason, public.sheet_maintenance.maintenance_reason),
-        cohort = EXCLUDED.cohort,
-        partner_id = EXCLUDED.partner_id,
-        dm_name = COALESCE(EXCLUDED.dm_name, public.sheet_maintenance.dm_name),
-        vehicle_model = COALESCE(EXCLUDED.vehicle_model, public.sheet_maintenance.vehicle_model),
-        sheet_status_id = EXCLUDED.sheet_status_id,
-        sheet_row_number = EXCLUDED.sheet_row_number,
-        updated_at = CURRENT_TIMESTAMP;
+      AND NOT EXISTS (
+          SELECT 1 FROM public.sheet_maintenance sm 
+          WHERE sm.vehicle_number = UPPER(REGEXP_REPLACE(s.vehicle_number, '[^a-zA-Z0-9]', '', 'g'))
+            AND sm.date = s.status_date
+      )
+    ON CONFLICT (vehicle_number, date) DO NOTHING;
+
+    GET DIAGNOSTICS v_rows_inserted = ROW_COUNT;
+    RAISE NOTICE 'Batch extraction complete: % records inserted into public.sheet_maintenance.', v_rows_inserted;
+END;
+$procedure$;
 
     GET DIAGNOSTICS v_rows_processed = ROW_COUNT;
     RAISE NOTICE 'Batch extraction complete: % records processed into public.sheet_maintenance.', v_rows_processed;
