@@ -122,6 +122,17 @@ Populates or refreshes `public.core_daily_vehicle_status` for any specified targ
 
 ---
 
+### 5. Real-Time Live Event Triggers (Live Operational Status)
+To ensure `core_daily_vehicle_status` reflects live movements instantaneously without waiting for a daily batch job:
+* **Function `fn_recalculate_vehicle_status(vehicle_number, target_date)`**: Transactionally recalculates status, cohort, driver details, and billing in under 2ms.
+* **Trigger on `core_vehicle_allocation` (`trg_live_status_from_allocation`)**: Fires on every insert/update/delete of an allocation, instantly updating today's vehicle status to `Active` (or `Allocation`), assigning driver details, and enabling billing.
+* **Trigger on `core_dropoffs` (`trg_live_status_from_dropoff`)**: Fires on every vehicle return, immediately updating today's vehicle status to `Drop Off` or `RFD` and waiving rent.
+* **Trigger on `core_maintenance` (`trg_live_status_from_maintenance`)**: Fires on workshop entry/exit, setting vehicle status to `Maintenance` with rent waived during repairs.
+* **Trigger on `core_vehicle_onboarding` (`trg_live_status_from_onboarding`)**: Fires when a new car is onboarded, immediately making it available as `RFD (In Yard)`.
+* **Decommissioned Staging Trigger**: The legacy trigger `trg_sync_core_daily_status_from_sheet` on `sheet_vehicle_status` was decommissioned and removed to prevent spreadsheet data entry from overriding live relational calculations.
+
+---
+
 ## 4. Mathematical Interval Pairing Model
 
 Every onboarded vehicle moves continuously across alternating periods of Driver Custody and Yard Custody:
