@@ -167,12 +167,27 @@ City filtering queries across tables require complex `CASE WHEN` or `ILIKE` stat
 | Date Format | `04/05/2026`, `2026-05-04` | `2026-05-04` | Apps Script `cleanDate()` |
 | Vehicle Number Typo | `MH-02 FG 2423` | `MH02FG2423` | Apps Script `cleanVehicleNumber()` |
 | Vehicle OCR Typo | `TGO7X9865` | `TG07X9865` | Apps Script `cleanVehicleNumber()` |
-| Trailing Whitespace | `'SHANKAR KUMAR N '` | `'SHANKAR KUMAR N'` | Apps Script `cleanPartnerName()` |
-| City Names | `Bengaluru`, `Bangalore` | `BLR` | Apps Script `cleanCity()` |
+| City Names | `Bengaluru`, `Bangalore` | `Bengaluru` | Apps Script `cleanCity()` |
 | Natural Key Conflict | Multiple updates to same date & car | In-place update | PostgreSQL Zero-Burn CTE |
+| Sliding Window Truncation | 500-row window dropped Bengaluru | Expanded to 4,000 rows | Apps Script `syncRecentVehicleStatus()` |
 
 ---
 
-## 4. Conclusion
+## 4. Operational Ingestion Incident (September 12–15): 500-Row Window Truncation
+
+### Observation
+From September 12 through September 15, 2026, `sheet_vehicle_status` and `core_daily_vehicle_status` captured exactly 493 vehicles per day (275 Mumbai + 218 Hyderabad), completely omitting ~973 Bengaluru fleet vehicles.
+
+### Root Cause
+The 1-minute automated trigger `syncRecentVehicleStatus()` in `vehicle_status_pipeline_appscript.js` used a static `windowSize = 500`. Because operations appends Mumbai (275 rows) and Hyderabad (218 rows) at the bottom of the master sheet (~493 rows combined), the 500-row sliding window truncated immediately above Hyderabad, leaving Bengaluru (~973 rows above them) unread.
+
+### Resolution
+1. Expanded `recentWindowSize` from 500 to 4,000 rows in `vehicle_status_pipeline_appscript.js`, comfortably accommodating 2-3 full operational days across all hubs (~1,500 rows/day).
+2. Made window size configurable via `PropertiesService.getScriptProperties().setProperty("WINDOW_SIZE", "4000")`.
+3. Executed batch catch-up sync to backfill missing Bengaluru records into PostgreSQL.
+
+---
+
+## 5. Conclusion
 
 By enforcing these sanitization layers at the ingestion boundary, `public.sheet_vehicle_status` provides an auditable, high-fidelity daily attendance ledger that can be reliably consumed by downstream Layer 2 merge engines (`core_maintenance`, `core_daily_vehicle_status`) without downstream pipeline failures.

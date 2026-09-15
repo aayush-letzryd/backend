@@ -35,7 +35,8 @@ const DB_CONFIG = {
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1P3tJFW56q_aKTJnfa1K_eyyXDngVD3qeI1WWDo2XLTM/edit",
   sourceSheetName: "Daily Vehicle Status",
   targetSheetName: "sheet_vehicle_status",
-  sqlBatchSize: 100 // Multi-row SQL chunk size (100 rows per single network RPC)
+  sqlBatchSize: 100, // Multi-row SQL chunk size (100 rows per single network RPC)
+  recentWindowSize: 4000 // Multi-day sliding window covering all operational hubs (~1,500 rows/day)
 };
 
 function getDbConfig() {
@@ -53,7 +54,8 @@ function getDbConfig() {
     sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_URL")) || DB_CONFIG.sourceSpreadsheetUrl,
     sourceSheetName: (props && props.getProperty("SOURCE_SHEET_NAME")) || DB_CONFIG.sourceSheetName,
     targetSheetName: (props && props.getProperty("TARGET_SHEET_NAME")) || DB_CONFIG.targetSheetName,
-    sqlBatchSize: parseInt((props && props.getProperty("BATCH_SIZE")), 10) || DB_CONFIG.sqlBatchSize
+    sqlBatchSize: parseInt((props && props.getProperty("BATCH_SIZE")), 10) || DB_CONFIG.sqlBatchSize,
+    recentWindowSize: parseInt((props && props.getProperty("WINDOW_SIZE")), 10) || DB_CONFIG.recentWindowSize
   };
 }
 
@@ -543,7 +545,8 @@ function syncRecentVehicleStatus() {
     var lastCol = sourceSheet.getLastColumn();
     if (lastRow <= 1) return;
     
-    var windowSize = 500;
+    var config = getDbConfig();
+    var windowSize = config.recentWindowSize || 4000;
     var startRow = Math.max(2, lastRow - windowSize + 1);
     var numRows = lastRow - startRow + 1;
     
