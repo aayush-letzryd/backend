@@ -281,7 +281,7 @@ BEGIN
         - COALESCE(v_ola_online_payment, 0.00)
         + COALESCE(v_daily_challans, 0.00)
         + COALESCE(v_daily_accident_recovery, 0.00)
-        + COALESCE(v_daily_adjustments, 0.00)
+        - COALESCE(v_daily_adjustments, 0.00) -- In-week approved credits (rent-off, servicing, reimbursements) reduce dues
         - COALESCE(v_weekly_incentive_credit, 0.00);
 
     -- 9. Upsert into hisaab_daily_ledger
@@ -530,7 +530,7 @@ BEGIN
         d.rapido_trips,
         d.rapido_net_revenue,
         d.weekly_platform_incentive,
-        d.vehicle_adjustments,
+        -d.vehicle_adjustments AS vehicle_adjustments, -- Displayed as negative credit (e.g. -1100.00) matching Excel Col AJ
         d.challan_amount,
         d.accident_penalties,
         0.00 AS dead_mile_charges,
@@ -800,11 +800,10 @@ BEGIN
         5000.00 AS security_deposit_paid,
         0.00 AS deposit_deduction_current_week,
         0.00 AS pending_deposit,
-        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)) AS total_outstanding,
-        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)))) AS net_bank_payout,
-        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00))) AS net_amount_to_collect,
-        'DRAFT' AS settlement_status,
-        dr.account_no AS payout_account_number,
+        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00)) AS total_outstanding,
+        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00)))) AS net_bank_payout,
+        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00))) AS net_amount_to_collect,
+        dr.account_number AS payout_account_number,
         dr.ifsc_code AS payout_ifsc,
         CURRENT_TIMESTAMP AS updated_at
     FROM all_partners ap
@@ -812,8 +811,8 @@ BEGIN
     LEFT JOIN prior_adj pa ON ap.partner_id = pa.partner_id
     LEFT JOIN prev_dues pd ON ap.partner_id = pd.partner_id
     LEFT JOIN LATERAL (
-        SELECT account_no, ifsc_code, full_name FROM public.drivers 
-        WHERE driver_code = ap.partner_id LIMIT 1
+        SELECT account_number, ifsc_code, driver_name FROM public.core_partner_onboarding 
+        WHERE partner_id = ap.partner_id LIMIT 1
     ) dr ON TRUE
     ON CONFLICT (week_id, partner_id) DO UPDATE SET
         partner_name = COALESCE(EXCLUDED.partner_name, public.hisaab_partner_weekly.partner_name),
@@ -1513,4 +1512,66 @@ CREATE TRIGGER trg_auto_route_prior_period_adjustment
 BEFORE INSERT ON public.hisaab_adjustments_ledger
 FOR EACH ROW EXECUTE FUNCTION public.fn_trg_auto_route_prior_period_adjustment();
 
+-- ============================================================================
+-- 10. SYNC TRIGGER: core_adjustments -> hisaab_adjustments_ledger
+-- ============================================================================
+-- Automatically keeps hisaab_adjustments_ledger synchronized whenever an
+-- adjustment is added, approved, edited, or deleted in public.core_adjustments.
+CREATE OR REPLACE FUNCTION public.fn_sync_core_to_hisaab_adjustments()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF (TG_OP = 'DELETE') THEN
+        DELETE FROM public.hisaab_adjustments_ledger
+        WHERE remarks LIKE 'CORE_ADJ:' || OLD.adjustment_id || '%'
+           OR (vehicle_number = OLD.vehicle_number AND partner_id = OLD.partner_id AND incident_date = OLD.adjustment_date AND amount = OLD.amount);
+        RETURN OLD;
+    END IF;
+
+    -- Only sync if Approved and not soft-deleted
+    IF (NEW.approval_status = 'Approved' AND (NEW.is_deleted IS FALSE OR NEW.is_deleted IS NULL)) THEN
+        -- Check if already exists
+        IF NOT EXISTS (
+            SELECT 1 FROM public.hisaab_adjustments_ledger 
+            WHERE remarks LIKE 'CORE_ADJ:' || NEW.adjustment_id || '%'
+        ) THEN
+            INSERT INTO public.hisaab_adjustments_ledger (
+                incident_date,
+                vehicle_number,
+                partner_id,
+                partner_type,
+                adjustment_category,
+                amount,
+                approval_status,
+                approved_by,
+                reference_doc_url,
+                remarks
+            ) VALUES (
+                NEW.adjustment_date,
+                COALESCE(UPPER(REPLACE(NEW.vehicle_number, ' ', '')), 'UNKNOWN'),
+                NEW.partner_id,
+                COALESCE(NEW.partner_type, 'Individual'),
+                COALESCE(NEW.remittance_towards, NEW.adjustment_type, 'General Adjustment'),
+                NEW.amount,
+                NEW.approval_status,
+                NEW.approved_by,
+                NEW.photo_url,
+                'CORE_ADJ:' || NEW.adjustment_id || ' - ' || COALESCE(NEW.remarks, '')
+            );
+        END IF;
+    ELSIF (TG_OP = 'UPDATE' AND NEW.approval_status != 'Approved') THEN
+        -- If un-approved or rejected, remove from hisaab ledger
+        DELETE FROM public.hisaab_adjustments_ledger
+        WHERE remarks LIKE 'CORE_ADJ:' || OLD.adjustment_id || '%';
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_core_adjustments ON public.core_adjustments;
+CREATE TRIGGER trg_sync_core_adjustments
+AFTER INSERT OR UPDATE OR DELETE ON public.core_adjustments
+FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_to_hisaab_adjustments();
+
 -- End of triggers.sql
+
