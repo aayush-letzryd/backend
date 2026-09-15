@@ -568,7 +568,7 @@ BEGIN
             - (d.uber_total_earnings - ABS(d.uber_cash_collection) + d.uber_toll - d.uber_driver_sub_charge)
             - d.ola_online_payment
             - d.weekly_platform_incentive
-            + d.vehicle_adjustments
+            - d.vehicle_adjustments
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
@@ -589,7 +589,7 @@ BEGIN
             - (d.uber_total_earnings - ABS(d.uber_cash_collection) + d.uber_toll - d.uber_driver_sub_charge)
             - d.ola_online_payment
             - d.weekly_platform_incentive
-            + d.vehicle_adjustments
+            - d.vehicle_adjustments
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
@@ -610,7 +610,7 @@ BEGIN
             - (d.uber_total_earnings - ABS(d.uber_cash_collection) + d.uber_toll - d.uber_driver_sub_charge)
             - d.ola_online_payment
             - d.weekly_platform_incentive
-            + d.vehicle_adjustments
+            - d.vehicle_adjustments
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
@@ -626,8 +626,8 @@ BEGIN
                END)
         ))) AS to_payout,
         
-        (d.net_weekly_lease_rental + d.vehicle_adjustments - d.challan_amount) AS letzryd_earning,
-        CASE WHEN d.onroad_days > 0 THEN ROUND((d.net_weekly_lease_rental + d.vehicle_adjustments - d.challan_amount) / d.onroad_days, 2) ELSE 0.00 END AS letzryd_earning_per_day,
+        (d.net_weekly_lease_rental - d.vehicle_adjustments - d.challan_amount) AS letzryd_earning,
+        CASE WHEN d.onroad_days > 0 THEN ROUND((d.net_weekly_lease_rental - d.vehicle_adjustments - d.challan_amount) / d.onroad_days, 2) ELSE 0.00 END AS letzryd_earning_per_day,
         'OPEN' AS settlement_status,
         CURRENT_TIMESTAMP AS updated_at
     FROM daily_agg d
@@ -1589,7 +1589,12 @@ FOR EACH ROW EXECUTE FUNCTION public.fn_trg_auto_route_prior_period_adjustment()
 -- adjustment is added, approved, edited, or deleted in public.core_adjustments.
 CREATE OR REPLACE FUNCTION public.fn_sync_core_to_hisaab_adjustments()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_rec_id BIGINT;
+    v_veh TEXT;
+    v_cat TEXT;
 BEGIN
+    -- 1. DELETE
     IF (TG_OP = 'DELETE') THEN
         DELETE FROM public.hisaab_adjustments_ledger
         WHERE remarks LIKE 'CORE_ADJ:' || OLD.adjustment_id || '%'
@@ -1597,41 +1602,61 @@ BEGIN
         RETURN OLD;
     END IF;
 
-    -- Only sync if Approved and not soft-deleted
-    IF (NEW.approval_status = 'Approved' AND (NEW.is_deleted IS FALSE OR NEW.is_deleted IS NULL)) THEN
-        -- Check if already exists
-        IF NOT EXISTS (
-            SELECT 1 FROM public.hisaab_adjustments_ledger 
-            WHERE remarks LIKE 'CORE_ADJ:' || NEW.adjustment_id || '%'
-        ) THEN
-            INSERT INTO public.hisaab_adjustments_ledger (
-                incident_date,
-                vehicle_number,
-                partner_id,
-                partner_type,
-                adjustment_category,
-                amount,
-                approval_status,
-                approved_by,
-                reference_doc_url,
-                remarks
-            ) VALUES (
-                NEW.adjustment_date,
-                COALESCE(UPPER(REPLACE(NEW.vehicle_number, ' ', '')), 'UNKNOWN'),
-                NEW.partner_id,
-                COALESCE(NEW.partner_type, 'Individual'),
-                COALESCE(NEW.remittance_towards, NEW.adjustment_type, 'General Adjustment'),
-                NEW.amount,
-                NEW.approval_status,
-                NEW.approved_by,
-                NEW.photo_url,
-                'CORE_ADJ:' || NEW.adjustment_id || ' - ' || COALESCE(NEW.remarks, '')
-            );
-        END IF;
-    ELSIF (TG_OP = 'UPDATE' AND NEW.approval_status != 'Approved') THEN
-        -- If un-approved or rejected, remove from hisaab ledger
+    -- 2. Soft-deleted or Unapproved / Rejected -> Remove from hisaab ledger
+    IF (NEW.is_deleted IS TRUE OR NEW.approval_status != 'Approved') THEN
         DELETE FROM public.hisaab_adjustments_ledger
-        WHERE remarks LIKE 'CORE_ADJ:' || OLD.adjustment_id || '%';
+        WHERE remarks LIKE 'CORE_ADJ:' || NEW.adjustment_id || '%'
+           OR remarks LIKE 'CORE_ADJ:' || OLD.adjustment_id || '%';
+        RETURN NEW;
+    END IF;
+
+    -- 3. Approved & Active -> Upsert into hisaab_adjustments_ledger
+    v_veh := COALESCE(UPPER(REPLACE(NEW.vehicle_number, ' ', '')), 'UNKNOWN');
+    v_cat := COALESCE(NEW.remittance_towards, NEW.adjustment_type, 'General Adjustment');
+
+    SELECT id INTO v_rec_id
+    FROM public.hisaab_adjustments_ledger
+    WHERE remarks LIKE 'CORE_ADJ:' || NEW.adjustment_id || '%'
+    LIMIT 1;
+
+    IF v_rec_id IS NOT NULL THEN
+        UPDATE public.hisaab_adjustments_ledger
+        SET amount = NEW.amount,
+            incident_date = NEW.adjustment_date,
+            vehicle_number = v_veh,
+            partner_id = NEW.partner_id,
+            partner_type = COALESCE(NEW.partner_type, 'Individual'),
+            adjustment_category = v_cat,
+            approval_status = NEW.approval_status,
+            approved_by = NEW.approved_by,
+            reference_doc_url = NEW.photo_url,
+            remarks = 'CORE_ADJ:' || NEW.adjustment_id || ' - ' || COALESCE(NEW.remarks, ''),
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = v_rec_id;
+    ELSE
+        INSERT INTO public.hisaab_adjustments_ledger (
+            incident_date,
+            vehicle_number,
+            partner_id,
+            partner_type,
+            adjustment_category,
+            amount,
+            approval_status,
+            approved_by,
+            reference_doc_url,
+            remarks
+        ) VALUES (
+            NEW.adjustment_date,
+            v_veh,
+            NEW.partner_id,
+            COALESCE(NEW.partner_type, 'Individual'),
+            v_cat,
+            NEW.amount,
+            NEW.approval_status,
+            NEW.approved_by,
+            NEW.photo_url,
+            'CORE_ADJ:' || NEW.adjustment_id || ' - ' || COALESCE(NEW.remarks, '')
+        );
     END IF;
 
     RETURN NEW;

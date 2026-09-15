@@ -58,6 +58,8 @@ CREATE INDEX IF NOT EXISTS idx_hisaab_adj_settlement ON public.hisaab_adjustment
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_vehicle ON public.hisaab_adjustments_ledger (vehicle_number, incident_date);
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_prior ON public.hisaab_adjustments_ledger (is_prior_period);
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_effective ON public.hisaab_adjustments_ledger (effective_date);
+CREATE INDEX IF NOT EXISTS idx_hisaab_adj_approval ON public.hisaab_adjustments_ledger (approval_status);
+CREATE INDEX IF NOT EXISTS idx_hisaab_adj_daily_lookup ON public.hisaab_adjustments_ledger (COALESCE(effective_date, incident_date), vehicle_number, partner_id);
 
 -- ----------------------------------------------------------------------------
 -- 3. hisaab_daily_ledger (Tier 1: Daily Shift Grain)
