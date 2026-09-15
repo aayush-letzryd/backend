@@ -485,6 +485,11 @@ BEGIN
         vehicle_adjustments,
         challan_amount,
         accident_penalties,
+        total_trip_km,
+        total_gps_km,
+        ideal_gps_km,
+        dead_mile_km,
+        dead_mile_pct,
         dead_mile_charges,
         tds_amount,
         current_week_os,
@@ -533,7 +538,22 @@ BEGIN
         -d.vehicle_adjustments AS vehicle_adjustments, -- Displayed as negative credit (e.g. -1100.00) matching Excel Col AJ
         d.challan_amount,
         d.accident_penalties,
-        0.00 AS dead_mile_charges,
+        
+        -- GPS TELEMETRY
+        (u_km.uber_km + o_km.ola_km) AS total_trip_km,
+        gps.total_gps_km,
+        ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30)) AS ideal_gps_km,
+        GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) AS dead_mile_km,
+        CASE WHEN gps.total_gps_km > 0 THEN 
+            ROUND((GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) / gps.total_gps_km), 4)
+        ELSE 0.0000 END AS dead_mile_pct,
+        
+        CASE 
+            WHEN d.partner_type = 'Operator' THEN 0.00 
+            WHEN gps.total_gps_km <= 0 THEN 0.00 
+            ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+        END AS dead_mile_charges,
+
         -- TDS 1% for Individual Drivers if Net Earnings > Rent
         CASE 
             WHEN d.partner_type = 'Operator' THEN 0.00
@@ -541,6 +561,7 @@ BEGIN
             THEN ROUND((d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) * 0.01, 2)
             ELSE 0.00 
         END AS tds_amount,
+        
         -- Current Week Outstanding
         (
             d.net_weekly_lease_rental
@@ -551,12 +572,18 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
+                WHEN d.partner_type = 'Operator' THEN 0.00 
+                WHEN gps.total_gps_km <= 0 THEN 0.00 
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+               END)
+            + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
                 WHEN (d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) > 0 
                 THEN ROUND((d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) * 0.01, 2)
                 ELSE 0.00 
                END)
         ) AS current_week_os,
+        
         GREATEST(0, (
             d.net_weekly_lease_rental
             - (d.uber_total_earnings - ABS(d.uber_cash_collection) + d.uber_toll - d.uber_driver_sub_charge)
@@ -566,12 +593,18 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
+                WHEN d.partner_type = 'Operator' THEN 0.00 
+                WHEN gps.total_gps_km <= 0 THEN 0.00 
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+               END)
+            + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
                 WHEN (d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) > 0 
                 THEN ROUND((d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) * 0.01, 2)
                 ELSE 0.00 
                END)
         )) AS to_collect,
+        
         ABS(LEAST(0, (
             d.net_weekly_lease_rental
             - (d.uber_total_earnings - ABS(d.uber_cash_collection) + d.uber_toll - d.uber_driver_sub_charge)
@@ -581,12 +614,18 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
+                WHEN d.partner_type = 'Operator' THEN 0.00 
+                WHEN gps.total_gps_km <= 0 THEN 0.00 
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+               END)
+            + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
                 WHEN (d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) > 0 
                 THEN ROUND((d.uber_total_earnings + d.ola_net_revenue - d.net_weekly_lease_rental) * 0.01, 2)
                 ELSE 0.00 
                END)
         ))) AS to_payout,
+        
         (d.net_weekly_lease_rental + d.vehicle_adjustments - d.challan_amount) AS letzryd_earning,
         CASE WHEN d.onroad_days > 0 THEN ROUND((d.net_weekly_lease_rental + d.vehicle_adjustments - d.challan_amount) / d.onroad_days, 2) ELSE 0.00 END AS letzryd_earning_per_day,
         'OPEN' AS settlement_status,
@@ -601,6 +640,24 @@ BEGIN
         SELECT driver_name FROM public.core_partner_onboarding 
         WHERE partner_id = d.partner_id LIMIT 1
     ) dr ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(distance_km), 0) AS total_gps_km 
+        FROM public.core_gps 
+        WHERE vehicle_number = d.vehicle_number 
+          AND record_date BETWEEN v_week_start AND v_week_end
+    ) gps ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(total_trip_distance_km), 0) AS uber_km 
+        FROM public.core_uber_daily 
+        WHERE vehicle_number = d.vehicle_number 
+          AND operational_date BETWEEN v_week_start AND v_week_end
+    ) u_km ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(total_kms), 0) AS ola_km 
+        FROM public.core_ola_daily 
+        WHERE vehicle_number = d.vehicle_number 
+          AND service_date BETWEEN v_week_start AND v_week_end
+    ) o_km ON TRUE
     ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
         partner_name = EXCLUDED.partner_name,
         allotted_days = EXCLUDED.allotted_days,
@@ -627,6 +684,12 @@ BEGIN
         vehicle_adjustments = EXCLUDED.vehicle_adjustments,
         challan_amount = EXCLUDED.challan_amount,
         accident_penalties = EXCLUDED.accident_penalties,
+        total_trip_km = EXCLUDED.total_trip_km,
+        total_gps_km = EXCLUDED.total_gps_km,
+        ideal_gps_km = EXCLUDED.ideal_gps_km,
+        dead_mile_km = EXCLUDED.dead_mile_km,
+        dead_mile_pct = EXCLUDED.dead_mile_pct,
+        dead_mile_charges = EXCLUDED.dead_mile_charges,
         tds_amount = EXCLUDED.tds_amount,
         current_week_os = EXCLUDED.current_week_os,
         to_collect = EXCLUDED.to_collect,
@@ -635,7 +698,6 @@ BEGIN
         letzryd_earning_per_day = EXCLUDED.letzryd_earning_per_day,
         updated_at = CURRENT_TIMESTAMP
     WHERE public.hisaab_vehicle_weekly.settlement_status = 'OPEN';
-
 END;
 $$;
 
@@ -1577,3 +1639,31 @@ FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_to_hisaab_adjustments();
 
 -- End of triggers.sql
 
+
+
+-- ----------------------------------------------------------------------------
+-- 5. GPS TRIGGER: fn_sync_hisaab_from_gps
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTIONpublic.fn_sync_hisaab_from_gps()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_week_id VARCHAR;
+    v_is_locked BOOLEAN;
+BEGIN
+    SELECT week_id, is_locked INTO v_week_id, v_is_locked
+    FROM public.hisaab_settlement_weeks
+    WHERE NEW.record_date BETWEEN week_start AND week_end
+    LIMIT 1;
+
+    IF v_week_id IS NOT NULL AND v_is_locked = FALSE THEN
+        CALL public.sp_sync_hisaab_vehicle_weekly(v_week_id, NEW.vehicle_number, NULL);
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_hisaab_from_gps ON public.core_gps;
+CREATE TRIGGER trg_sync_hisaab_from_gps
+AFTER INSERT OR UPDATE ON public.core_gps
+FOR EACH ROW EXECUTE FUNCTION public.fn_sync_hisaab_from_gps();
