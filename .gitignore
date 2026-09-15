@@ -40,3 +40,12 @@ env/
 # Operating System
 .DS_Store
 Thumbs.db
+
+# Node / Javascript artifacts & temporary test scripts
+node_modules/
+package.json
+package-lock.json
+*.js
+*.sql.bak
+run_sql.py
+update.sql

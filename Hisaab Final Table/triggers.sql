@@ -1012,6 +1012,12 @@ RETURNS TRIGGER AS $$
 DECLARE
     v_target_date DATE;
 BEGIN
+    IF TG_OP = 'DELETE' THEN
+        v_target_date := COALESCE(OLD.effective_date, OLD.incident_date);
+        PERFORM public.fn_sync_hisaab_daily_upsert(v_target_date, OLD.vehicle_number, OLD.partner_id);
+        RETURN OLD;
+    END IF;
+
     v_target_date := COALESCE(NEW.effective_date, NEW.incident_date);
     PERFORM public.fn_sync_hisaab_daily_upsert(v_target_date, NEW.vehicle_number, NEW.partner_id);
 
@@ -1028,7 +1034,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_sync_hisaab_from_adj ON public.hisaab_adjustments_ledger;
 CREATE TRIGGER trg_sync_hisaab_from_adj
-AFTER INSERT OR UPDATE ON public.hisaab_adjustments_ledger
+AFTER INSERT OR UPDATE OR DELETE ON public.hisaab_adjustments_ledger
 FOR EACH ROW EXECUTE FUNCTION public.fn_trg_sync_hisaab_from_adj();
 
 
@@ -1637,14 +1643,10 @@ CREATE TRIGGER trg_sync_core_adjustments
 AFTER INSERT OR UPDATE OR DELETE ON public.core_adjustments
 FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_to_hisaab_adjustments();
 
--- End of triggers.sql
-
-
-
 -- ----------------------------------------------------------------------------
--- 5. GPS TRIGGER: fn_sync_hisaab_from_gps
+-- 10.B GPS TRIGGER: fn_sync_hisaab_from_gps
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE FUNCTIONpublic.fn_sync_hisaab_from_gps()
+CREATE OR REPLACE FUNCTION public.fn_sync_hisaab_from_gps()
 RETURNS TRIGGER AS $$
 DECLARE
     v_week_id VARCHAR;
@@ -1667,3 +1669,160 @@ DROP TRIGGER IF EXISTS trg_sync_hisaab_from_gps ON public.core_gps;
 CREATE TRIGGER trg_sync_hisaab_from_gps
 AFTER INSERT OR UPDATE ON public.core_gps
 FOR EACH ROW EXECUTE FUNCTION public.fn_sync_hisaab_from_gps();
+
+
+-- ============================================================================
+-- 11. SYNC TRIGGER: core_challans -> hisaab_adjustments_ledger
+-- ============================================================================
+-- Automatically keeps hisaab_adjustments_ledger synchronized whenever a traffic
+-- challan is inserted, updated, paid, or deleted in public.core_challans.
+-- Performs multi-tier partner attribution:
+--   Tier 1: public.daily_rent_log (exact vehicle and violation date)
+--   Tier 2: public.core_daily_vehicle_status (exact vehicle and status date)
+--   Tier 3: public.core_rent (active allocation for vehicle)
+--   Tier 4: public.core_rent (historical fallback)
+--   Fallback: 'UNKNOWN'
+-- Cascades into hisaab_daily_ledger, hisaab_vehicle_weekly, and hisaab_partner_weekly.
+CREATE OR REPLACE FUNCTION public.fn_sync_core_to_hisaab_challans()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_incident_date DATE;
+    v_vehicle_number VARCHAR(64);
+    v_partner_id VARCHAR(64);
+    v_partner_type VARCHAR(32);
+    v_amount NUMERIC(12,2);
+    v_remarks TEXT;
+    v_rec_id BIGINT;
+BEGIN
+    -- Handle DELETE
+    IF (TG_OP = 'DELETE') THEN
+        DELETE FROM public.hisaab_adjustments_ledger
+        WHERE remarks LIKE 'CHALLAN:' || OLD.id || ' - %'
+          AND adjustment_category = 'Challan';
+        RETURN OLD;
+    END IF;
+
+    -- Determine amount: prefer total_pending, fallback to challan_amount
+    v_amount := COALESCE(NEW.total_pending, NEW.challan_amount, 0.00);
+
+    -- Paid or soft-deleted or 0 amount -> Remove from adjustments ledger
+    IF (NEW.is_deleted IS TRUE OR NEW.payment_status = 'PAID' OR v_amount <= 0) THEN
+        DELETE FROM public.hisaab_adjustments_ledger
+        WHERE remarks LIKE 'CHALLAN:' || NEW.id || ' - %'
+          AND adjustment_category = 'Challan';
+        RETURN NEW;
+    END IF;
+
+    -- Upsert Case (INSERT or UPDATE with pending fine)
+    v_incident_date := COALESCE(NEW.violation_date, NEW.audit_date, NEW.notice_date, CURRENT_DATE);
+    v_vehicle_number := UPPER(REPLACE(NEW.vehicle_reg_no, ' ', ''));
+
+    -- Tier 1: Check daily_rent_log for exact vehicle and violation date
+    SELECT partner_id, 
+           CASE WHEN partner_id ILIKE '%IP%' OR partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END
+    INTO v_partner_id, v_partner_type
+    FROM public.daily_rent_log
+    WHERE UPPER(REPLACE(vehicle_number, ' ', '')) = v_vehicle_number
+      AND log_date = v_incident_date
+      AND partner_id IS NOT NULL AND partner_id <> ''
+    LIMIT 1;
+
+    -- Tier 2: Check core_daily_vehicle_status for exact vehicle and status date
+    IF v_partner_id IS NULL THEN
+        SELECT partner_id,
+               CASE WHEN partner_id ILIKE '%IP%' OR partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END
+        INTO v_partner_id, v_partner_type
+        FROM public.core_daily_vehicle_status
+        WHERE UPPER(REPLACE(vehicle_number, ' ', '')) = v_vehicle_number
+          AND status_date = v_incident_date
+          AND partner_id IS NOT NULL AND partner_id <> ''
+        LIMIT 1;
+    END IF;
+
+    -- Tier 3: Check core_rent for active vehicle allocation
+    IF v_partner_id IS NULL THEN
+        SELECT partner_id,
+               CASE WHEN partner_id ILIKE '%IP%' OR partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END
+        INTO v_partner_id, v_partner_type
+        FROM public.core_rent
+        WHERE UPPER(REPLACE(vehicle_number, ' ', '')) = v_vehicle_number
+          AND is_active = TRUE
+          AND partner_id IS NOT NULL AND partner_id <> ''
+        ORDER BY id DESC
+        LIMIT 1;
+    END IF;
+
+    -- Tier 4: Check core_rent historical allocation fallback
+    IF v_partner_id IS NULL THEN
+        SELECT partner_id,
+               CASE WHEN partner_id ILIKE '%IP%' OR partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END
+        INTO v_partner_id, v_partner_type
+        FROM public.core_rent
+        WHERE UPPER(REPLACE(vehicle_number, ' ', '')) = v_vehicle_number
+          AND partner_id IS NOT NULL AND partner_id <> ''
+        ORDER BY is_active DESC NULLS LAST, id DESC
+        LIMIT 1;
+    END IF;
+
+    -- Tier 5: Fallback to UNKNOWN
+    IF v_partner_id IS NULL THEN
+        v_partner_id := 'UNKNOWN';
+        v_partner_type := 'Individual';
+    END IF;
+
+    v_remarks := 'CHALLAN:' || NEW.id || ' - ' || COALESCE(NEW.notice_no, '') || ' ' || COALESCE(NEW.violation_description, '');
+
+    -- Check if already exists in hisaab_adjustments_ledger
+    SELECT id INTO v_rec_id 
+    FROM public.hisaab_adjustments_ledger 
+    WHERE remarks LIKE 'CHALLAN:' || NEW.id || ' - %' 
+      AND adjustment_category = 'Challan' 
+    LIMIT 1;
+
+    IF v_rec_id IS NOT NULL THEN
+        UPDATE public.hisaab_adjustments_ledger
+        SET amount = v_amount,
+            partner_id = v_partner_id,
+            partner_type = v_partner_type,
+            vehicle_number = v_vehicle_number,
+            incident_date = v_incident_date,
+            remarks = v_remarks,
+            reference_doc_url = NEW.challan_image_url,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE id = v_rec_id;
+    ELSE
+        INSERT INTO public.hisaab_adjustments_ledger (
+            incident_date,
+            vehicle_number,
+            partner_id,
+            partner_type,
+            adjustment_category,
+            amount,
+            approval_status,
+            reference_doc_url,
+            remarks
+        ) VALUES (
+            v_incident_date,
+            v_vehicle_number,
+            v_partner_id,
+            v_partner_type,
+            'Challan',
+            v_amount,
+            'Approved',
+            NEW.challan_image_url,
+            v_remarks
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_sync_core_challans ON public.core_challans;
+CREATE TRIGGER trg_sync_core_challans
+AFTER INSERT OR UPDATE OR DELETE ON public.core_challans
+FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_to_hisaab_challans();
+
+-- ============================================================================
+-- End of triggers.sql
+-- ============================================================================
