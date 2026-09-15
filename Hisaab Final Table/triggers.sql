@@ -148,7 +148,7 @@ BEGIN
                 UNION
                 SELECT partner_id FROM public.hisaab_daily_ledger WHERE log_date = p_log_date AND vehicle_number = p_vehicle
                 UNION
-                SELECT partner_id FROM public.hisaab_adjustments_ledger WHERE incident_date = p_log_date AND vehicle_number = p_vehicle
+                SELECT partner_id FROM public.hisaab_adjustments_ledger WHERE COALESCE(effective_date, incident_date) = p_log_date AND vehicle_number = p_vehicle
                 UNION
                 SELECT partner_id FROM public.core_rent WHERE vehicle_number = p_vehicle AND is_active = TRUE
             ) sub WHERE partner_id IS NOT NULL AND partner_id <> ''
@@ -245,7 +245,7 @@ BEGIN
         v_daily_accident_recovery,
         v_daily_adjustments
     FROM public.hisaab_adjustments_ledger
-    WHERE incident_date = p_log_date 
+    WHERE COALESCE(effective_date, incident_date) = p_log_date 
       AND vehicle_number = p_vehicle 
       AND partner_id = v_target_partner
       AND settlement_week_id = v_week_id
@@ -503,7 +503,7 @@ BEGIN
         v_week_end,
         d.vehicle_number,
         d.partner_id,
-        COALESCE(dr.full_name, d.partner_id) AS partner_name,
+        COALESCE(dr.driver_name, d.partner_id) AS partner_name,
         d.partner_type,
         d.city,
         d.vehicle_model,
@@ -598,8 +598,8 @@ BEGIN
         ORDER BY is_active DESC NULLS LAST, id DESC LIMIT 1
     ) p ON TRUE
     LEFT JOIN LATERAL (
-        SELECT full_name FROM public.drivers 
-        WHERE driver_code = d.partner_id LIMIT 1
+        SELECT driver_name FROM public.core_partner_onboarding 
+        WHERE partner_id = d.partner_id LIMIT 1
     ) dr ON TRUE
     ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
         partner_name = EXCLUDED.partner_name,
@@ -778,7 +778,7 @@ BEGIN
         v_week_start,
         v_week_end,
         ap.partner_id,
-        COALESCE(v.partner_name, dr.full_name, ap.partner_id) AS partner_name,
+        COALESCE(v.partner_name, dr.driver_name, ap.partner_id) AS partner_name,
         COALESCE(v.partner_type, CASE WHEN ap.partner_id ILIKE '%IP%' OR ap.partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END) AS partner_type,
         COALESCE(v.city, 'HYD') AS city,
         COALESCE(v.allotted_cars_count, 0) AS allotted_cars_count,
@@ -800,9 +800,10 @@ BEGIN
         5000.00 AS security_deposit_paid,
         0.00 AS deposit_deduction_current_week,
         0.00 AS pending_deposit,
-        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00)) AS total_outstanding,
-        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00)))) AS net_bank_payout,
-        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) - COALESCE(pa.prior_period_adjustments, 0.00))) AS net_amount_to_collect,
+        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00)) AS total_outstanding,
+        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00)))) AS net_bank_payout,
+        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00))) AS net_amount_to_collect,
+        'DRAFT' AS settlement_status,
         dr.account_number AS payout_account_number,
         dr.ifsc_code AS payout_ifsc,
         CURRENT_TIMESTAMP AS updated_at
@@ -943,21 +944,20 @@ FOR EACH ROW EXECUTE FUNCTION public.fn_trg_sync_hisaab_from_ola();
 
 
 -- D. HISAAB ADJUSTMENTS LEDGER TRIGGER: trg_sync_hisaab_from_adj
--- Routes in-week adjustments to daily ledger, and prior-period adjustments directly to partner weekly.
+-- Routes all approved adjustments (both in-week and prior-period) to daily ledger on their effective_date.
 CREATE OR REPLACE FUNCTION public.fn_trg_sync_hisaab_from_adj()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_target_date DATE;
 BEGIN
-    IF NEW.is_prior_period = FALSE THEN
-        PERFORM public.fn_sync_hisaab_daily_upsert(NEW.incident_date, NEW.vehicle_number, NEW.partner_id);
-    ELSE
-        CALL public.sp_sync_hisaab_partner_weekly(NEW.settlement_week_id, NEW.partner_id);
-    END IF;
+    v_target_date := COALESCE(NEW.effective_date, NEW.incident_date);
+    PERFORM public.fn_sync_hisaab_daily_upsert(v_target_date, NEW.vehicle_number, NEW.partner_id);
 
     IF TG_OP = 'UPDATE' THEN
-        IF OLD.is_prior_period = FALSE THEN
+        IF OLD.effective_date IS NOT NULL AND OLD.effective_date <> v_target_date THEN
+            PERFORM public.fn_sync_hisaab_daily_upsert(OLD.effective_date, OLD.vehicle_number, OLD.partner_id);
+        ELSIF OLD.incident_date <> v_target_date THEN
             PERFORM public.fn_sync_hisaab_daily_upsert(OLD.incident_date, OLD.vehicle_number, OLD.partner_id);
-        ELSE
-            CALL public.sp_sync_hisaab_partner_weekly(OLD.settlement_week_id, OLD.partner_id);
         END IF;
     END IF;
     RETURN NEW;
@@ -1490,6 +1490,7 @@ BEGIN
 
         NEW.settlement_week_id := v_active_week_id;
         NEW.is_prior_period := TRUE;
+        NEW.effective_date := COALESCE(NEW.effective_date, CURRENT_DATE); -- Approval date in active cycle
 
         -- Append [Prior Period from {incident_date}] to NEW.remarks
         v_prior_tag := '[Prior Period from ' || to_char(NEW.incident_date, 'YYYY-MM-DD') || ']';
@@ -1501,6 +1502,7 @@ BEGIN
     ELSE
         NEW.settlement_week_id := v_incident_week_id;
         NEW.is_prior_period := FALSE;
+        NEW.effective_date := NEW.incident_date;
     END IF;
 
     RETURN NEW;

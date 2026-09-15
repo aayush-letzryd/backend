@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS public.hisaab_adjustments_ledger (
     adjustment_category VARCHAR(64) NOT NULL,           -- 'Challan', 'Rent Off', 'Maintenance/Tyre', 'Accident Damage', 'Bonus'
     amount NUMERIC(12,2) NOT NULL,                      -- Positive = Deduction; Negative = Credit/Reimbursement
     is_prior_period BOOLEAN NOT NULL DEFAULT FALSE,     -- TRUE if incident week was already locked
+    effective_date DATE DEFAULT CURRENT_DATE,           -- Date posted to daily ledger (CURRENT_DATE for prior-period, incident_date for in-week)
     approval_status VARCHAR(32) NOT NULL DEFAULT 'Approved', -- 'Approved', 'Pending', 'Rejected'
     approved_by VARCHAR(64),
     reference_doc_url TEXT,                             -- Google Drive link or PDF URL
@@ -56,6 +57,7 @@ CREATE TABLE IF NOT EXISTS public.hisaab_adjustments_ledger (
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_settlement ON public.hisaab_adjustments_ledger (settlement_week_id, partner_id);
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_vehicle ON public.hisaab_adjustments_ledger (vehicle_number, incident_date);
 CREATE INDEX IF NOT EXISTS idx_hisaab_adj_prior ON public.hisaab_adjustments_ledger (is_prior_period);
+CREATE INDEX IF NOT EXISTS idx_hisaab_adj_effective ON public.hisaab_adjustments_ledger (effective_date);
 
 -- ----------------------------------------------------------------------------
 -- 3. hisaab_daily_ledger (Tier 1: Daily Shift Grain)
