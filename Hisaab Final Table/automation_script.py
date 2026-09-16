@@ -144,11 +144,16 @@ def lock_settlement_week(week_id, locked_by='finance_admin'):
         conn.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) > 2 and sys.argv[1] == '--daily':
-        sync_daily_hisaab(sys.argv[2])
-    elif len(sys.argv) > 2 and sys.argv[1] == '--weekly':
-        sync_weekly_vehicle_hisaab(sys.argv[2])
-    elif len(sys.argv) > 2 and sys.argv[1] == '--lock':
-        lock_settlement_week(sys.argv[2])
-    else:
-        logger.info("Usage: python automation_script.py [--daily YYYY-MM-DD | --weekly CYxxWKww | --lock CYxxWKww]")
+    try:
+        if len(sys.argv) > 2 and sys.argv[1] == '--daily':
+            sync_daily_hisaab(sys.argv[2])
+        elif len(sys.argv) > 2 and sys.argv[1] == '--weekly':
+            sync_weekly_vehicle_hisaab(sys.argv[2])
+        elif len(sys.argv) > 2 and sys.argv[1] == '--lock':
+            lock_settlement_week(sys.argv[2])
+        else:
+            logger.info("Usage: python automation_script.py [--daily YYYY-MM-DD | --weekly CYxxWKww | --lock CYxxWKww]")
+            sys.exit(2)
+    except Exception as exc:
+        logger.critical(f"Fatal error during Hisaab CLI execution: {exc}")
+        sys.exit(1)
