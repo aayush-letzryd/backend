@@ -106,52 +106,60 @@ DECLARE
     v_daily_indemnity_fee NUMERIC(12,2) := 0.00;
     v_net_daily_rent NUMERIC(12,2) := 0.00;
 
+    -- Uber
     v_uber_trips INT := 0;
     v_uber_fare_earnings NUMERIC(12,2) := 0.00;
     v_uber_cash_collected NUMERIC(12,2) := 0.00;
     v_uber_tolls NUMERIC(12,2) := 0.00;
     v_uber_subscription_charge NUMERIC(12,2) := 0.00;
 
+    -- Ola
     v_ola_trips INT := 0;
     v_ola_net_revenue NUMERIC(12,2) := 0.00;
     v_ola_cash_collected NUMERIC(12,2) := 0.00;
     v_ola_tolls NUMERIC(12,2) := 0.00;
     v_ola_online_payment NUMERIC(12,2) := 0.00;
 
+    -- Rapido
+    v_rapido_trips INT := 0;
+    v_rapido_net_revenue NUMERIC(12,2) := 0.00;
+    v_rapido_cash_collected NUMERIC(12,2) := 0.00;
+
+    -- Adjustments, Challans, Accidents
     v_daily_adjustments NUMERIC(12,2) := 0.00;
     v_daily_challans NUMERIC(12,2) := 0.00;
     v_daily_accident_recovery NUMERIC(12,2) := 0.00;
+
+    -- Milestone Incentive
     v_weekly_incentive_credit NUMERIC(12,2) := 0.00;
+
+    -- Balance
     v_daily_net_balance NUMERIC(12,2) := 0.00;
 BEGIN
-    IF p_log_date IS NULL OR p_vehicle IS NULL THEN
-        RETURN;
-    END IF;
-
-    -- 1. Ensure settlement week exists and check lock status
+    -- 1. Ensure Week exists and get its metadata
     v_week_id := public.fn_ensure_hisaab_week(NULL, p_log_date);
-    SELECT is_locked, week_start, week_end, settlement_year, settlement_week
+    SELECT is_locked, week_start, week_end, settlement_year, settlement_week 
     INTO v_is_locked, v_week_start, v_week_end, v_year, v_week_num
-    FROM public.hisaab_settlement_weeks
+    FROM public.hisaab_settlement_weeks 
     WHERE week_id = v_week_id;
 
     IF v_is_locked = TRUE THEN
-        RETURN; -- Settlement week is frozen; immutable
+        RETURN;
     END IF;
 
-    -- 2. Partner Resolution:
-    -- If p_partner is not specified or not in daily_rent_log, resolve all partners linked to this vehicle on this date
-    IF v_target_partner IS NULL OR v_target_partner = '' THEN
+    -- 2. Partner Identification if not explicitly passed
+    IF v_target_partner IS NULL THEN
         FOR v_partner_record IN
             SELECT DISTINCT partner_id FROM (
-                SELECT partner_id FROM public.daily_rent_log WHERE log_date = p_log_date AND vehicle_number = p_vehicle
+                SELECT partner_id FROM public.daily_rent_log 
+                WHERE log_date = p_log_date AND vehicle_number = p_vehicle AND partner_id IS NOT NULL
                 UNION
-                SELECT partner_id FROM public.hisaab_daily_ledger WHERE log_date = p_log_date AND vehicle_number = p_vehicle
+                SELECT vendor_code AS partner_id FROM public.core_uber_daily 
+                WHERE operational_date = p_log_date AND vehicle_number = p_vehicle AND vendor_code IS NOT NULL
                 UNION
-                SELECT partner_id FROM public.hisaab_adjustments_ledger WHERE COALESCE(effective_date, incident_date) = p_log_date AND vehicle_number = p_vehicle
-                UNION
-                SELECT partner_id FROM public.core_rent WHERE vehicle_number = p_vehicle AND is_active = TRUE
-            ) sub WHERE partner_id IS NOT NULL AND partner_id <> ''
+                SELECT partner_id FROM public.hisaab_adjustments_ledger 
+                WHERE COALESCE(effective_date, incident_date) = p_log_date AND vehicle_number = p_vehicle AND partner_id IS NOT NULL
+            ) t
         LOOP
             v_found_partners := TRUE;
             PERFORM public.fn_sync_hisaab_daily_upsert(p_log_date, p_vehicle, v_partner_record.partner_id);
@@ -161,11 +169,19 @@ BEGIN
             RETURN;
         END IF;
 
-        -- Fallback if no partner found anywhere
-        v_target_partner := 'UNKNOWN';
+        -- Fallback to master agreement partner
+        SELECT partner_id INTO v_target_partner
+        FROM public.core_rent
+        WHERE vehicle_number = p_vehicle
+        ORDER BY is_active DESC NULLS LAST, id DESC
+        LIMIT 1;
+
+        IF v_target_partner IS NULL THEN
+            v_target_partner := 'UNASSIGNED_' || p_vehicle;
+        END IF;
     END IF;
 
-    -- 3. Attendance & Rent (daily_rent_log)
+    -- 3. Ingest Rent Metrics (daily_rent_log)
     SELECT 
         r.city,
         r.vehicle_model,
@@ -187,7 +203,6 @@ BEGIN
       AND r.vehicle_number = p_vehicle 
       AND r.partner_id = v_target_partner;
 
-    -- Fallback vehicle model and city from core_rent if not in daily_rent_log
     IF v_city IS NULL THEN
         SELECT city, vehicle_model INTO v_city, v_vehicle_model 
         FROM public.core_rent 
@@ -196,14 +211,13 @@ BEGIN
         LIMIT 1;
     END IF;
 
-    -- Determine partner type: Operator vs Individual
     IF v_target_partner ILIKE '%IP%' OR v_target_partner ILIKE '%OP%' THEN
         v_partner_type := 'Operator';
     ELSE
         v_partner_type := 'Individual';
     END IF;
 
-    -- 4. Uber Telemetry (core_uber_daily)
+    -- 4. Uber Telemetry (core_uber_daily) with partner/driver isolation
     SELECT 
         COALESCE(SUM(completed_trips), 0),
         COALESCE(SUM(net_fare_earnings), 0.00),
@@ -217,7 +231,9 @@ BEGIN
         v_uber_tolls,
         v_uber_subscription_charge
     FROM public.core_uber_daily
-    WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
+    WHERE operational_date = p_log_date 
+      AND vehicle_number = p_vehicle
+      AND (vendor_code = v_target_partner OR vendor_code IS NULL OR v_target_partner ILIKE 'UNASSIGNED_%');
 
     -- 5. Ola Telemetry (core_ola_daily)
     SELECT 
@@ -235,7 +251,19 @@ BEGIN
     FROM public.core_ola_daily
     WHERE service_date = p_log_date AND vehicle_number = p_vehicle;
 
-    -- 6. In-Week Adjustments & Challans (hisaab_adjustments_ledger)
+    -- 6. Rapido Telemetry (core_rapido_daily)
+    SELECT 
+        COALESCE(SUM(completed_trips), 0),
+        COALESCE(SUM(net_revenue), 0.00),
+        COALESCE(SUM(cash_collected), 0.00)
+    INTO 
+        v_rapido_trips,
+        v_rapido_net_revenue,
+        v_rapido_cash_collected
+    FROM public.core_rapido_daily
+    WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
+
+    -- 7. In-Week Adjustments & Challans (hisaab_adjustments_ledger)
     SELECT 
         COALESCE(SUM(CASE WHEN adjustment_category = 'Challan' THEN amount ELSE 0 END), 0.00),
         COALESCE(SUM(CASE WHEN adjustment_category = 'Accident Damage' THEN amount ELSE 0 END), 0.00),
@@ -251,7 +279,7 @@ BEGIN
       AND settlement_week_id = v_week_id
       AND approval_status = 'Approved';
 
-    -- 7. Sunday Milestone Incentives Credit
+    -- 8. Sunday Milestone Incentives Credit
     IF p_log_date = v_week_end THEN
         SELECT 
             COALESCE(u.uber_inc, 0.00) + COALESCE(o.ola_inc, 0.00)
@@ -272,19 +300,19 @@ BEGIN
         v_weekly_incentive_credit := 0.00;
     END IF;
 
-    -- 8. Daily Net Balance Calculation:
-    -- Net Daily Rent + ABS(Cash Collected) - Digital Fare Earnings - Online Pay + Challans/Damages/Adjustments - Incentive
+    -- 9. Daily Net Balance Calculation:
+    -- Net Daily Rent + ABS(Cash Collected) - Digital Fare Earnings - Online Pay + Challans/Damages - Adjustments - Incentive
     v_daily_net_balance := 
         COALESCE(v_net_daily_rent, 0.00)
-        + (ABS(COALESCE(v_uber_cash_collected, 0.00)) + ABS(COALESCE(v_ola_cash_collected, 0.00)))
-        - (COALESCE(v_uber_fare_earnings, 0.00) + COALESCE(v_ola_net_revenue, 0.00))
+        + (ABS(COALESCE(v_uber_cash_collected, 0.00)) + ABS(COALESCE(v_ola_cash_collected, 0.00)) + ABS(COALESCE(v_rapido_cash_collected, 0.00)))
+        - (COALESCE(v_uber_fare_earnings, 0.00) + COALESCE(v_ola_net_revenue, 0.00) + COALESCE(v_rapido_net_revenue, 0.00))
         - COALESCE(v_ola_online_payment, 0.00)
         + COALESCE(v_daily_challans, 0.00)
         + COALESCE(v_daily_accident_recovery, 0.00)
-        - COALESCE(v_daily_adjustments, 0.00) -- In-week approved credits (rent-off, servicing, reimbursements) reduce dues
+        - COALESCE(v_daily_adjustments, 0.00)
         - COALESCE(v_weekly_incentive_credit, 0.00);
 
-    -- 9. Upsert into hisaab_daily_ledger
+    -- 10. Upsert into hisaab_daily_ledger
     INSERT INTO public.hisaab_daily_ledger (
         log_date,
         week_id,
@@ -308,6 +336,9 @@ BEGIN
         ola_cash_collected,
         ola_tolls,
         ola_online_payment,
+        rapido_trips,
+        rapido_net_revenue,
+        rapido_cash_collected,
         daily_adjustments,
         daily_challans,
         daily_accident_recovery,
@@ -338,6 +369,9 @@ BEGIN
         COALESCE(v_ola_cash_collected, 0.00),
         COALESCE(v_ola_tolls, 0.00),
         COALESCE(v_ola_online_payment, 0.00),
+        COALESCE(v_rapido_trips, 0),
+        COALESCE(v_rapido_net_revenue, 0.00),
+        COALESCE(v_rapido_cash_collected, 0.00),
         COALESCE(v_daily_adjustments, 0.00),
         COALESCE(v_daily_challans, 0.00),
         COALESCE(v_daily_accident_recovery, 0.00),
@@ -365,6 +399,9 @@ BEGIN
         ola_cash_collected = EXCLUDED.ola_cash_collected,
         ola_tolls = EXCLUDED.ola_tolls,
         ola_online_payment = EXCLUDED.ola_online_payment,
+        rapido_trips = EXCLUDED.rapido_trips,
+        rapido_net_revenue = EXCLUDED.rapido_net_revenue,
+        rapido_cash_collected = EXCLUDED.rapido_cash_collected,
         daily_adjustments = EXCLUDED.daily_adjustments,
         daily_challans = EXCLUDED.daily_challans,
         daily_accident_recovery = EXCLUDED.daily_accident_recovery,
@@ -733,10 +770,9 @@ $$;
 --   p_week_id: Target week (e.g. 'CY26WK36')
 --   p_partner: Partner code (NULL for all partners in week)
 -- ----------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE public.sp_sync_hisaab_partner_weekly(
-    p_week_id VARCHAR,
-    p_partner VARCHAR DEFAULT NULL
-) LANGUAGE plpgsql AS $$
+CREATE OR REPLACE PROCEDURE public.sp_sync_hisaab_partner_weekly(IN p_week_id character varying, IN p_partner character varying DEFAULT NULL::character varying)
+ LANGUAGE plpgsql
+AS $procedure$
 DECLARE
     v_week_start DATE;
     v_week_end DATE;
@@ -802,7 +838,8 @@ BEGIN
     prev_dues AS (
         SELECT 
             partner_id,
-            total_outstanding AS previous_outstanding
+            -- FIX 1: Only uncollected positive debt rolls forward. Negative balances (payouts already disbursed) do NOT roll forward into subsequent weeks!
+            CASE WHEN total_outstanding > 0 THEN total_outstanding ELSE 0.00 END AS previous_outstanding
         FROM public.hisaab_partner_weekly
         WHERE week_id = v_prev_week_id
           AND (p_partner IS NULL OR partner_id = p_partner)
@@ -880,9 +917,10 @@ BEGIN
         5000.00 AS security_deposit_paid,
         0.00 AS deposit_deduction_current_week,
         0.00 AS pending_deposit,
-        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00)) AS total_outstanding,
-        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00)))) AS net_bank_payout,
-        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00))) AS net_amount_to_collect,
+        -- FIX 2: Include prior_period_adjustments in total_outstanding calculation
+        (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)) AS total_outstanding,
+        ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)))) AS net_bank_payout,
+        GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00))) AS net_amount_to_collect,
         'DRAFT' AS settlement_status,
         dr.account_number AS payout_account_number,
         dr.ifsc_code AS payout_ifsc,
@@ -920,10 +958,9 @@ BEGIN
     WHERE public.hisaab_partner_weekly.settlement_status = 'DRAFT';
 
 END;
-$$;
+$procedure$;
 
 
--- ----------------------------------------------------------------------------
 -- 5. CASCADE TRIGGER: trg_cascade_daily_to_weekly
 -- Attached to public.hisaab_daily_ledger.
 -- Whenever a daily shift record is inserted or updated:
@@ -1317,7 +1354,7 @@ BEGIN
             - COALESCE(o.ola_online_payment, 0.00)
             + COALESCE(a.daily_challans, 0.00)
             + COALESCE(a.daily_accidents, 0.00)
-            + COALESCE(a.daily_adjustments, 0.00)
+            - COALESCE(a.daily_adjustments, 0.00)
             - (CASE WHEN r.log_date = v_week_end THEN COALESCE(sinc.total_inc, 0.00) ELSE 0.00 END)
         ) AS daily_net_balance,
         FALSE,
@@ -1869,3 +1906,81 @@ FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_to_hisaab_challans();
 -- ============================================================================
 -- End of triggers.sql
 -- ============================================================================
+
+
+-- ============================================================================
+-- 10. COMPREHENSIVE FINANCIAL IMMUTABILITY & CONCURRENCY LOCK TRIGGERS
+-- Protects hisaab_daily_ledger, hisaab_vehicle_weekly, hisaab_partner_weekly,
+-- and hisaab_adjustments_ledger against modification once a cycle is FROZEN or LOCKED.
+-- ============================================================================
+
+-- 10.1 Vehicle Weekly Lock
+CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update()
+RETURNS TRIGGER AS 
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.settlement_status = 'FROZEN' THEN
+        RAISE EXCEPTION 'Hisaab vehicle weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
+    END IF;
+
+    RETURN NEW;
+END;
+ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_vehicle_lock ON public.hisaab_vehicle_weekly;
+CREATE TRIGGER trg_check_hisaab_vehicle_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_vehicle_weekly
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update();
+
+
+-- 10.2 Partner Weekly Lock
+CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_partner_weekly_update()
+RETURNS TRIGGER AS 
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.settlement_status = 'FROZEN' THEN
+        RAISE EXCEPTION 'Hisaab partner weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
+    END IF;
+
+    RETURN NEW;
+END;
+ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_partner_lock ON public.hisaab_partner_weekly;
+CREATE TRIGGER trg_check_hisaab_partner_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_partner_weekly
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_partner_weekly_update();
+
+
+-- 10.3 Adjustments Ledger Lock
+CREATE OR REPLACE FUNCTION public.fn_prevent_locked_adjustment_update()
+RETURNS TRIGGER AS 
+DECLARE
+    v_locked BOOLEAN;
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+    END IF;
+
+    SELECT is_locked INTO v_locked
+    FROM public.hisaab_settlement_weeks
+    WHERE week_id = OLD.settlement_week_id;
+
+    IF v_locked = TRUE THEN
+        RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No modifications allowed to adjustments.', OLD.settlement_week_id;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_adj_lock ON public.hisaab_adjustments_ledger;
+CREATE TRIGGER trg_check_hisaab_adj_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_adjustments_ledger
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_adjustment_update();

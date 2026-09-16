@@ -254,6 +254,7 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
     records_to_insert = list(records_dict.values())
     print(f"Upserting {len(records_to_insert)} unique daily settlement records into daily_rent_log...")
 
+    cur.execute("SET hisaab.skip_cascade = 'true';")
     execute_values(cur, UPSERT_DAILY_RENT_LOG_SQL, records_to_insert, page_size=1000)
     conn.commit()
     print("Direct attendance synchronization completed successfully!\n")

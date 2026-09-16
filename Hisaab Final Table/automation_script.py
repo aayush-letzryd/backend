@@ -68,7 +68,7 @@ def sync_daily_hisaab(target_date):
         year, week_num, weekday = dt.isocalendar()
         week_start = dt - datetime.timedelta(days=weekday - 1)
         week_end = week_start + datetime.timedelta(days=6)
-        week_id = f"{year}-W{week_num:02d}"
+        week_id = f"CY{str(year)[-2:]}WK{week_num:02d}"
 
         # 1. Ensure week exists and check lock status
         ensure_settlement_week(cur, week_id, week_start, week_end)
@@ -282,7 +282,7 @@ def credit_sunday_weekly_incentives(conn, week_id, sunday_date):
           AND d.vehicle_number = w.vehicle_number
           AND d.is_locked = FALSE;
         """
-        year, week_num = int(week_id.split('-W')[0]), int(week_id.split('-W')[1])
+        year, week_num = (2000 + int(week_id[2:4]), int(week_id[6:])) if week_id.startswith('CY') else (int(week_id.split('-W')[0]), int(week_id.split('-W')[1]))
         cur.execute(update_incentives_query, (week_id, year, week_num, week_id, sunday_date))
         conn.commit()
         logger.info(f"Weekly incentives credited on Sunday ({sunday_date}) rows: {cur.rowcount}")
@@ -314,7 +314,7 @@ def sync_weekly_vehicle_hisaab(week_id):
 
         week_start = week_info['week_start']
         week_end = week_info['week_end']
-        year, week_num = int(week_id.split('-W')[0]), int(week_id.split('-W')[1])
+        year, week_num = (2000 + int(week_id[2:4]), int(week_id[6:])) if week_id.startswith('CY') else (int(week_id.split('-W')[0]), int(week_id.split('-W')[1]))
 
         vehicle_weekly_query = """
         WITH daily_agg AS (
@@ -401,11 +401,11 @@ def sync_weekly_vehicle_hisaab(week_id):
             %s AS week_end,
             d.vehicle_number,
             d.partner_id,
-            COALESCE(p.driver_name, d.partner_id) AS partner_name,
+            COALESCE(dr.driver_name, d.partner_id) AS partner_name,
             d.partner_type,
             d.city,
             d.vehicle_model,
-            COALESCE(p.plan_type, 'Standard') AS rental_plan,
+            COALESCE(p.plan_scheme, 'Standard') AS rental_plan,
             d.allotted_days,
             d.onroad_days,
             d.daily_rent_applied,
@@ -479,7 +479,15 @@ def sync_weekly_vehicle_hisaab(week_id):
             'OPEN' AS settlement_status,
             CURRENT_TIMESTAMP AS updated_at
         FROM daily_agg d
-        LEFT JOIN public.core_rent p ON d.vehicle_number = p.vehicle_number
+        LEFT JOIN LATERAL (
+            SELECT partner_id, plan_scheme FROM public.core_rent 
+            WHERE vehicle_number = d.vehicle_number 
+            ORDER BY is_active DESC NULLS LAST, id DESC LIMIT 1
+        ) p ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT driver_name FROM public.core_partner_onboarding 
+            WHERE partner_id = d.partner_id LIMIT 1
+        ) dr ON TRUE
         ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
             allotted_days = EXCLUDED.allotted_days,
             onroad_days = EXCLUDED.onroad_days,
@@ -539,7 +547,7 @@ def sync_partner_weekly_payout(conn, week_id, year, week_num, week_start, week_e
         # Determine previous week ID
         prev_week_end = week_start - datetime.timedelta(days=1)
         prev_year, prev_week_num, _ = prev_week_end.isocalendar()
-        prev_week_id = f"{prev_year}-W{prev_week_num:02d}"
+        prev_week_id = f"CY{str(prev_year)[-2:]}WK{prev_week_num:02d}"
 
         partner_payout_query = """
         WITH veh_summary AS (
@@ -694,6 +702,7 @@ def lock_settlement_week(week_id, locked_by='finance_admin'):
     conn = get_connection()
     cur = conn.cursor()
     try:
+        cur.execute("SET hisaab.enforcing_lock = 'true';")
         cur.execute("""
             UPDATE public.hisaab_settlement_weeks
             SET is_locked = TRUE, locked_at = CURRENT_TIMESTAMP, locked_by = %s
