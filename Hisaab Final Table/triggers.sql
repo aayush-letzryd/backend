@@ -542,16 +542,16 @@ BEGIN
         -- GPS TELEMETRY
         (u_km.uber_km + o_km.ola_km) AS total_trip_km,
         gps.total_gps_km,
-        ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30)) AS ideal_gps_km,
-        GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) AS dead_mile_km,
+        ideal.ideal_gps_km,
+        GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) AS dead_mile_km,
         CASE WHEN gps.total_gps_km > 0 THEN 
-            ROUND((GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) / gps.total_gps_km), 4)
+            ROUND((GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) / gps.total_gps_km), 4)
         ELSE 0.0000 END AS dead_mile_pct,
         
         CASE 
             WHEN d.partner_type = 'Operator' THEN 0.00 
             WHEN gps.total_gps_km <= 0 THEN 0.00 
-            ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+            ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
         END AS dead_mile_charges,
 
         -- TDS 1% for Individual Drivers if Net Earnings > Rent
@@ -574,7 +574,7 @@ BEGIN
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00 
                 WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -595,7 +595,7 @@ BEGIN
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00 
                 WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -616,7 +616,7 @@ BEGIN
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00 
                 WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))) * 3.00, 2)
+                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -658,6 +658,15 @@ BEGIN
         WHERE vehicle_number = d.vehicle_number 
           AND service_date BETWEEN v_week_start AND v_week_end
     ) o_km ON TRUE
+    LEFT JOIN LATERAL (
+        SELECT 
+            CASE 
+                WHEN d.city = 'HYD' OR d.city ILIKE '%Hyderabad%' THEN
+                    ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 4) + (d.onroad_days * 25))
+                ELSE
+                    ((u_km.uber_km + o_km.ola_km) + ((d.uber_trips + d.ola_trips + d.rapido_trips) * 3) + (d.onroad_days * 30))
+            END AS ideal_gps_km
+    ) ideal ON TRUE
     ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
         partner_name = EXCLUDED.partner_name,
         allotted_days = EXCLUDED.allotted_days,
