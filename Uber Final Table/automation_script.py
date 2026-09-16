@@ -68,7 +68,7 @@ def sync_core_uber_daily(conn):
                 (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1]
             ) AS veh_no,
             ot.driver_uuid,
-            COALESCE(SUM(ot.actual_earnings), 0) AS earnings,
+            COALESCE(SUM(CASE WHEN ot.description NOT ILIKE '%promotion%' AND ot.description NOT ILIKE '%incentive%' THEN ot.actual_earnings ELSE 0 END), 0) AS earnings,
             COALESCE(SUM(ABS(ot.cash_collected)), 0) AS cash,
             COALESCE(SUM(ot.refunds_toll), 0) AS toll,
             COALESCE(ABS(SUM(CASE WHEN ot.paid_to_you < 0 AND (ot.description ILIKE '%subscription%' OR ot.description ILIKE '%platform fee%') THEN ot.paid_to_you ELSE 0 END)), 0) AS sub_fee
