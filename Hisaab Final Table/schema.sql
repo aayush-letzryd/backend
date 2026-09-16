@@ -278,30 +278,57 @@ CREATE INDEX IF NOT EXISTS idx_hisaab_partner_status ON public.hisaab_partner_we
 
 -- ----------------------------------------------------------------------------
 -- Automatic Lock Enforcement Functions & Triggers (Immutability Guards)
--- Prevents modifications/deletions on locked settlement weeks across all tables.
+-- Prevents modifications/deletions/inserts on locked settlement weeks across all tables.
 -- ----------------------------------------------------------------------------
 
--- 1. Daily ledger lock guard
-CREATE OR REPLACE FUNCTION public.fn_prevent_locked_hisaab_update()
+-- 0. Master settlement weeks lock guard
+CREATE OR REPLACE FUNCTION public.fn_prevent_unauthorized_week_unlock()
 RETURNS TRIGGER AS $$
-DECLARE
-    v_week VARCHAR;
 BEGIN
     IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
         IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
-    IF TG_OP = 'DELETE' THEN
-        v_week := OLD.week_id;
-    ELSE
-        v_week := NEW.week_id;
+    IF TG_OP = 'UPDATE' AND OLD.is_locked = TRUE AND NEW.is_locked = FALSE THEN
+        RAISE EXCEPTION 'Settlement week % is LOCKED. Unlocking requires admin session authorization (hisaab.enforcing_lock).', OLD.week_id;
     END IF;
 
-    IF EXISTS (
-        SELECT 1 FROM public.hisaab_settlement_weeks 
-        WHERE week_id = v_week AND is_locked = TRUE
-    ) THEN
-        RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No modifications or deletions allowed.', v_week;
+    IF TG_OP = 'DELETE' AND OLD.is_locked = TRUE THEN
+        RAISE EXCEPTION 'Settlement week % is LOCKED and cannot be deleted.', OLD.week_id;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_hisaab_week_lock_guard ON public.hisaab_settlement_weeks;
+CREATE TRIGGER trg_hisaab_week_lock_guard
+BEFORE UPDATE OR DELETE ON public.hisaab_settlement_weeks
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_unauthorized_week_unlock();
+
+-- 1. Daily ledger lock guard
+CREATE OR REPLACE FUNCTION public.fn_prevent_locked_hisaab_update()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_is_locked BOOLEAN;
+    v_week_id VARCHAR(16);
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+    END IF;
+
+    IF TG_OP = 'INSERT' THEN
+        v_week_id := NEW.week_id;
+    ELSE
+        v_week_id := OLD.week_id;
+    END IF;
+
+    SELECT is_locked INTO v_is_locked
+    FROM public.hisaab_settlement_weeks
+    WHERE week_id = v_week_id;
+
+    IF v_is_locked = TRUE OR (TG_OP <> 'INSERT' AND OLD.is_locked = TRUE) THEN
+        RAISE EXCEPTION 'Hisaab daily cycle % is LOCKED. Modifications not allowed.', v_week_id;
     END IF;
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
@@ -310,7 +337,7 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_check_hisaab_daily_lock ON public.hisaab_daily_ledger;
 CREATE TRIGGER trg_check_hisaab_daily_lock
-BEFORE UPDATE OR DELETE ON public.hisaab_daily_ledger
+BEFORE INSERT OR UPDATE OR DELETE ON public.hisaab_daily_ledger
 FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_hisaab_update();
 
 -- 2. Adjustments ledger lock guard
@@ -323,7 +350,6 @@ BEGIN
         IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
-    -- Guard against modifying existing locked records
     SELECT is_locked INTO v_locked
     FROM public.hisaab_settlement_weeks
     WHERE week_id = OLD.settlement_week_id;
@@ -332,7 +358,6 @@ BEGIN
         RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No modifications allowed to adjustments.', OLD.settlement_week_id;
     END IF;
 
-    -- Guard against reassigning records into locked records on UPDATE
     IF TG_OP = 'UPDATE' AND NEW.settlement_week_id IS DISTINCT FROM OLD.settlement_week_id THEN
         SELECT is_locked INTO v_locked
         FROM public.hisaab_settlement_weeks
@@ -355,13 +380,26 @@ FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_adjustment_update();
 -- 3. Vehicle weekly lock guard
 CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_is_locked BOOLEAN;
+    v_week_id VARCHAR(16);
 BEGIN
     IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
         IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
-    IF OLD.settlement_status = 'FROZEN' THEN
-        RAISE EXCEPTION 'Hisaab vehicle weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
+    IF TG_OP = 'INSERT' THEN
+        v_week_id := NEW.week_id;
+    ELSE
+        v_week_id := OLD.week_id;
+    END IF;
+
+    SELECT is_locked INTO v_is_locked
+    FROM public.hisaab_settlement_weeks
+    WHERE week_id = v_week_id;
+
+    IF v_is_locked = TRUE OR (TG_OP <> 'INSERT' AND OLD.settlement_status = 'FROZEN') THEN
+        RAISE EXCEPTION 'Hisaab vehicle weekly cycle % is LOCKED/FROZEN. Modifications not allowed.', v_week_id;
     END IF;
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
@@ -370,19 +408,32 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_check_hisaab_vehicle_lock ON public.hisaab_vehicle_weekly;
 CREATE TRIGGER trg_check_hisaab_vehicle_lock
-BEFORE UPDATE OR DELETE ON public.hisaab_vehicle_weekly
+BEFORE INSERT OR UPDATE OR DELETE ON public.hisaab_vehicle_weekly
 FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update();
 
 -- 4. Partner weekly lock guard
 CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_partner_weekly_update()
 RETURNS TRIGGER AS $$
+DECLARE
+    v_is_locked BOOLEAN;
+    v_week_id VARCHAR(16);
 BEGIN
     IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
         IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
-    IF OLD.settlement_status = 'FROZEN' THEN
-        RAISE EXCEPTION 'Hisaab partner weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
+    IF TG_OP = 'INSERT' THEN
+        v_week_id := NEW.week_id;
+    ELSE
+        v_week_id := OLD.week_id;
+    END IF;
+
+    SELECT is_locked INTO v_is_locked
+    FROM public.hisaab_settlement_weeks
+    WHERE week_id = v_week_id;
+
+    IF v_is_locked = TRUE OR (TG_OP <> 'INSERT' AND OLD.settlement_status = 'FROZEN') THEN
+        RAISE EXCEPTION 'Hisaab partner weekly cycle % is LOCKED/FROZEN. Modifications not allowed.', v_week_id;
     END IF;
 
     IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
@@ -391,5 +442,38 @@ $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_check_hisaab_partner_lock ON public.hisaab_partner_weekly;
 CREATE TRIGGER trg_check_hisaab_partner_lock
-BEFORE UPDATE OR DELETE ON public.hisaab_partner_weekly
+BEFORE INSERT OR UPDATE OR DELETE ON public.hisaab_partner_weekly
 FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_partner_weekly_update();
+
+-- ============================================================================
+-- TABLE 6: hisaab_system_config
+-- Global runtime configuration parameters for the Hisaab Engine.
+-- Controls switches like standalone weekly hisaabs vs dynamic debt roll-forwards.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public.hisaab_system_config (
+    config_key VARCHAR(64) PRIMARY KEY,
+    config_value TEXT NOT NULL,
+    description TEXT,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ============================================================================
+-- TABLE 7: hisaab_partner_opening_balances
+-- Opening debt/credit balance ledger for driver and partner accounts upon
+-- mobile application cutover. Enables verified starting balances without
+-- relying on unverified historical uncollected dues.
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS public.hisaab_partner_opening_balances (
+    id BIGSERIAL PRIMARY KEY,
+    partner_id VARCHAR(64) NOT NULL,
+    effective_week_id VARCHAR(16) NOT NULL,
+    opening_balance_due NUMERIC(12,2) NOT NULL DEFAULT 0.00,
+    remarks TEXT,
+    created_by VARCHAR(64) DEFAULT 'finance_admin',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_hisaab_partner_opening UNIQUE (partner_id, effective_week_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_hisaab_partner_opening_week ON public.hisaab_partner_opening_balances (effective_week_id);
+CREATE INDEX IF NOT EXISTS idx_hisaab_partner_opening_partner ON public.hisaab_partner_opening_balances (partner_id);

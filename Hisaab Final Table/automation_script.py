@@ -59,7 +59,7 @@ def sync_daily_hisaab(target_date):
             logger.warning(f"Settlement Week {week_id} is LOCKED. Skipping daily update for {dt}.")
             return
 
-        # Fetch all vehicles and partners active in daily rent log or telemetry
+        # Fetch all vehicles and partners active in daily rent log, telemetry, or adjustments
         cur.execute("""
             SELECT DISTINCT vehicle_number, partner_id
             FROM (
@@ -70,9 +70,11 @@ def sync_daily_hisaab(target_date):
                 SELECT vehicle_number, NULL AS partner_id FROM public.core_ola_daily WHERE service_date = %s
                 UNION
                 SELECT vehicle_number, NULL AS partner_id FROM public.core_rapido_daily WHERE operational_date = %s
+                UNION
+                SELECT vehicle_number, partner_id FROM public.hisaab_adjustments_ledger WHERE COALESCE(effective_date, incident_date) = %s AND approval_status = 'Approved'
             ) combined
             WHERE vehicle_number IS NOT NULL AND vehicle_number <> '';
-        """, (dt, dt, dt, dt))
+        """, (dt, dt, dt, dt, dt))
         
         rows = cur.fetchall()
         logger.info(f"Found {len(rows)} vehicle-partner targets for {dt}. Executing upsert...")
@@ -87,6 +89,7 @@ def sync_daily_hisaab(target_date):
     except Exception as e:
         conn.rollback()
         logger.error(f"Error in sync_daily_hisaab: {e}", exc_info=True)
+        raise
     finally:
         cur.close()
         conn.close()
@@ -114,6 +117,7 @@ def sync_weekly_vehicle_hisaab(week_id):
     except Exception as e:
         conn.rollback()
         logger.error(f"Error in sync_weekly_vehicle_hisaab: {e}", exc_info=True)
+        raise
     finally:
         cur.close()
         conn.close()
@@ -128,12 +132,13 @@ def lock_settlement_week(week_id, locked_by='finance_admin'):
     conn = get_connection()
     cur = conn.cursor()
     try:
-        cur.execute("CALL public.sp_check_and_enforce_monday_lock(%s);", (week_id,))
+        cur.execute("CALL public.sp_check_and_enforce_monday_lock(%s, %s);", (week_id, locked_by))
         conn.commit()
-        logger.info(f"Week {week_id} is now FROZEN and IMMUTABLE.")
+        logger.info(f"Week {week_id} is now FROZEN and IMMUTABLE by {locked_by}.")
     except Exception as e:
         conn.rollback()
         logger.error(f"Error locking week {week_id}: {e}", exc_info=True)
+        raise
     finally:
         cur.close()
         conn.close()

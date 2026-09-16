@@ -1,9 +1,9 @@
 {
   "engine_name": "LetzRyd Hisaab Engine",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "classification": "Master Architectural Context & Specification",
   "last_updated": "2026-09-16",
-  "git_commit": "b84dc08",
+  "git_commit": "HEAD",
   "git_repository": "git@github.com:aayush-letzryd/backend.git",
   "database_connection": {
     "host": "35.200.196.113",
@@ -38,6 +38,21 @@
         "partner_id"
       ],
       "purpose": "1-to-1 mirror of Excel sheet 'Hisaab Summary'. Multi-car fleet consolidation and bank payouts."
+    },
+    "system_configuration": {
+      "table": "public.hisaab_system_config",
+      "grain": [
+        "config_key"
+      ],
+      "purpose": "Engine operational toggles, including enable_roll_forward and roll_forward_start_week."
+    },
+    "opening_balances": {
+      "table": "public.hisaab_partner_opening_balances",
+      "grain": [
+        "partner_id",
+        "effective_week_id"
+      ],
+      "purpose": "Initial verified debt/credit balances for driver & partner mobile app go-live cutover."
     }
   },
   "tables_schema": {
@@ -979,6 +994,82 @@
         "type": "character varying",
         "nullable": true,
         "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "hisaab_system_config": [
+      {
+        "name": "config_key",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "config_value",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "description",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "hisaab_partner_opening_balances": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('hisaab_partner_opening_balances_id_seq'::regclass)"
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "effective_week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "opening_balance_due",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "remarks",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_by",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'finance_admin'::character varying"
       },
       {
         "name": "created_at",
@@ -2580,16 +2671,20 @@
     "sign_convention": "Positive balance = Driver owes company (to_collect); Negative balance = Company owes driver (to_payout / net_bank_payout)",
     "daily_net_balance": "net_daily_rent + ABS(uber_cash + ola_cash + rapido_cash) - (uber_earnings + ola_net_revenue + rapido_net_revenue) - ola_online_payment + daily_challans + daily_accidents - daily_adjustments - sunday_milestone_incentive",
     "vehicle_current_week_os": "net_weekly_lease_rental + ABS(total_cash_collected) - total_platform_earnings - ola_online_payment - platform_incentives - adjustments + challans + accidents + dead_mile_charges + tds_amount",
-    "partner_total_outstanding": "current_week_os_consolidated + previous_unpaid_debt + prior_period_adjustments - amount_paid_during_week",
-    "roll_forward_rule": "Only unpaid debt (total_outstanding > 0) carries over to next week. Negative credit balances (total_outstanding < 0) are paid out and reset to 0.00.",
+    "partner_total_outstanding": "current_week_os_consolidated + previous_outstanding + prior_period_adjustments - amount_paid_during_week",
+    "modular_roll_forward_modes": {
+      "standalone_mode (current default)": "previous_outstanding = 0.00 across all cycles. Each weekly hisaab is independent without merging unverified historical collections.",
+      "app_opening_balance_cutover": "Reads opening_balance_due from hisaab_partner_opening_balances for the go-live settlement cycle.",
+      "dynamic_roll_forward_mode": "Activated via enable_roll_forward = 'true' in hisaab_system_config. Carries forward verified positive debt from previous cycle."
+    },
     "dead_mile_allowance": "ideal_gps_km = (total_trip_km * 1.05) + (completed_trips * 3.0 km) + (onroad_days * 30.0 km). Penalty = GREATEST(0, total_gps_km - ideal_gps_km) * 3.00 INR (Individuals only, 0 for Operators)",
-    "tds_194c": "1% on (net_platform_earnings - net_weekly_lease_rental) for Individuals if earnings > rent. 0% for Operators.",
-    "prior_period_adjustments_formula": "SUM(CASE WHEN polarity = 'DEBIT' THEN amount ELSE -amount END) from hisaab_adjustments_ledger where is_prior_period = TRUE"
+    "tds_194c": "1% on (net_platform_earnings - net_weekly_lease_rental) for Individuals if earnings > rent. 0% for Operators."
   },
   "key_operational_engines": {
+    "modular_roll_forward_engine": "Decouples current week hisaab from unverified previous dues via hisaab_system_config and hisaab_partner_opening_balances.",
     "operational_trip_override": "If a car is marked Maintenance/RFD or net_daily_rent <= 0, but completed trips > 0 or earnings > 0, system automatically bills standard contracted tariff from core_rent (fallback 856.00 INR).",
     "multi_driver_deduplication": "Operators only receive trips explicitly tagged with their code or untagged trips when no individual driver drove that day. Secondary drivers on the same car capture trip earnings with 0 rent to avoid double-charging lease rent.",
-    "prior_period_routing": "Adjustments occurring in locked past weeks are intercepted BEFORE INSERT and routed to the current active cycle with is_prior_period = TRUE and effective_date = CURRENT_DATE.",
+    "prior_period_routing": "Adjustments occurring in locked past weeks are intercepted BEFORE INSERT and routed to the current active cycle with is_prior_period = TRUE and effective_date = CURRENT_DATE. Polarity: DEBIT adds to dues, CREDIT reduces dues.",
     "monday_lock_enforcement": "Every Monday at 11:00 AM IST, sp_check_and_enforce_monday_lock freezes hisaab_settlement_weeks, hisaab_daily_ledger, hisaab_vehicle_weekly, and hisaab_partner_weekly. PostgreSQL trigger guards abort any subsequent updates."
   },
   "scorecard_verification": {
@@ -2598,6 +2693,7 @@
       "net_rent": 0.0,
       "veh_os": 0.0,
       "partner_os": 0.0,
+      "previous_os": 0.0,
       "variance": 0.0
     },
     "CY26WK26": {
@@ -2605,6 +2701,7 @@
       "net_rent": 5112067.0,
       "veh_os": 2068574.47,
       "partner_os": 2068574.47,
+      "previous_os": 0.0,
       "variance": 0.0
     },
     "CY26WK27": {
@@ -2612,6 +2709,7 @@
       "net_rent": 5255765.0,
       "veh_os": 1638108.14,
       "partner_os": 1638108.14,
+      "previous_os": -8361.73,
       "variance": 0.0
     },
     "CY26WK36": {
@@ -2619,6 +2717,7 @@
       "net_rent": 5445578.0,
       "veh_os": 2707427.0,
       "partner_os": 2707427.0,
+      "previous_os": 0.0,
       "variance": 0.0
     },
     "CY26WK37": {
@@ -2626,6 +2725,7 @@
       "net_rent": 7048130.0,
       "veh_os": 3447415.0,
       "partner_os": 3447415.0,
+      "previous_os": 0.0,
       "variance": 0.0
     },
     "CY26WK38": {
@@ -2633,6 +2733,7 @@
       "net_rent": 2695714.0,
       "veh_os": 4024269.13,
       "partner_os": 4024269.13,
+      "previous_os": 0.0,
       "variance": 0.0
     }
   }
