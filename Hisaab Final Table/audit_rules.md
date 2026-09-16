@@ -4,19 +4,19 @@ This document codifies the exact financial calculations, regulatory deductions, 
 
 ---
 
-## 1. Operational Shift & Calendar Boundary
+## 1. Operational Ingestion Architecture & Calendar Boundaries
 
-1. **The 04:00 AM IST Shift Cutoff Rule**:
-   - An operational shift runs from `04:00:00 AM` on day $T$ to `03:59:59 AM` on day $T+1$.
-   - Any ride, CRN, or order completed between `00:00:00` and `03:59:59` is attributed to the **previous calendar day**:
-     ```sql
-     (trip_time AT TIME ZONE 'Asia/Kolkata' - INTERVAL '4 hours')::date
-     ```
+1. **Next-Day Morning Automated Ingestion**:
+   - Telemetry and platform feeds are automatically pulled the following morning for the previous calendar day:
+     * **GPS Telematics**: Pulled at **04:00 AM IST** for yesterday (`record_date`).
+     * **Uber Telemetry**: Pulled at **07:00 AM IST** for yesterday (`trip_date`, `trx_date`), with automated retries between 06:00 AM and 10:00 AM.
+     * **Ola Telemetry**: Pulled at **07:00 AM IST** for yesterday (`service_date`), with automated retries between 06:00 AM and 10:00 AM.
+   - Because each feed is already partitioned by the platform provider for "yesterday", no artificial 4-hour shift is applied. Each feed maps directly to its calendar date (`log_date`, `trip_date`, `service_date`, `record_date`).
 2. **The Settlement Week Window**:
-   - Runs from **Monday 04:00 AM to the following Monday 03:59:59 AM** (7 operational days: Monday to Sunday).
+   - Runs from **Monday through Sunday** (7 calendar days: `week_start` Monday to `week_end` Sunday).
 3. **The Monday 11:00 AM Lock Cutoff**:
-   - The entire week freezes at **Monday 11:00:00 AM IST**.
-   - Statements become **immutable** (`is_locked = TRUE`).
+   - The entire past week freezes at **Monday 11:00:00 AM IST** (`lock_cutoff_at`).
+   - Once locked, statements become **immutable** (`is_locked = TRUE`), and late adjustments automatically divert into the upcoming open billing cycle.
 
 ---
 

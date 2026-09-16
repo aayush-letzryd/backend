@@ -8,7 +8,7 @@ This document details the data quality anomalies, edge cases, and automated busi
 
 | Issue ID | Severity | Category | Symptom / Anomaly Description | Production Resolution |
 | :--- | :---: | :--- | :--- | :--- |
-| **UBR-01** | **High** | Temporal Shift | Trips between `00:00:00` and `03:59:59` belong to the night shift of the previous calendar day. | Evaluated with `(timestamp AT TIME ZONE 'Asia/Kolkata' - INTERVAL '4 hours')::date`. |
+| **UBR-01** | **Resolved** | Data Pull Schedule | Uber data is pulled at 07:00 AM IST (with retries 6-10 AM) for the previous day. | Uses direct partition dates `trip_date` and `trx_date` without artificial temporal offsets. |
 | **UBR-02** | **Critical** | Missing Foreign Key | `uber_pipeline_order_transactions.vehicle_number` is 100% NULL from Uber Supplier API. | Enriched by joining `trip_uuid` to `uber_pipeline_trips` (89.7% match) and regex license plate extraction from transaction `description` for promotions. |
 | **UBR-03** | **Critical** | Financial Metric | `paid_to_you` is net of rider cash kept by drivers and bank disbursements. Summing it yields ~₹0. | Separated into distinct components: `net_fare_earnings` (gross fares), `cash_collected` (driver cash kept), `tolls_refunded`, and `driver_subscription_charge`. |
 | **UBR-04** | **Medium** | Incentive Granularity | `uber_vehicle_incentives_raw` evaluates target milestones on a weekly cycle (`start_date` to `end_date`). | Maintained strictly at the weekly settlement grain in `core_uber_weekly`. |

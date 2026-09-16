@@ -50,7 +50,7 @@ def sync_core_uber_daily(conn):
     upsert_sql = """
     WITH trips_agg AS (
         SELECT 
-            (trip_request_time AT TIME ZONE 'Asia/Kolkata' - INTERVAL '4 hours')::date AS op_date,
+            COALESCE(trip_date, trip_request_time::date) AS op_date,
             UPPER(REPLACE(car_no, ' ', '')) AS veh_no,
             driver_uuid,
             COUNT(*) FILTER (WHERE LOWER(trip_status) = 'completed' OR trip_status IS NULL) AS trips,
@@ -61,7 +61,7 @@ def sync_core_uber_daily(conn):
     ),
     txns_agg AS (
         SELECT 
-            (ot.reporting_time AT TIME ZONE 'Asia/Kolkata' - INTERVAL '4 hours')::date AS op_date,
+            COALESCE(ot.trx_date, ot.reporting_time::date) AS op_date,
             COALESCE(
                 UPPER(REPLACE(t.car_no, ' ', '')),
                 (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1]
@@ -73,7 +73,7 @@ def sync_core_uber_daily(conn):
             COALESCE(ABS(SUM(CASE WHEN ot.description ILIKE '%subscription%' OR ot.description ILIKE '%platform fee%' THEN ot.paid_to_you ELSE 0 END)), 0) AS sub_fee
         FROM uber_pipeline_order_transactions ot
         LEFT JOIN uber_pipeline_trips t ON ot.trip_uuid = t.trip_uuid
-        WHERE ot.reporting_time IS NOT NULL
+        WHERE ot.trx_date IS NOT NULL OR ot.reporting_time IS NOT NULL
         GROUP BY 1, 2, 3
     ),
     combined AS (

@@ -78,12 +78,13 @@ The **Uber Final Table** pipeline is the definitive operational authority for Ub
 
 ---
 
-## 4. Operational Rules & Cutoffs
+## 4. Operational Rules & Ingestion Architecture
 
-1. **The 04:00 AM IST Shift Rule:**
-   - Any ride or order completed between `00:00:00` and `03:59:59` is attributed to the **previous calendar day**:
+1. **Daily Morning Ingestion (07:00 AM IST):**
+   - Uber reports are pulled automatically each morning at 07:00 AM IST (with automated retries between 06:00 AM and 10:00 AM) for the previous calendar day.
+   - The pipeline directly utilizes `trip_date` from trips and `trx_date` from order transactions, which already reflect the operational day:
      ```sql
-     (trip_request_time AT TIME ZONE 'Asia/Kolkata' - INTERVAL '4 hours')::date
+     COALESCE(trip_date, trip_request_time::date) AS operational_date
      ```
 2. **The `paid_to_you` Caveat:**
    - `paid_to_you` in Uber's raw transaction feed is net of driver cash collected and bank payouts.
