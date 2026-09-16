@@ -1110,7 +1110,7 @@ BEGIN
             r.log_date,
             r.vehicle_number,
             r.partner_id,
-            COALESCE(r.partner_type, CASE WHEN r.partner_id ILIKE '%IP%' OR r.partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END) AS partner_type,
+            CASE WHEN r.partner_id ILIKE '%IP%' OR r.partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END AS partner_type,
             COALESCE(r.city, 'HYD') AS city,
             r.vehicle_model,
             r.attendance_status,
@@ -1228,7 +1228,7 @@ BEGIN
         p_week_id,
         r.vehicle_number,
         r.partner_id,
-        r.partner_type,
+        CASE WHEN r.partner_id ILIKE '%IP%' OR r.partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END AS partner_type,
         r.city,
         r.vehicle_model,
         CASE 
