@@ -234,97 +234,60 @@ BEGIN
         END IF;
     END IF;
 
-    -- 4. Uber Telemetry (core_uber_daily) with operator isolation
+    -- Operator 7-Day Billing Contract Rule:
     IF v_partner_type = 'Operator' THEN
-        SELECT 
-            COALESCE(SUM(completed_trips), 0),
-            COALESCE(SUM(net_fare_earnings), 0.00),
-            COALESCE(SUM(cash_collected), 0.00),
-            COALESCE(SUM(tolls_refunded), 0.00),
-            COALESCE(SUM(driver_subscription_charge), 0.00)
-        INTO 
-            v_uber_trips,
-            v_uber_fare_earnings,
-            v_uber_cash_collected,
-            v_uber_tolls,
-            v_uber_subscription_charge
-        FROM public.core_uber_daily
-        WHERE operational_date = p_log_date 
-          AND vehicle_number = p_vehicle 
-          AND (vendor_code = v_target_partner OR (vendor_code IS NULL AND NOT EXISTS (
-              SELECT 1 FROM public.daily_rent_log r 
-              WHERE r.log_date = p_log_date AND r.vehicle_number = p_vehicle AND r.partner_id NOT ILIKE '%IP%' AND r.partner_id NOT ILIKE '%OP%'
-          )));
-    ELSE
-        SELECT 
-            COALESCE(SUM(completed_trips), 0),
-            COALESCE(SUM(net_fare_earnings), 0.00),
-            COALESCE(SUM(cash_collected), 0.00),
-            COALESCE(SUM(tolls_refunded), 0.00),
-            COALESCE(SUM(driver_subscription_charge), 0.00)
-        INTO 
-            v_uber_trips,
-            v_uber_fare_earnings,
-            v_uber_cash_collected,
-            v_uber_tolls,
-            v_uber_subscription_charge
-        FROM public.core_uber_daily
-        WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
+        IF v_attendance NOT IN ('Maintenance', 'Breakdown', 'Accident') THEN
+            v_is_billable_day := TRUE;
+            IF v_net_daily_rent <= 0.00 THEN
+                v_daily_rent_applied := 856.00;
+                v_net_daily_rent := 856.00;
+            END IF;
+        END IF;
     END IF;
 
-    -- 5. Ola Telemetry (core_ola_daily) with operator isolation
-    IF v_partner_type = 'Operator' AND EXISTS (
-        SELECT 1 FROM public.daily_rent_log r 
-        WHERE r.log_date = p_log_date 
-          AND r.vehicle_number = p_vehicle 
-          AND r.partner_id NOT ILIKE '%IP%' 
-          AND r.partner_id NOT ILIKE '%OP%'
-    ) THEN
-        v_ola_trips := 0;
-        v_ola_net_revenue := 0.00;
-        v_ola_cash_collected := 0.00;
-        v_ola_tolls := 0.00;
-        v_ola_online_payment := 0.00;
-    ELSE
-        SELECT 
-            COALESCE(SUM(completed_trips), 0),
-            COALESCE(SUM(operator_bill), 0.00),
-            COALESCE(SUM(cash_collected), 0.00),
-            COALESCE(SUM(toll_and_parking), 0.00),
-            COALESCE(SUM(online_payouts), 0.00)
-        INTO 
-            v_ola_trips,
-            v_ola_net_revenue,
-            v_ola_cash_collected,
-            v_ola_tolls,
-            v_ola_online_payment
-        FROM public.core_ola_daily
-        WHERE service_date = p_log_date AND vehicle_number = p_vehicle;
-    END IF;
+    -- 4. Uber Telemetry (core_uber_daily) with operator multi-driver attribution
+    SELECT 
+        COALESCE(SUM(completed_trips), 0),
+        COALESCE(SUM(net_fare_earnings), 0.00),
+        COALESCE(SUM(cash_collected), 0.00),
+        COALESCE(SUM(tolls_refunded), 0.00),
+        COALESCE(SUM(driver_subscription_charge), 0.00)
+    INTO 
+        v_uber_trips,
+        v_uber_fare_earnings,
+        v_uber_cash_collected,
+        v_uber_tolls,
+        v_uber_subscription_charge
+    FROM public.core_uber_daily
+    WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
 
-    -- 6. Rapido Telemetry (core_rapido_daily) with operator isolation
-    IF v_partner_type = 'Operator' AND EXISTS (
-        SELECT 1 FROM public.daily_rent_log r 
-        WHERE r.log_date = p_log_date 
-          AND r.vehicle_number = p_vehicle 
-          AND r.partner_id NOT ILIKE '%IP%' 
-          AND r.partner_id NOT ILIKE '%OP%'
-    ) THEN
-        v_rapido_trips := 0;
-        v_rapido_net_revenue := 0.00;
-        v_rapido_cash_collected := 0.00;
-    ELSE
-        SELECT 
-            COALESCE(SUM(completed_trips), 0),
-            COALESCE(SUM(net_revenue), 0.00),
-            COALESCE(SUM(cash_collected), 0.00)
-        INTO 
-            v_rapido_trips,
-            v_rapido_net_revenue,
-            v_rapido_cash_collected
-        FROM public.core_rapido_daily
-        WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
-    END IF;
+    -- 5. Ola Telemetry (core_ola_daily) with operator multi-driver attribution
+    SELECT 
+        COALESCE(SUM(completed_trips), 0),
+        COALESCE(SUM(operator_bill), 0.00),
+        COALESCE(SUM(cash_collected), 0.00),
+        COALESCE(SUM(toll_and_parking), 0.00),
+        COALESCE(SUM(online_payouts), 0.00)
+    INTO 
+        v_ola_trips,
+        v_ola_net_revenue,
+        v_ola_cash_collected,
+        v_ola_tolls,
+        v_ola_online_payment
+    FROM public.core_ola_daily
+    WHERE service_date = p_log_date AND vehicle_number = p_vehicle;
+
+    -- 6. Rapido Telemetry (core_rapido_daily)
+    SELECT 
+        COALESCE(SUM(completed_trips), 0),
+        COALESCE(SUM(net_revenue), 0.00),
+        COALESCE(SUM(cash_collected), 0.00)
+    INTO 
+        v_rapido_trips,
+        v_rapido_net_revenue,
+        v_rapido_cash_collected
+    FROM public.core_rapido_daily
+    WHERE operational_date = p_log_date AND vehicle_number = p_vehicle;
 
     -- OPERATIONAL TRIP OVERRIDE ON LEASE RENT:
     IF (v_net_daily_rent <= 0.00 OR v_is_billable_day = FALSE) AND (v_uber_trips > 0 OR v_ola_trips > 0 OR v_rapido_trips > 0) THEN
@@ -661,19 +624,28 @@ BEGIN
         COALESCE(gps.total_gps_km, 0.00) AS total_gps_km,
         COALESCE(ideal.ideal_gps_km, 0.00) AS ideal_gps_km,
         CASE 
-            WHEN d.partner_type = 'Operator' THEN 0.00 
-            WHEN gps.total_gps_km <= 0 THEN 0.00 
-            ELSE GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km)
+            WHEN d.partner_type = 'Individual' 
+                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND d.city <> 'Mumbai' 
+                 AND gps.total_gps_km > 0 
+            THEN GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km)
+            ELSE 0.00
         END AS dead_mile_km,
         CASE 
-            WHEN d.partner_type = 'Operator' THEN 0.00 
-            WHEN gps.total_gps_km <= 0 THEN 0.00 
-            ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) / NULLIF(gps.total_gps_km, 0) * 100, 2)
+            WHEN d.partner_type = 'Individual' 
+                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND d.city <> 'Mumbai' 
+                 AND gps.total_gps_km > 0 
+            THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) / NULLIF(gps.total_gps_km, 0) * 100, 2)
+            ELSE 0.00
         END AS dead_mile_pct,
         CASE 
-            WHEN d.partner_type = 'Operator' THEN 0.00 
-            WHEN gps.total_gps_km <= 0 THEN 0.00 
-            ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+            WHEN d.partner_type = 'Individual' 
+                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND d.city <> 'Mumbai' 
+                 AND gps.total_gps_km > 0 
+            THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+            ELSE 0.00
         END AS dead_mile_charges,
         
         -- TDS Section 194C
@@ -695,9 +667,12 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
-                WHEN d.partner_type = 'Operator' THEN 0.00 
-                WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                WHEN d.partner_type = 'Individual' 
+                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND d.city <> 'Mumbai' 
+                     AND gps.total_gps_km > 0 
+                THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                ELSE 0.00 
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -717,9 +692,12 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
-                WHEN d.partner_type = 'Operator' THEN 0.00 
-                WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                WHEN d.partner_type = 'Individual' 
+                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND d.city <> 'Mumbai' 
+                     AND gps.total_gps_km > 0 
+                THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                ELSE 0.00 
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -739,9 +717,12 @@ BEGIN
             + d.challan_amount
             + d.accident_penalties
             + (CASE 
-                WHEN d.partner_type = 'Operator' THEN 0.00 
-                WHEN gps.total_gps_km <= 0 THEN 0.00 
-                ELSE ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                WHEN d.partner_type = 'Individual' 
+                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND d.city <> 'Mumbai' 
+                     AND gps.total_gps_km > 0 
+                THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
+                ELSE 0.00 
                END)
             + (CASE 
                 WHEN d.partner_type = 'Operator' THEN 0.00
@@ -772,7 +753,7 @@ BEGIN
         LEFT JOIN public.core_uber_daily u 
             ON u.vehicle_number = d.vehicle_number 
            AND u.operational_date BETWEEN d.partner_min_date AND d.partner_max_date
-           AND (u.vendor_code = d.partner_id OR u.vendor_code IS NULL)
+           AND (d.partner_type = 'Operator' OR u.vendor_code = d.partner_id OR u.vendor_code IS NULL)
         LEFT JOIN public.core_ola_daily o 
             ON o.vehicle_number = d.vehicle_number 
            AND o.service_date BETWEEN d.partner_min_date AND d.partner_max_date
@@ -1104,6 +1085,9 @@ BEGIN
         RAISE EXCEPTION 'Settlement week % is LOCKED. Batch reconciliation aborted.', p_week_id;
     END IF;
 
+    -- Suppress per-row trigger cascades during batch daily upsert
+    PERFORM set_config('hisaab.skip_cascade', 'true', true);
+
     -- 1. Ingest/Update hisaab_daily_ledger across entire 7-day window
     WITH base_rent AS (
         SELECT 
@@ -1125,7 +1109,6 @@ BEGIN
         SELECT 
             u.operational_date,
             u.vehicle_number,
-            u.vendor_code,
             COALESCE(SUM(u.completed_trips), 0)::INT AS uber_trips,
             COALESCE(SUM(u.net_fare_earnings), 0.00) AS uber_fare_earnings,
             COALESCE(SUM(u.cash_collected), 0.00) AS uber_cash_collected,
@@ -1133,7 +1116,7 @@ BEGIN
             COALESCE(SUM(u.driver_subscription_charge), 0.00) AS uber_subscription_charge
         FROM public.core_uber_daily u
         WHERE u.operational_date BETWEEN v_week_start AND v_week_end
-        GROUP BY u.operational_date, u.vehicle_number, u.vendor_code
+        GROUP BY u.operational_date, u.vehicle_number
     ),
     ola_agg AS (
         SELECT 
@@ -1232,18 +1215,24 @@ BEGIN
         r.city,
         r.vehicle_model,
         CASE 
+            WHEN r.partner_type = 'Operator' AND r.attendance_status NOT IN ('Maintenance', 'Breakdown', 'Accident')
+            THEN 'Active (Operator Contract)'
             WHEN (COALESCE(r.net_daily_rent, 0.00) <= 0.00 OR r.is_billable_day = FALSE) 
              AND (COALESCE(u.uber_trips, 0) > 0 OR COALESCE(o.ola_trips, 0) > 0 OR COALESCE(rp.rapido_trips, 0) > 0)
             THEN 'Active (Trip Override)'
             ELSE r.attendance_status
         END,
         CASE 
+            WHEN r.partner_type = 'Operator' AND r.attendance_status NOT IN ('Maintenance', 'Breakdown', 'Accident')
+            THEN TRUE
             WHEN (COALESCE(r.net_daily_rent, 0.00) <= 0.00 OR r.is_billable_day = FALSE) 
              AND (COALESCE(u.uber_trips, 0) > 0 OR COALESCE(o.ola_trips, 0) > 0 OR COALESCE(rp.rapido_trips, 0) > 0)
             THEN TRUE
             ELSE r.is_billable_day
         END,
         CASE 
+            WHEN r.partner_type = 'Operator' AND r.attendance_status NOT IN ('Maintenance', 'Breakdown', 'Accident')
+            THEN COALESCE(NULLIF(r.applied_daily_rent, 0.00), cr.custom_daily_rent, 856.00)
             WHEN (COALESCE(r.net_daily_rent, 0.00) <= 0.00 OR r.is_billable_day = FALSE) 
              AND (COALESCE(u.uber_trips, 0) > 0 OR COALESCE(o.ola_trips, 0) > 0 OR COALESCE(rp.rapido_trips, 0) > 0)
             THEN COALESCE(cr.custom_daily_rent, 856.00)
@@ -1251,6 +1240,8 @@ BEGIN
         END,
         r.applied_daily_indemnity,
         CASE 
+            WHEN r.partner_type = 'Operator' AND r.attendance_status NOT IN ('Maintenance', 'Breakdown', 'Accident')
+            THEN COALESCE(NULLIF(r.applied_daily_rent, 0.00), cr.custom_daily_rent, 856.00) + COALESCE(r.applied_daily_indemnity, 0.00)
             WHEN (COALESCE(r.net_daily_rent, 0.00) <= 0.00 OR r.is_billable_day = FALSE) 
              AND (COALESCE(u.uber_trips, 0) > 0 OR COALESCE(o.ola_trips, 0) > 0 OR COALESCE(rp.rapido_trips, 0) > 0)
             THEN COALESCE(cr.custom_daily_rent, 856.00) + COALESCE(r.applied_daily_indemnity, 0.00)
@@ -1276,6 +1267,8 @@ BEGIN
         (
             -- Rent
             (CASE 
+                WHEN r.partner_type = 'Operator' AND r.attendance_status NOT IN ('Maintenance', 'Breakdown', 'Accident')
+                THEN COALESCE(NULLIF(r.applied_daily_rent, 0.00), cr.custom_daily_rent, 856.00) + COALESCE(r.applied_daily_indemnity, 0.00)
                 WHEN (COALESCE(r.net_daily_rent, 0.00) <= 0.00 OR r.is_billable_day = FALSE) 
                  AND (COALESCE(u.uber_trips, 0) > 0 OR COALESCE(o.ola_trips, 0) > 0 OR COALESCE(rp.rapido_trips, 0) > 0)
                 THEN COALESCE(cr.custom_daily_rent, 856.00) + COALESCE(r.applied_daily_indemnity, 0.00)
@@ -1302,7 +1295,7 @@ BEGIN
         WHERE vehicle_number = r.vehicle_number 
         ORDER BY is_active DESC NULLS LAST, id DESC LIMIT 1
     ) cr ON TRUE
-    LEFT JOIN uber_agg u ON r.log_date = u.operational_date AND r.vehicle_number = u.vehicle_number AND (u.vendor_code = r.partner_id OR u.vendor_code IS NULL)
+    LEFT JOIN uber_agg u ON r.log_date = u.operational_date AND r.vehicle_number = u.vehicle_number
     LEFT JOIN ola_agg o ON r.log_date = o.service_date AND r.vehicle_number = o.vehicle_number
     LEFT JOIN rapido_agg rp ON r.log_date = rp.operational_date AND r.vehicle_number = rp.vehicle_number
     LEFT JOIN adj_agg a ON r.log_date = a.incident_date AND r.vehicle_number = a.vehicle_number AND r.partner_id = a.partner_id
@@ -1342,6 +1335,8 @@ BEGIN
 
     -- 3. Bulk Roll-up into hisaab_partner_weekly
     CALL public.sp_sync_hisaab_partner_weekly(p_week_id, NULL);
+
+    PERFORM set_config('hisaab.skip_cascade', 'false', true);
 
     RAISE NOTICE 'sp_run_full_week_hisaab complete for % in % ms.',
         p_week_id, (EXTRACT(EPOCH FROM (clock_timestamp() - v_start_time)) * 1000)::INT;
