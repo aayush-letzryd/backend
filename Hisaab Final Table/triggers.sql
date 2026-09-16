@@ -603,7 +603,7 @@ BEGIN
         d.uber_cash_collection,
         d.uber_toll,
         d.uber_driver_sub_charge,
-        (d.uber_cash_collection - d.uber_total_earnings) AS uber_week_os,
+        (d.uber_cash_collection - d.uber_total_earnings + d.uber_driver_sub_charge) AS uber_week_os,
         d.ola_trips,
         d.ola_net_revenue,
         d.ola_cash_collection,
@@ -625,7 +625,7 @@ BEGIN
         COALESCE(ideal.ideal_gps_km, 0.00) AS ideal_gps_km,
         CASE 
             WHEN d.partner_type = 'Individual' 
-                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                  AND d.city <> 'Mumbai' 
                  AND gps.total_gps_km > 0 
             THEN GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km)
@@ -633,7 +633,7 @@ BEGIN
         END AS dead_mile_km,
         CASE 
             WHEN d.partner_type = 'Individual' 
-                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                  AND d.city <> 'Mumbai' 
                  AND gps.total_gps_km > 0 
             THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) / NULLIF(gps.total_gps_km, 0) * 100, 2)
@@ -641,7 +641,7 @@ BEGIN
         END AS dead_mile_pct,
         CASE 
             WHEN d.partner_type = 'Individual' 
-                 AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                 AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                  AND d.city <> 'Mumbai' 
                  AND gps.total_gps_km > 0 
             THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
@@ -661,6 +661,7 @@ BEGIN
             d.net_weekly_lease_rental
             + ABS(d.uber_cash_collection) + ABS(d.ola_cash_collection) + ABS(d.rapido_cash_collected)
             - (d.uber_total_earnings + d.ola_net_revenue + d.rapido_net_revenue)
+            + d.uber_driver_sub_charge
             - d.ola_online_payment
             - d.weekly_platform_incentive
             - d.vehicle_adjustments
@@ -668,7 +669,7 @@ BEGIN
             + d.accident_penalties
             + (CASE 
                 WHEN d.partner_type = 'Individual' 
-                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                      AND d.city <> 'Mumbai' 
                      AND gps.total_gps_km > 0 
                 THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
@@ -686,6 +687,7 @@ BEGIN
             d.net_weekly_lease_rental
             + ABS(d.uber_cash_collection) + ABS(d.ola_cash_collection) + ABS(d.rapido_cash_collected)
             - (d.uber_total_earnings + d.ola_net_revenue + d.rapido_net_revenue)
+            + d.uber_driver_sub_charge
             - d.ola_online_payment
             - d.weekly_platform_incentive
             - d.vehicle_adjustments
@@ -693,7 +695,7 @@ BEGIN
             + d.accident_penalties
             + (CASE 
                 WHEN d.partner_type = 'Individual' 
-                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                      AND d.city <> 'Mumbai' 
                      AND gps.total_gps_km > 0 
                 THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
@@ -711,6 +713,7 @@ BEGIN
             d.net_weekly_lease_rental
             + ABS(d.uber_cash_collection) + ABS(d.ola_cash_collection) + ABS(d.rapido_cash_collected)
             - (d.uber_total_earnings + d.ola_net_revenue + d.rapido_net_revenue)
+            + d.uber_driver_sub_charge
             - d.ola_online_payment
             - d.weekly_platform_incentive
             - d.vehicle_adjustments
@@ -718,7 +721,7 @@ BEGIN
             + d.accident_penalties
             + (CASE 
                 WHEN d.partner_type = 'Individual' 
-                     AND COALESCE(p.plan_scheme, '') ILIKE '%D2R%' 
+                     AND (COALESCE(p.plan_scheme, '') ILIKE '%D2R%' OR COALESCE(p.plan_scheme, '') ILIKE '%TBS%' OR COALESCE(p.plan_scheme, '') ILIKE '%Reducing Rent%')
                      AND d.city <> 'Mumbai' 
                      AND gps.total_gps_km > 0 
                 THEN ROUND(GREATEST(0, gps.total_gps_km - ideal.ideal_gps_km) * 3.00, 2)
