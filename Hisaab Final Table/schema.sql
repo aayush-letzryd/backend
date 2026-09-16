@@ -357,14 +357,14 @@ CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update()
 RETURNS TRIGGER AS $$
 BEGIN
     IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
-        RETURN NEW;
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
     IF OLD.settlement_status = 'FROZEN' THEN
         RAISE EXCEPTION 'Hisaab vehicle weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
     END IF;
 
-    RETURN NEW;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -378,14 +378,14 @@ CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_partner_weekly_update()
 RETURNS TRIGGER AS $$
 BEGIN
     IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
-        RETURN NEW;
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
     END IF;
 
     IF OLD.settlement_status = 'FROZEN' THEN
         RAISE EXCEPTION 'Hisaab partner weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
     END IF;
 
-    RETURN NEW;
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
 END;
 $$ LANGUAGE plpgsql;
 
