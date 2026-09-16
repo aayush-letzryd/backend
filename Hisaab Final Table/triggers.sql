@@ -642,21 +642,30 @@ BEGIN
     ) dr ON TRUE
     LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(distance_km), 0) AS total_gps_km 
-        FROM public.core_gps 
-        WHERE vehicle_number = d.vehicle_number 
-          AND record_date BETWEEN v_week_start AND v_week_end
+        FROM public.core_gps g
+        WHERE g.vehicle_number = d.vehicle_number 
+          AND g.record_date IN (
+              SELECT l.log_date FROM public.hisaab_daily_ledger l 
+              WHERE l.week_id = d.week_id AND l.vehicle_number = d.vehicle_number AND l.partner_id = d.partner_id
+          )
     ) gps ON TRUE
     LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(total_trip_distance_km), 0) AS uber_km 
-        FROM public.core_uber_daily 
-        WHERE vehicle_number = d.vehicle_number 
-          AND operational_date BETWEEN v_week_start AND v_week_end
+        FROM public.core_uber_daily u
+        WHERE u.vehicle_number = d.vehicle_number 
+          AND u.operational_date IN (
+              SELECT l.log_date FROM public.hisaab_daily_ledger l 
+              WHERE l.week_id = d.week_id AND l.vehicle_number = d.vehicle_number AND l.partner_id = d.partner_id
+          )
     ) u_km ON TRUE
     LEFT JOIN LATERAL (
         SELECT COALESCE(SUM(total_kms), 0) AS ola_km 
-        FROM public.core_ola_daily 
-        WHERE vehicle_number = d.vehicle_number 
-          AND service_date BETWEEN v_week_start AND v_week_end
+        FROM public.core_ola_daily o
+        WHERE o.vehicle_number = d.vehicle_number 
+          AND o.service_date IN (
+              SELECT l.log_date FROM public.hisaab_daily_ledger l 
+              WHERE l.week_id = d.week_id AND l.vehicle_number = d.vehicle_number AND l.partner_id = d.partner_id
+          )
     ) o_km ON TRUE
     LEFT JOIN LATERAL (
         SELECT 
