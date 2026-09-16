@@ -1,0 +1,2639 @@
+{
+  "engine_name": "LetzRyd Hisaab Engine",
+  "version": "2.0.0",
+  "classification": "Master Architectural Context & Specification",
+  "last_updated": "2026-09-16",
+  "git_commit": "b84dc08",
+  "git_repository": "git@github.com:aayush-letzryd/backend.git",
+  "database_connection": {
+    "host": "35.200.196.113",
+    "port": 5432,
+    "database": "postgres",
+    "timezone": "Asia/Kolkata (IST, UTC+05:30)",
+    "billing_calendar": "Monday 04:00 AM IST through Sunday (Cutoff: Monday 11:00 AM IST)"
+  },
+  "architecture_tiers": {
+    "tier_1_daily_ledger": {
+      "table": "public.hisaab_daily_ledger",
+      "grain": [
+        "log_date",
+        "vehicle_number",
+        "partner_id"
+      ],
+      "purpose": "Powers Driver App live feed and daily pacing. Granular shift reconciliation."
+    },
+    "tier_2_vehicle_weekly": {
+      "table": "public.hisaab_vehicle_weekly",
+      "grain": [
+        "week_id",
+        "vehicle_number",
+        "partner_id"
+      ],
+      "purpose": "1-to-1 mirror of Excel sheet 'Uber + OLA Final Hisaab'. GPS dead miles, platform earnings, and TDS."
+    },
+    "tier_3_partner_weekly": {
+      "table": "public.hisaab_partner_weekly",
+      "grain": [
+        "week_id",
+        "partner_id"
+      ],
+      "purpose": "1-to-1 mirror of Excel sheet 'Hisaab Summary'. Multi-car fleet consolidation and bank payouts."
+    }
+  },
+  "tables_schema": {
+    "hisaab_settlement_weeks": [
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "settlement_year",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "settlement_week",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_start",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_end",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "lock_cutoff_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "is_locked",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "locked_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "locked_by",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "notes",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "hisaab_adjustments_ledger": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('hisaab_adjustments_ledger_id_seq'::regclass)"
+      },
+      {
+        "name": "incident_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "incident_week_id",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "settlement_week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_type",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "adjustment_category",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "amount",
+        "type": "numeric",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "is_prior_period",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "approval_status",
+        "type": "character varying",
+        "nullable": false,
+        "default": "'Approved'::character varying"
+      },
+      {
+        "name": "approved_by",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "reference_doc_url",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "remarks",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "effective_date",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "polarity",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'CREDIT'::character varying"
+      }
+    ],
+    "hisaab_daily_ledger": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('hisaab_daily_ledger_id_seq'::regclass)"
+      },
+      {
+        "name": "log_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_type",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_model",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "attendance_status",
+        "type": "character varying",
+        "nullable": false,
+        "default": "'Active'::character varying"
+      },
+      {
+        "name": "is_billable_day",
+        "type": "boolean",
+        "nullable": false,
+        "default": "true"
+      },
+      {
+        "name": "daily_rent_applied",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_indemnity_fee",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "net_daily_rent",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "uber_fare_earnings",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_cash_collected",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_tolls",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_subscription_charge",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "ola_net_revenue",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_cash_collected",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_tolls",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_online_payment",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "rapido_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "rapido_net_revenue",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "rapido_cash_collected",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_adjustments",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_challans",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_accident_recovery",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "weekly_incentive_credit",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_net_balance",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "is_locked",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "hisaab_vehicle_weekly": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('hisaab_vehicle_weekly_id_seq'::regclass)"
+      },
+      {
+        "name": "settlement_year",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "settlement_week",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_start",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_end",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_type",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_model",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "rental_plan",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "allotted_days",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "onroad_days",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "daily_rent_applied",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "weekly_lease_rental",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "weekly_indemnity_fees",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "net_weekly_lease_rental",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "uber_total_earnings",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_cash_collection",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_toll",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_driver_sub_charge",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_week_os",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "ola_net_revenue",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_toll",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_gst",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_online_payment",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_week_os",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "rapido_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "rapido_net_revenue",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "weekly_platform_incentive",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "vehicle_adjustments",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "challan_amount",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "accident_penalties",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "dead_mile_charges",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "tds_amount",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "current_week_os",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "to_collect",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "to_payout",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_trip_km",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_gps_km",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "ideal_gps_km",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "dead_mile_km",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "dead_mile_pct",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.0000"
+      },
+      {
+        "name": "letzryd_earning",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "letzryd_earning_per_day",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "settlement_status",
+        "type": "character varying",
+        "nullable": false,
+        "default": "'OPEN'::character varying"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "ola_cash_collection",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "rapido_cash_collected",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      }
+    ],
+    "hisaab_partner_weekly": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('hisaab_partner_weekly_id_seq'::regclass)"
+      },
+      {
+        "name": "settlement_year",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "settlement_week",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_start",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_end",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_type",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "allotted_cars_count",
+        "type": "integer",
+        "nullable": false,
+        "default": "1"
+      },
+      {
+        "name": "total_onroad_days",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "total_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "total_net_rent_billed",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_platform_earnings",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_cash_collected",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_platform_incentives",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_adjustments",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_challans",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_accidents",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_tds",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "current_week_os",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "previous_outstanding",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "amount_paid_during_week",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "prior_period_adjustments",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "security_deposit_target",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "security_deposit_paid",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "deposit_deduction_current_week",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "pending_deposit",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "total_outstanding",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "net_bank_payout",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "net_amount_to_collect",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "settlement_status",
+        "type": "character varying",
+        "nullable": false,
+        "default": "'DRAFT'::character varying"
+      },
+      {
+        "name": "frozen_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "bank_utr_reference",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "payout_account_number",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "payout_ifsc",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": false,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "daily_rent_log": [
+      {
+        "name": "id",
+        "type": "integer",
+        "nullable": false,
+        "default": "nextval('daily_rent_log_id_seq'::regclass)"
+      },
+      {
+        "name": "log_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_model",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "attendance_status",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "is_billable_day",
+        "type": "boolean",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "weekly_completed_trips",
+        "type": "integer",
+        "nullable": false,
+        "default": "0"
+      },
+      {
+        "name": "applied_daily_rent",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "applied_daily_indemnity",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "net_daily_rent",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "calculation_rule",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "core_uber_daily": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_uber_daily_id_seq'::regclass)"
+      },
+      {
+        "name": "operational_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "driver_uuid",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "vendor_code",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Hyderabad'::character varying"
+      },
+      {
+        "name": "org_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "completed_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_trip_distance_km",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "net_fare_earnings",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "cash_collected",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "tolls_refunded",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "driver_subscription_charge",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "net_driver_day_balance",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "source_origin",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'uber_pipeline'::character varying"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      }
+    ],
+    "core_ola_daily": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_ola_daily_id_seq'::regclass)"
+      },
+      {
+        "name": "service_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Bengaluru'::character varying"
+      },
+      {
+        "name": "primary_driver_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "primary_driver_number",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "completed_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "cancelled_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_bookings",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_kms",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "customer_bill",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "operator_bill",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "cancellation_revenue",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "toll_and_parking",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "cash_collected",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "net_ola_to_pay",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "portal_incentive",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "platform_fee",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "subscription_fee",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "online_payouts",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "daily_driver_balance",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      }
+    ],
+    "core_rapido_daily": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_rapido_daily_id_seq'::regclass)"
+      },
+      {
+        "name": "operational_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "captain_id",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "captain_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "completed_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_trip_distance_km",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "captain_earnings",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "toll_charges",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "cash_collected",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "net_revenue",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "source_origin",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'rapido_pipeline'::character varying"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "core_gps": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_gps_id_seq'::regclass)"
+      },
+      {
+        "name": "record_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "distance_km",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "driver_phone",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "vehicle_status",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'RFD'::character varying"
+      },
+      {
+        "name": "cohort",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'In Yard'::character varying"
+      },
+      {
+        "name": "source_provider",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'INTELLICAR'::character varying"
+      },
+      {
+        "name": "raw_vehicle_id",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "is_idle_movement_alert",
+        "type": "boolean",
+        "nullable": true,
+        "default": "false"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "core_adjustments": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "adjustment_id",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_phone",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "partner_type",
+        "type": "text",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "vehicle_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "city_name",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "adjustment_type",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "adjustment_nature",
+        "type": "text",
+        "nullable": true,
+        "default": "'Monetary'::character varying"
+      },
+      {
+        "name": "adjustment_level",
+        "type": "text",
+        "nullable": true,
+        "default": "'Driver'::character varying"
+      },
+      {
+        "name": "adjustment_date",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "amount",
+        "type": "numeric",
+        "nullable": false,
+        "default": "0.00"
+      },
+      {
+        "name": "remittance_towards",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "adjustment_related_to",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "hisaab_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "hisaab_week_number",
+        "type": "integer",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "contested_line_items",
+        "type": "jsonb",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "severity_level",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "cost_level",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "remarks",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "approval_status",
+        "type": "text",
+        "nullable": true,
+        "default": "'Pending'::character varying"
+      },
+      {
+        "name": "first_level_approver",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "final_level_approver",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "current_approver_id",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "approved_by",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "photo_url",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "data_source",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "source_reference_id",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'::text)"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'::text)"
+      },
+      {
+        "name": "is_deleted",
+        "type": "boolean",
+        "nullable": true,
+        "default": "false"
+      },
+      {
+        "name": "deleted_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": null
+      }
+    ],
+    "core_challans": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_challans_id_seq'::regclass)"
+      },
+      {
+        "name": "source_system",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "source_table",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "sheet_challan_id",
+        "type": "bigint",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "automated_challan_id",
+        "type": "bigint",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "vehicle_reg_no",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "rc_holder_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "notice_no",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_cycle",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "violation_date",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "violation_time",
+        "type": "time without time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "notice_date",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "audit_date",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "violation_description",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "police_station",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "violation_location",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "liability_type",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'TRAFFIC_FINE'::character varying"
+      },
+      {
+        "name": "challan_amount",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "sticker_fine",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "previous_balance",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "amount_paid",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "total_pending",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "payment_status",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'PENDING'::character varying"
+      },
+      {
+        "name": "challan_image_url",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "scraped_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "source_tab",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "sheet_row_number",
+        "type": "integer",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "remarks",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "is_deleted",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "deleted_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "extra_attributes",
+        "type": "jsonb",
+        "nullable": true,
+        "default": "'{}'::jsonb"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'::text)"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'::text)"
+      }
+    ],
+    "core_partner_onboarding": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_partner_onboarding_id_seq'::regclass)"
+      },
+      {
+        "name": "partner_id",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "driver_name",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "phone_number",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "whatsapp_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "dob",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "onboarding_type",
+        "type": "text",
+        "nullable": true,
+        "default": "'Individual'::character varying"
+      },
+      {
+        "name": "lead_source",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "driver_plan",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "father_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "present_address",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "permanent_address",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "emergency_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "emergency_phone",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "emergency_relationship",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "reference_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "reference_phone",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "dl_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "dl_expiry_date",
+        "type": "date",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "pan_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "aadhaar_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "pan_aadhaar_linked",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "bank_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "account_name",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "account_number",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "ifsc_code",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "upi_id",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "security_deposit",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "selfie_photo",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "dl_front",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "dl_back",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "aadhaar_card_front",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "aadhaar_card_back",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "pan_card_photo",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "local_address_proof",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "cancelled_cheque_photo",
+        "type": "text",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "approval_status",
+        "type": "text",
+        "nullable": true,
+        "default": "'Draft'::character varying"
+      },
+      {
+        "name": "is_documents_verified",
+        "type": "boolean",
+        "nullable": true,
+        "default": "false"
+      },
+      {
+        "name": "is_spring_verified",
+        "type": "boolean",
+        "nullable": true,
+        "default": "false"
+      },
+      {
+        "name": "source_origin",
+        "type": "text",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "source_sheet_row_id",
+        "type": "bigint",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "source_portal_form_id",
+        "type": "integer",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "onboarding_timestamp",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "is_deleted",
+        "type": "boolean",
+        "nullable": true,
+        "default": "false"
+      },
+      {
+        "name": "deleted_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": null
+      }
+    ],
+    "core_rent": [
+      {
+        "name": "id",
+        "type": "integer",
+        "nullable": false,
+        "default": "nextval('core_rent_id_seq'::regclass)"
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "partner_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_model",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "plan_scheme",
+        "type": "character varying",
+        "nullable": false,
+        "default": "'Uber Reducing Rent'::character varying"
+      },
+      {
+        "name": "custom_daily_rent",
+        "type": "numeric",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "custom_daily_indemnity",
+        "type": "numeric",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "enable_age_discount",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "enable_volume_discount",
+        "type": "boolean",
+        "nullable": false,
+        "default": "false"
+      },
+      {
+        "name": "effective_from",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "effective_to",
+        "type": "date",
+        "nullable": false,
+        "default": "'9999-12-31'::date"
+      },
+      {
+        "name": "is_active",
+        "type": "boolean",
+        "nullable": false,
+        "default": "true"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp without time zone",
+        "nullable": true,
+        "default": "CURRENT_TIMESTAMP"
+      }
+    ],
+    "core_uber_weekly": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_uber_weekly_id_seq'::regclass)"
+      },
+      {
+        "name": "settlement_year",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "settlement_week",
+        "type": "integer",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_start",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_end",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vendor_code",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Hyderabad'::character varying"
+      },
+      {
+        "name": "active_days",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "completed_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_trip_km",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_total_earnings",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_cash_collection",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_toll",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_driver_sub_charge",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_vehicle_incentive",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_pass_on_incentive",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_letzryd_incentive",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "uber_week_balance",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      }
+    ],
+    "core_ola_weekly": [
+      {
+        "name": "id",
+        "type": "bigint",
+        "nullable": false,
+        "default": "nextval('core_ola_weekly_id_seq'::regclass)"
+      },
+      {
+        "name": "week_id",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_start",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "week_end",
+        "type": "date",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "vehicle_number",
+        "type": "character varying",
+        "nullable": false,
+        "default": null
+      },
+      {
+        "name": "city",
+        "type": "character varying",
+        "nullable": true,
+        "default": "'Bengaluru'::character varying"
+      },
+      {
+        "name": "vendor_code",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "driver_name",
+        "type": "character varying",
+        "nullable": true,
+        "default": null
+      },
+      {
+        "name": "onroad_days",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "completed_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "cancelled_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_trips",
+        "type": "integer",
+        "nullable": true,
+        "default": "0"
+      },
+      {
+        "name": "total_kms",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_net_revenue",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_toll",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_cash_collected",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_portal_incentive",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_online_payment_deductions",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_platform_fees",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_subscription_fees",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "ola_week_outstanding",
+        "type": "numeric",
+        "nullable": true,
+        "default": "0.00"
+      },
+      {
+        "name": "created_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      },
+      {
+        "name": "updated_at",
+        "type": "timestamp with time zone",
+        "nullable": true,
+        "default": "now()"
+      }
+    ]
+  },
+  "core_formulas": {
+    "sign_convention": "Positive balance = Driver owes company (to_collect); Negative balance = Company owes driver (to_payout / net_bank_payout)",
+    "daily_net_balance": "net_daily_rent + ABS(uber_cash + ola_cash + rapido_cash) - (uber_earnings + ola_net_revenue + rapido_net_revenue) - ola_online_payment + daily_challans + daily_accidents - daily_adjustments - sunday_milestone_incentive",
+    "vehicle_current_week_os": "net_weekly_lease_rental + ABS(total_cash_collected) - total_platform_earnings - ola_online_payment - platform_incentives - adjustments + challans + accidents + dead_mile_charges + tds_amount",
+    "partner_total_outstanding": "current_week_os_consolidated + previous_unpaid_debt + prior_period_adjustments - amount_paid_during_week",
+    "roll_forward_rule": "Only unpaid debt (total_outstanding > 0) carries over to next week. Negative credit balances (total_outstanding < 0) are paid out and reset to 0.00.",
+    "dead_mile_allowance": "ideal_gps_km = (total_trip_km * 1.05) + (completed_trips * 3.0 km) + (onroad_days * 30.0 km). Penalty = GREATEST(0, total_gps_km - ideal_gps_km) * 3.00 INR (Individuals only, 0 for Operators)",
+    "tds_194c": "1% on (net_platform_earnings - net_weekly_lease_rental) for Individuals if earnings > rent. 0% for Operators.",
+    "prior_period_adjustments_formula": "SUM(CASE WHEN polarity = 'DEBIT' THEN amount ELSE -amount END) from hisaab_adjustments_ledger where is_prior_period = TRUE"
+  },
+  "key_operational_engines": {
+    "operational_trip_override": "If a car is marked Maintenance/RFD or net_daily_rent <= 0, but completed trips > 0 or earnings > 0, system automatically bills standard contracted tariff from core_rent (fallback 856.00 INR).",
+    "multi_driver_deduplication": "Operators only receive trips explicitly tagged with their code or untagged trips when no individual driver drove that day. Secondary drivers on the same car capture trip earnings with 0 rent to avoid double-charging lease rent.",
+    "prior_period_routing": "Adjustments occurring in locked past weeks are intercepted BEFORE INSERT and routed to the current active cycle with is_prior_period = TRUE and effective_date = CURRENT_DATE.",
+    "monday_lock_enforcement": "Every Monday at 11:00 AM IST, sp_check_and_enforce_monday_lock freezes hisaab_settlement_weeks, hisaab_daily_ledger, hisaab_vehicle_weekly, and hisaab_partner_weekly. PostgreSQL trigger guards abort any subsequent updates."
+  },
+  "scorecard_verification": {
+    "CY26WK25": {
+      "status": "LOCKED",
+      "net_rent": 0.0,
+      "veh_os": 0.0,
+      "partner_os": 0.0,
+      "variance": 0.0
+    },
+    "CY26WK26": {
+      "status": "LOCKED",
+      "net_rent": 5112067.0,
+      "veh_os": 2068574.47,
+      "partner_os": 2068574.47,
+      "variance": 0.0
+    },
+    "CY26WK27": {
+      "status": "LOCKED",
+      "net_rent": 5255765.0,
+      "veh_os": 1638108.14,
+      "partner_os": 1638108.14,
+      "variance": 0.0
+    },
+    "CY26WK36": {
+      "status": "LOCKED",
+      "net_rent": 5445578.0,
+      "veh_os": 2707427.0,
+      "partner_os": 2707427.0,
+      "variance": 0.0
+    },
+    "CY26WK37": {
+      "status": "OPEN",
+      "net_rent": 7048130.0,
+      "veh_os": 3447415.0,
+      "partner_os": 3447415.0,
+      "variance": 0.0
+    },
+    "CY26WK38": {
+      "status": "OPEN",
+      "net_rent": 2695714.0,
+      "veh_os": 4024269.13,
+      "partner_os": 4024269.13,
+      "variance": 0.0
+    }
+  }
+}

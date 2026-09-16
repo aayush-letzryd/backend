@@ -880,7 +880,8 @@ BEGIN
     prior_adj AS (
         SELECT 
             partner_id,
-            SUM(amount) AS prior_period_adjustments
+            -- FIX: Respect polarity so DEBITs add to debt (+) and CREDITs subtract from debt (-)
+            COALESCE(SUM(CASE WHEN polarity = 'DEBIT' THEN amount ELSE -amount END), 0.00) AS prior_period_adjustments
         FROM public.hisaab_adjustments_ledger
         WHERE settlement_week_id = p_week_id 
           AND is_prior_period = TRUE
@@ -891,7 +892,7 @@ BEGIN
     prev_dues AS (
         SELECT 
             partner_id,
-            -- FIX 1: Only uncollected positive debt rolls forward. Negative balances (payouts already disbursed) do NOT roll forward into subsequent weeks!
+            -- Only uncollected positive debt rolls forward. Negative balances (payouts already disbursed) do NOT roll forward
             CASE WHEN total_outstanding > 0 THEN total_outstanding ELSE 0.00 END AS previous_outstanding
         FROM public.hisaab_partner_weekly
         WHERE week_id = v_prev_week_id
@@ -966,11 +967,11 @@ BEGIN
         COALESCE(pd.previous_outstanding, 0.00) AS previous_outstanding,
         0.00 AS amount_paid_during_week,
         COALESCE(pa.prior_period_adjustments, 0.00) AS prior_period_adjustments,
-        5000.00 AS security_deposit_target,
-        5000.00 AS security_deposit_paid,
+        COALESCE(dr.security_deposit, 5000.00) AS security_deposit_target,
+        COALESCE(dr.security_deposit, 5000.00) AS security_deposit_paid,
         0.00 AS deposit_deduction_current_week,
         0.00 AS pending_deposit,
-        -- FIX 2: Include prior_period_adjustments in total_outstanding calculation
+        -- Corrected total_outstanding: adds prior_period_adjustments (signed: positive adds to debt, negative reduces debt)
         (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)) AS total_outstanding,
         ABS(LEAST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00)))) AS net_bank_payout,
         GREATEST(0, (COALESCE(v.current_week_os, 0.00) + COALESCE(pd.previous_outstanding, 0.00) + COALESCE(pa.prior_period_adjustments, 0.00))) AS net_amount_to_collect,
@@ -983,7 +984,7 @@ BEGIN
     LEFT JOIN prior_adj pa ON ap.partner_id = pa.partner_id
     LEFT JOIN prev_dues pd ON ap.partner_id = pd.partner_id
     LEFT JOIN LATERAL (
-        SELECT account_number, ifsc_code, driver_name FROM public.core_partner_onboarding 
+        SELECT account_number, ifsc_code, driver_name, security_deposit FROM public.core_partner_onboarding 
         WHERE partner_id = ap.partner_id LIMIT 1
     ) dr ON TRUE
     ON CONFLICT (week_id, partner_id) DO UPDATE SET
@@ -1002,6 +1003,8 @@ BEGIN
         current_week_os = EXCLUDED.current_week_os,
         previous_outstanding = EXCLUDED.previous_outstanding,
         prior_period_adjustments = EXCLUDED.prior_period_adjustments,
+        security_deposit_target = EXCLUDED.security_deposit_target,
+        security_deposit_paid = EXCLUDED.security_deposit_paid,
         total_outstanding = EXCLUDED.total_outstanding,
         net_bank_payout = EXCLUDED.net_bank_payout,
         net_amount_to_collect = EXCLUDED.net_amount_to_collect,
