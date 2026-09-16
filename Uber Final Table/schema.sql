@@ -86,7 +86,25 @@ CREATE OR REPLACE FUNCTION fn_sync_core_uber()
 RETURNS TRIGGER AS $$
 BEGIN
     -- Refresh core_uber_daily
-    WITH trips_agg AS (
+    WITH driver_daily_veh AS (
+        SELECT DISTINCT ON (driver_uuid, trip_date)
+            driver_uuid,
+            trip_date,
+            UPPER(REPLACE(car_no, ' ', '')) AS veh_no
+        FROM uber_pipeline_trips
+        WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
+        ORDER BY driver_uuid, trip_date, trip_request_time DESC
+    ),
+    driver_week_veh AS (
+        SELECT DISTINCT ON (driver_uuid, date_trunc('week', trip_date))
+            driver_uuid,
+            date_trunc('week', trip_date) AS week_start,
+            UPPER(REPLACE(car_no, ' ', '')) AS veh_no
+        FROM uber_pipeline_trips
+        WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
+        ORDER BY driver_uuid, date_trunc('week', trip_date), trip_request_time DESC
+    ),
+    trips_agg AS (
         SELECT 
             COALESCE(trip_date, trip_request_time::date) AS op_date,
             UPPER(REPLACE(car_no, ' ', '')) AS veh_no,
@@ -99,20 +117,28 @@ BEGIN
     ),
     txns_agg AS (
         SELECT 
-            COALESCE(ot.trx_date, ot.reporting_time::date) AS op_date,
+            COALESCE(t.trip_date, t.trip_request_time::date, ot.trx_date, ot.reporting_time::date) AS op_date,
             COALESCE(
                 ot.vehicle_number,
                 UPPER(REPLACE(t.car_no, ' ', '')),
-                (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1]
+                (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1],
+                ddv.veh_no,
+                dwv.veh_no
             ) AS veh_no,
             ot.driver_uuid,
             COALESCE(SUM(CASE WHEN ot.description NOT ILIKE '%promotion%' AND ot.description NOT ILIKE '%incentive%' THEN ot.actual_earnings ELSE 0 END), 0) AS earnings,
             COALESCE(SUM(ABS(ot.cash_collected)), 0) AS cash,
             COALESCE(SUM(ot.refunds_toll), 0) AS toll,
-            COALESCE(ABS(SUM(CASE WHEN ot.paid_to_you < 0 AND (ot.description ILIKE '%subscription%' OR ot.description ILIKE '%platform fee%') THEN ot.paid_to_you ELSE 0 END)), 0) AS sub_fee
+            COALESCE(ABS(SUM(CASE WHEN ot.paid_to_you < 0 AND (ot.description ILIKE '%subscription%' OR ot.description ILIKE '%platform fee%' OR ot.description ILIKE '%Drive Pass%' OR ot.description ILIKE '%ड्राइव%') THEN ot.paid_to_you ELSE 0 END)), 0) AS sub_fee
         FROM uber_pipeline_order_transactions ot
         LEFT JOIN uber_pipeline_trips t ON ot.trip_uuid = t.trip_uuid
-        WHERE ot.trx_date IS NOT NULL OR ot.reporting_time IS NOT NULL
+        LEFT JOIN driver_daily_veh ddv 
+          ON ot.driver_uuid = ddv.driver_uuid 
+         AND COALESCE(ot.trx_date, ot.reporting_time::date) = ddv.trip_date
+        LEFT JOIN driver_week_veh dwv 
+          ON ot.driver_uuid = dwv.driver_uuid 
+         AND date_trunc('week', COALESCE(ot.trx_date, ot.reporting_time::date)) = dwv.week_start
+        WHERE ot.trx_date IS NOT NULL OR ot.reporting_time IS NOT NULL OR t.trip_date IS NOT NULL
         GROUP BY 1, 2, 3
     ),
     combined AS (
@@ -182,6 +208,15 @@ BEGIN
             SUM(tolls_refunded) AS uber_toll, SUM(driver_subscription_charge) AS uber_driver_sub_charge
         FROM weekly_cal
         GROUP BY settlement_year, settlement_week, week_id, week_start, week_end, vehicle_number, COALESCE(vendor_code, 'UNASSIGNED')
+    ),
+    raw_inc_agg AS (
+        SELECT 
+            UPPER(REPLACE(number_plate, ' ', '')) AS veh_no,
+            start_date::date AS week_start,
+            SUM(total_payout) AS total_payout
+        FROM uber_vehicle_incentives_raw
+        WHERE number_plate IS NOT NULL AND TRIM(number_plate) <> '' AND number_plate <> 'nan'
+        GROUP BY 1, 2
     )
     INSERT INTO core_uber_weekly (
         settlement_year, settlement_week, week_id, week_start, week_end, vehicle_number,
@@ -193,12 +228,12 @@ BEGIN
         w.settlement_year, w.settlement_week, w.week_id, w.week_start, w.week_end, w.vehicle_number,
         w.vendor_code, w.city, w.active_days, w.completed_trips, w.total_trip_km,
         w.uber_total_earnings, w.uber_cash_collection, w.uber_toll, w.uber_driver_sub_charge,
-        COALESCE(inc.total_payout, 0) AS uber_vehicle_incentive, 0.00 AS uber_pass_on_incentive,
-        COALESCE(inc.total_payout, 0) AS uber_letzryd_incentive,
-        (w.uber_total_earnings - w.uber_cash_collection + w.uber_toll - w.uber_driver_sub_charge + COALESCE(inc.total_payout, 0)) AS uber_week_balance
+        COALESCE(inc.total_payout, 0.00) AS uber_vehicle_incentive, 0.00 AS uber_pass_on_incentive,
+        COALESCE(inc.total_payout, 0.00) AS uber_letzryd_incentive,
+        (w.uber_total_earnings - w.uber_cash_collection + w.uber_toll - w.uber_driver_sub_charge + COALESCE(inc.total_payout, 0.00)) AS uber_week_balance
     FROM weekly_agg w
-    LEFT JOIN uber_vehicle_incentives_raw inc 
-      ON w.vehicle_number = UPPER(REPLACE(inc.number_plate, ' ', '')) AND inc.start_date::date = w.week_start
+    LEFT JOIN raw_inc_agg inc 
+      ON w.vehicle_number = inc.veh_no AND inc.week_start = w.week_start
     ON CONFLICT (settlement_year, settlement_week, vehicle_number, vendor_code) DO UPDATE SET
         active_days = EXCLUDED.active_days,
         completed_trips = EXCLUDED.completed_trips,
@@ -208,6 +243,8 @@ BEGIN
         uber_toll = EXCLUDED.uber_toll,
         uber_driver_sub_charge = EXCLUDED.uber_driver_sub_charge,
         uber_vehicle_incentive = EXCLUDED.uber_vehicle_incentive,
+        uber_pass_on_incentive = EXCLUDED.uber_pass_on_incentive,
+        uber_letzryd_incentive = EXCLUDED.uber_letzryd_incentive,
         uber_week_balance = EXCLUDED.uber_week_balance,
         updated_at = NOW();
 
