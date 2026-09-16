@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_hisaab_adj_daily_lookup ON public.hisaab_adjustme
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.hisaab_daily_ledger (
     id BIGSERIAL PRIMARY KEY,
-    log_date DATE NOT NULL,                             -- Shift date (04:00 AM to 04:00 AM IST)
+    log_date DATE NOT NULL,                             -- Calendar date (Monday to Sunday)
     week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks (week_id),
     vehicle_number VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64) NOT NULL,

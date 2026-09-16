@@ -115,7 +115,7 @@ Tier 1 daily shift feed powering mobile apps and daily pacing:
 ```sql
 CREATE TABLE public.hisaab_daily_ledger (
     id BIGSERIAL PRIMARY KEY,
-    log_date DATE NOT NULL,                 -- Operational shift (04:00 AM to 04:00 AM)
+    log_date DATE NOT NULL,                 -- Calendar date (Monday to Sunday)
     week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks(week_id),
     vehicle_number VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64) NOT NULL,
