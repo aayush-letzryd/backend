@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS public.hisaab_settlement_weeks (
     locked_by VARCHAR(64),                              -- Admin or system user
     notes TEXT,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_hisaab_settlement_weeks_year_week UNIQUE (settlement_year, settlement_week)
 );
 
 CREATE INDEX IF NOT EXISTS idx_hisaab_weeks_dates ON public.hisaab_settlement_weeks (week_start, week_end);
@@ -43,7 +44,8 @@ CREATE TABLE IF NOT EXISTS public.hisaab_adjustments_ledger (
     partner_id VARCHAR(64) NOT NULL,                    -- Driver or Operator code
     partner_type VARCHAR(32) DEFAULT 'Individual',      -- 'Individual' or 'Operator'
     adjustment_category VARCHAR(64) NOT NULL,           -- 'Challan', 'Rent Off', 'Maintenance/Tyre', 'Accident Damage', 'Bonus'
-    amount NUMERIC(12,2) NOT NULL,                      -- Positive = Deduction; Negative = Credit/Reimbursement
+    polarity VARCHAR(8) NOT NULL DEFAULT 'CREDIT',      -- 'CREDIT' (reduces driver dues) or 'DEBIT' (adds to driver dues)
+    amount NUMERIC(12,2) NOT NULL,
     is_prior_period BOOLEAN NOT NULL DEFAULT FALSE,     -- TRUE if incident week was already locked
     effective_date DATE DEFAULT CURRENT_DATE,           -- Date posted to daily ledger (CURRENT_DATE for prior-period, incident_date for in-week)
     approval_status VARCHAR(32) NOT NULL DEFAULT 'Approved', -- 'Approved', 'Pending', 'Rejected'
@@ -165,6 +167,7 @@ CREATE TABLE IF NOT EXISTS public.hisaab_vehicle_weekly (
 
     ola_trips INT NOT NULL DEFAULT 0,
     ola_net_revenue NUMERIC(12,2) NOT NULL DEFAULT 0.00,
+    ola_cash_collection NUMERIC(12,2) NOT NULL DEFAULT 0.00,
     ola_toll NUMERIC(12,2) NOT NULL DEFAULT 0.00,
     ola_gst NUMERIC(12,2) NOT NULL DEFAULT 0.00,        -- BLR 5%
     ola_online_payment NUMERIC(12,2) NOT NULL DEFAULT 0.00,
@@ -172,6 +175,7 @@ CREATE TABLE IF NOT EXISTS public.hisaab_vehicle_weekly (
 
     rapido_trips INT NOT NULL DEFAULT 0,
     rapido_net_revenue NUMERIC(12,2) NOT NULL DEFAULT 0.00,
+    rapido_cash_collected NUMERIC(12,2) NOT NULL DEFAULT 0.00,
 
     -- Platform Milestone Incentive
     weekly_platform_incentive NUMERIC(12,2) NOT NULL DEFAULT 0.00,
@@ -273,27 +277,119 @@ CREATE INDEX IF NOT EXISTS idx_hisaab_partner_lookup ON public.hisaab_partner_we
 CREATE INDEX IF NOT EXISTS idx_hisaab_partner_status ON public.hisaab_partner_weekly (settlement_status);
 
 -- ----------------------------------------------------------------------------
--- Automatic Lock Enforcement Function & Trigger
--- Prevents updating daily rows if the associated week is locked.
+-- Automatic Lock Enforcement Functions & Triggers (Immutability Guards)
+-- Prevents modifications/deletions on locked settlement weeks across all tables.
 -- ----------------------------------------------------------------------------
+
+-- 1. Daily ledger lock guard
 CREATE OR REPLACE FUNCTION public.fn_prevent_locked_hisaab_update()
+RETURNS TRIGGER AS $$
+DECLARE
+    v_week VARCHAR;
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        v_week := OLD.week_id;
+    ELSE
+        v_week := NEW.week_id;
+    END IF;
+
+    IF EXISTS (
+        SELECT 1 FROM public.hisaab_settlement_weeks 
+        WHERE week_id = v_week AND is_locked = TRUE
+    ) THEN
+        RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No modifications or deletions allowed.', v_week;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_daily_lock ON public.hisaab_daily_ledger;
+CREATE TRIGGER trg_check_hisaab_daily_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_daily_ledger
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_hisaab_update();
+
+-- 2. Adjustments ledger lock guard
+CREATE OR REPLACE FUNCTION public.fn_prevent_locked_adjustment_update()
 RETURNS TRIGGER AS $$
 DECLARE
     v_locked BOOLEAN;
 BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+    END IF;
+
+    -- Guard against modifying existing locked records
     SELECT is_locked INTO v_locked
     FROM public.hisaab_settlement_weeks
-    WHERE week_id = NEW.week_id;
+    WHERE week_id = OLD.settlement_week_id;
 
     IF v_locked = TRUE THEN
-        RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No further modifications allowed.', NEW.week_id;
+        RAISE EXCEPTION 'Hisaab cycle % is LOCKED. No modifications allowed to adjustments.', OLD.settlement_week_id;
+    END IF;
+
+    -- Guard against reassigning records into locked records on UPDATE
+    IF TG_OP = 'UPDATE' AND NEW.settlement_week_id IS DISTINCT FROM OLD.settlement_week_id THEN
+        SELECT is_locked INTO v_locked
+        FROM public.hisaab_settlement_weeks
+        WHERE week_id = NEW.settlement_week_id;
+
+        IF v_locked = TRUE THEN
+            RAISE EXCEPTION 'Cannot reassign adjustment to LOCKED Hisaab cycle %.', NEW.settlement_week_id;
+        END IF;
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN RETURN OLD; ELSE RETURN NEW; END IF;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_adj_lock ON public.hisaab_adjustments_ledger;
+CREATE TRIGGER trg_check_hisaab_adj_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_adjustments_ledger
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_adjustment_update();
+
+-- 3. Vehicle weekly lock guard
+CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.settlement_status = 'FROZEN' THEN
+        RAISE EXCEPTION 'Hisaab vehicle weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
     END IF;
 
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
-DROP TRIGGER IF EXISTS trg_check_hisaab_daily_lock ON public.hisaab_daily_ledger;
-CREATE TRIGGER trg_check_hisaab_daily_lock
-BEFORE UPDATE ON public.hisaab_daily_ledger
-FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_locked_hisaab_update();
+DROP TRIGGER IF EXISTS trg_check_hisaab_vehicle_lock ON public.hisaab_vehicle_weekly;
+CREATE TRIGGER trg_check_hisaab_vehicle_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_vehicle_weekly
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_vehicle_weekly_update();
+
+-- 4. Partner weekly lock guard
+CREATE OR REPLACE FUNCTION public.fn_prevent_frozen_partner_weekly_update()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF current_setting('hisaab.enforcing_lock', true) = 'true' THEN
+        RETURN NEW;
+    END IF;
+
+    IF OLD.settlement_status = 'FROZEN' THEN
+        RAISE EXCEPTION 'Hisaab partner weekly cycle % is FROZEN. No modifications allowed.', OLD.week_id;
+    END IF;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_check_hisaab_partner_lock ON public.hisaab_partner_weekly;
+CREATE TRIGGER trg_check_hisaab_partner_lock
+BEFORE UPDATE OR DELETE ON public.hisaab_partner_weekly
+FOR EACH ROW EXECUTE FUNCTION public.fn_prevent_frozen_partner_weekly_update();
