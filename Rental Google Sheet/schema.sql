@@ -34,7 +34,9 @@ ON sheet_rental_slabs (city, vehicle_model, driver_type, min_trips, max_trips);
 
 -- Table 2: sheet_rental_partners
 CREATE TABLE IF NOT EXISTS sheet_rental_partners (
-    vendor_code VARCHAR(64) PRIMARY KEY,                      -- Partner ID / LID (e.g. 'LETZHYDIP7569776283')
+    id SERIAL PRIMARY KEY,
+    vendor_code VARCHAR(64) NOT NULL,                         -- Partner ID / LID (e.g. 'LETZHYDIP7569776283')
+    vehicle_model VARCHAR(64) NOT NULL DEFAULT 'All',          -- 'Maruti Wagonr Tour H3 CNG', 'Dzire Tour S CNG', 'EC3', 'All'
     vendor_name VARCHAR(128),                                 -- Partner / Operator legal or display name
     city VARCHAR(32) NOT NULL,                                -- 'Hyderabad', 'Mumbai', 'Bengaluru'
     vendor_type VARCHAR(32),                                  -- 'Operator', 'Individual', 'VIP'
@@ -43,8 +45,11 @@ CREATE TABLE IF NOT EXISTS sheet_rental_partners (
     plan_type_hisaab VARCHAR(64),                             -- 'Reducing Rental', 'Fixed', 'All Platform'
     custom_daily_rent NUMERIC(10,2) NULL,                     -- Custom negotiated flat rate (e.g. INR 900, INR 970, INR 1050)
     custom_daily_indemnity NUMERIC(10,2) NULL,                 -- Custom negotiated indemnity (INR 0 for Kareem, INR 15 for Nisamudeen)
-    last_synced_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    last_synced_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_sheet_rental_partners UNIQUE (vendor_code, vehicle_model)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sheet_rental_partners_city 
 ON sheet_rental_partners (city);
+CREATE INDEX IF NOT EXISTS idx_sheet_rental_partners_code_model
+ON sheet_rental_partners (vendor_code, vehicle_model);

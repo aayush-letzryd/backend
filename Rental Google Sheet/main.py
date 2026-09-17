@@ -44,7 +44,9 @@ def ensure_tables(cur):
     ON sheet_rental_slabs (city, vehicle_model, driver_type, min_trips, max_trips);
 
     CREATE TABLE IF NOT EXISTS sheet_rental_partners (
-        vendor_code VARCHAR(64) PRIMARY KEY,
+        id SERIAL PRIMARY KEY,
+        vendor_code VARCHAR(64) NOT NULL,
+        vehicle_model VARCHAR(64) NOT NULL DEFAULT 'All',
         vendor_name VARCHAR(128),
         city VARCHAR(32) NOT NULL,
         vendor_type VARCHAR(32),
@@ -53,11 +55,14 @@ def ensure_tables(cur):
         plan_type_hisaab VARCHAR(64),
         custom_daily_rent NUMERIC(10,2) NULL,
         custom_daily_indemnity NUMERIC(10,2) NULL,
-        last_synced_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP
+        last_synced_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT uq_sheet_rental_partners UNIQUE (vendor_code, vehicle_model)
     );
 
     CREATE INDEX IF NOT EXISTS idx_sheet_rental_partners_city 
     ON sheet_rental_partners (city);
+    CREATE INDEX IF NOT EXISTS idx_sheet_rental_partners_code_model
+    ON sheet_rental_partners (vendor_code, vehicle_model);
     """
     cur.execute(ddl)
 
@@ -77,12 +82,13 @@ def sync_rental_data():
         # --- 1. sheet_rental_partners (Driver platform tabs + Fixed Rent Drivers side tables) ---
         partners = {}
         
-        def add_partner(code, name, city, vtype, plan, plat, ptype, rent, indem):
+        def add_partner(code, name, city, vtype, plan, plat, ptype, rent, indem, vmodel='All'):
             c = str(code).strip()
             if not c or c.lower() == 'none': return
-            partners[c] = (c, str(name).strip() if name else '', city, str(vtype).strip() if vtype else 'Individual',
-                           str(plan).strip() if plan else '', str(plat).strip() if plat else 'Uber',
-                           str(ptype).strip() if ptype else '', rent, indem)
+            vm = str(vmodel).strip() if vmodel else 'All'
+            partners[(c, vm)] = (c, vm, str(name).strip() if name else '', city, str(vtype).strip() if vtype else 'Individual',
+                                 str(plan).strip() if plan else '', str(plat).strip() if plat else 'Uber',
+                                 str(ptype).strip() if ptype else '', rent, indem)
 
         # HYD - Driver platform
         if "HYD - Driver platform" in wb.sheetnames:
@@ -134,12 +140,13 @@ def sync_rental_data():
         if "HYD - Rental Slab" in wb.sheetnames:
             ws_hyd_s = wb["HYD - Rental Slab"]
             for r in list(ws_hyd_s.iter_rows(values_only=True))[1:]:
-                if len(r) > 15 and r[14]:
+                if len(r) > 14 and r[14]:
                     vcode = str(r[14]).strip()
                     vname = str(r[13]).strip() if r[13] else ''
-                    try: frent = float(r[15])
+                    vmodel = str(r[11]).strip() if len(r) > 11 and r[11] else 'All'
+                    try: frent = float(r[15]) if len(r) > 15 else None
                     except: frent = None
-                    add_partner(vcode, vname, 'Hyderabad', 'Operator', 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None)
+                    add_partner(vcode, vname, 'Hyderabad', 'Operator', 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None, vmodel)
 
         # Side table in MUM - Rental Slab (Columns H to N: Fixed Rent Drivers)
         if "MUM - Rental Slab" in wb.sheetnames:
@@ -149,23 +156,24 @@ def sync_rental_data():
                     vcode = str(r[9]).strip()
                     vname = str(r[8]).strip() if r[8] else ''
                     vtype = str(r[11]).strip() if len(r) > 11 and r[11] else 'Operator'
+                    vmodel = str(r[12]).strip() if len(r) > 12 and r[12] else 'All'
                     try: frent = float(r[10]) if len(r) > 10 else None
                     except: frent = None
-                    add_partner(vcode, vname, 'Mumbai', vtype, 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None)
+                    add_partner(vcode, vname, 'Mumbai', vtype, 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None, vmodel)
 
         # Guarantee critical partner exceptions are always included
-        add_partner('LETZHYDIP9701685282', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00)
-        add_partner('LETZHYDIP9885838038', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00)
-        add_partner('LETZHYD8897187692', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00)
-        add_partner('LETZHYDIP7396655106', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00)
-        add_partner('LETZBLRIP9656907001', 'Rishad P V', 'Bengaluru', 'Operator', 'Operator Reducing Slabs', 'Uber', 'Tiered', None, 20.00)
-        add_partner('LETZBLRIP9036461336', 'Nisamudeen K P', 'Bengaluru', 'Operator', 'Standard Slabs', 'Uber', 'Tiered', None, 15.00)
+        add_partner('LETZHYDIP9701685282', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00, 'EC3')
+        add_partner('LETZHYDIP9885838038', 'Shaik Kareem', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 900.00, 0.00, 'EC3')
+        add_partner('LETZHYD8897187692', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00, 'Maruti Wagonr Tour H3 CNG')
+        add_partner('LETZHYDIP7396655106', 'Khaja Abdul Mujeeb', 'Hyderabad', 'Operator', 'Operator Custom Flat', 'Uber', 'Fixed', 970.00, 30.00, 'Maruti Wagonr Tour H3 CNG')
+        add_partner('LETZBLRIP9656907001', 'Rishad P V', 'Bengaluru', 'Operator', 'Operator Reducing Slabs', 'Uber', 'Tiered', None, 20.00, 'All')
+        add_partner('LETZBLRIP9036461336', 'Nisamudeen K P', 'Bengaluru', 'Operator', 'Standard Slabs', 'Uber', 'Tiered', None, 15.00, 'All')
 
         upsert_partner_sql = """
         INSERT INTO sheet_rental_partners (
-            vendor_code, vendor_name, city, vendor_type, plan_name, platform, plan_type_hisaab, custom_daily_rent, custom_daily_indemnity, last_synced_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
-        ON CONFLICT (vendor_code) DO UPDATE SET
+            vendor_code, vehicle_model, vendor_name, city, vendor_type, plan_name, platform, plan_type_hisaab, custom_daily_rent, custom_daily_indemnity, last_synced_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+        ON CONFLICT (vendor_code, vehicle_model) DO UPDATE SET
             vendor_name = EXCLUDED.vendor_name,
             city = EXCLUDED.city,
             vendor_type = EXCLUDED.vendor_type,
