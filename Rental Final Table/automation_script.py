@@ -141,7 +141,13 @@ def calculate_single_vehicle_day(
                 break
 
         if applied_rent is None:
-            if 'dzire' in model.lower(): applied_rent = 1100.00
+            if 'hyderabad' in city.lower():
+                if 'wagon' in model.lower(): applied_rent = 1050.00
+                elif 'dzire' in model.lower(): applied_rent = 1200.00
+                elif 'xcent' in model.lower(): applied_rent = 0.00
+                elif 'ec3' in model.lower(): applied_rent = 1400.00
+                else: applied_rent = 1050.00
+            elif 'dzire' in model.lower(): applied_rent = 1100.00
             elif 'ec3' in model.lower() or 'ev' in model.lower(): applied_rent = 1400.00
             elif 'xcent' in model.lower(): applied_rent = 550.00
             elif 'wagon' in model.lower(): applied_rent = 989.00
