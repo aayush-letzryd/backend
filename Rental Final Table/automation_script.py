@@ -87,7 +87,7 @@ def calculate_single_vehicle_day(
     else:
         city = contract['city']
         model = contract['vehicle_model']
-        partner_id = contract['partner_id']
+        partner_id = fallback_partner if (fallback_partner and fallback_partner != 'UNMAPPED') else contract['partner_id']
         custom_rent = contract['custom_daily_rent']
         custom_indem = contract['custom_daily_indemnity']
         plan_scheme = contract['plan_scheme']
