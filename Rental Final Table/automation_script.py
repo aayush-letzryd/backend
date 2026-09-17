@@ -92,7 +92,14 @@ def calculate_single_vehicle_day(
         custom_indem = contract['custom_daily_indemnity']
         plan_scheme = contract['plan_scheme']
 
-    # Golden Rule #2: Non-billable attendance status (Maintenance, Breakdown, RFD, Drop-Off)
+    # MANDATE: Primary condition for charging daily rent is successful trip activity (>0)
+    # If trips > 0, vehicle was active on road -> MUST BE BILLABLE REGARDLESS OF ATTENDANCE STATUS!
+    if (float(weekly_trips or 0) > 0 or float(ola_trips or 0) > 0):
+        is_billable = True
+        if attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
+            attendance_status = 'Active'
+
+    # Non-billable attendance status (Maintenance, Breakdown, RFD, Drop-Off) ONLY applies if trips == 0
     if not is_billable:
         return (
             log_date, week_id, veh_clean, partner_id, city, model,
@@ -134,9 +141,10 @@ def calculate_single_vehicle_day(
                 break
 
         if applied_rent is None:
-            if 'dzire' in model.lower(): applied_rent = 1200.00
-            elif 'ec3' in model.lower() or 'ev' in model.lower(): applied_rent = 1300.00
-            elif 'xcent' in model.lower(): applied_rent = 900.00
+            if 'dzire' in model.lower(): applied_rent = 1100.00
+            elif 'ec3' in model.lower() or 'ev' in model.lower(): applied_rent = 1400.00
+            elif 'xcent' in model.lower(): applied_rent = 550.00
+            elif 'wagon' in model.lower(): applied_rent = 989.00
             else: applied_rent = 1050.00
             calc_rule = f"Priority 3: Fallback Base ({applied_rent}/day)"
 
@@ -200,14 +208,38 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
 
     print(f"Querying vehicle status from {start_d} to {end_d}...")
 
-    # Query trip counts from uber_pipeline_trips for this date window
+    # Query trip counts from core_uber_daily and core_ola_daily for official completed trips in this date window
     cur.execute("""
-        SELECT car_no, COUNT(*) AS trip_count
-        FROM uber_pipeline_trips
-        WHERE trip_date BETWEEN %s AND %s AND car_no IS NOT NULL AND car_no != ''
-        GROUP BY car_no;
-    """, (start_d, end_d))
-    trip_map = {(r['car_no'] or '').strip().upper(): r['trip_count'] for r in cur.fetchall()}
+        SELECT 
+            UPPER(REPLACE(v.vehicle_number, ' ', '')) AS car_no,
+            COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) AS trip_count
+        FROM (
+            SELECT DISTINCT vehicle_number FROM public.core_daily_vehicle_status WHERE status_date BETWEEN %s AND %s
+        ) v
+        LEFT JOIN (
+            SELECT UPPER(REPLACE(vehicle_number, ' ', '')) AS veh, SUM(completed_trips) AS uber_trips
+            FROM public.core_uber_daily
+            WHERE operational_date BETWEEN %s AND %s
+            GROUP BY UPPER(REPLACE(vehicle_number, ' ', ''))
+        ) u ON UPPER(REPLACE(v.vehicle_number, ' ', '')) = u.veh
+        LEFT JOIN (
+            SELECT UPPER(REPLACE(vehicle_number, ' ', '')) AS veh, SUM(completed_trips) AS ola_trips
+            FROM public.core_ola_daily
+            WHERE service_date BETWEEN %s AND %s
+            GROUP BY UPPER(REPLACE(vehicle_number, ' ', ''))
+        ) o ON UPPER(REPLACE(v.vehicle_number, ' ', '')) = o.veh;
+    """, (start_d, end_d, start_d, end_d, start_d, end_d))
+    trip_rows = cur.fetchall()
+    trip_map = {}
+    for r in trip_rows:
+        if isinstance(r, dict):
+            k = (r['car_no'] or '').strip().upper()
+            v = r['trip_count']
+        else:
+            k = (r[0] or '').strip().upper()
+            v = r[1]
+        if k:
+            trip_map[k] = float(v or 0)
     print(f"Loaded trip counts for {len(trip_map)} vehicles from uber_pipeline_trips.")
 
     # Query attendance

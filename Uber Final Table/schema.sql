@@ -85,7 +85,7 @@ CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_vendor ON core_uber_weekly (vend
 CREATE OR REPLACE FUNCTION fn_sync_core_uber()
 RETURNS TRIGGER AS $$
 BEGIN
-    -- Refresh core_uber_daily
+    -- Refresh core_uber_daily for active 30-day window
     WITH driver_daily_veh AS (
         SELECT DISTINCT ON (driver_uuid, trip_date)
             driver_uuid,
@@ -93,6 +93,7 @@ BEGIN
             UPPER(REPLACE(car_no, ' ', '')) AS veh_no
         FROM uber_pipeline_trips
         WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
+          AND trip_date >= (CURRENT_DATE - INTERVAL '30 days')
         ORDER BY driver_uuid, trip_date, trip_request_time DESC
     ),
     driver_week_veh AS (
@@ -102,6 +103,7 @@ BEGIN
             UPPER(REPLACE(car_no, ' ', '')) AS veh_no
         FROM uber_pipeline_trips
         WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
+          AND trip_date >= (CURRENT_DATE - INTERVAL '30 days')
         ORDER BY driver_uuid, date_trunc('week', trip_date), trip_request_time DESC
     ),
     trips_agg AS (
@@ -113,6 +115,7 @@ BEGIN
             COALESCE(SUM(trip_distance), 0) AS dist_km
         FROM uber_pipeline_trips
         WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
+          AND COALESCE(trip_date, trip_request_time::date) >= (CURRENT_DATE - INTERVAL '30 days')
         GROUP BY 1, 2, 3
     ),
     txns_agg AS (
@@ -138,7 +141,7 @@ BEGIN
         LEFT JOIN driver_week_veh dwv 
           ON ot.driver_uuid = dwv.driver_uuid 
          AND date_trunc('week', COALESCE(ot.trx_date, ot.reporting_time::date)) = dwv.week_start
-        WHERE ot.trx_date IS NOT NULL OR ot.reporting_time IS NOT NULL OR t.trip_date IS NOT NULL
+        WHERE (ot.trx_date >= (CURRENT_DATE - INTERVAL '30 days') OR ot.reporting_time >= (CURRENT_DATE - INTERVAL '30 days') OR t.trip_date >= (CURRENT_DATE - INTERVAL '30 days'))
         GROUP BY 1, 2, 3
     ),
     combined AS (
@@ -185,7 +188,7 @@ BEGIN
         net_driver_day_balance = EXCLUDED.net_driver_day_balance,
         updated_at = NOW();
 
-    -- Refresh core_uber_weekly
+    -- Refresh core_uber_weekly for active 30-day window
     WITH weekly_cal AS (
         SELECT 
             d.operational_date, d.vehicle_number, d.vendor_code, d.city,
@@ -197,6 +200,7 @@ BEGIN
             EXTRACT(WEEK FROM d.operational_date)::int AS settlement_week,
             'CY' || SUBSTRING(EXTRACT(ISOYEAR FROM d.operational_date)::text FROM 3 FOR 2) || 'WK' || LPAD(EXTRACT(WEEK FROM d.operational_date)::text, 2, '0') AS week_id
         FROM core_uber_daily d
+        WHERE d.operational_date >= (CURRENT_DATE - INTERVAL '30 days')
     ),
     weekly_agg AS (
         SELECT 
@@ -216,6 +220,7 @@ BEGIN
             SUM(total_payout) AS total_payout
         FROM uber_vehicle_incentives_raw
         WHERE number_plate IS NOT NULL AND TRIM(number_plate) <> '' AND number_plate <> 'nan'
+          AND start_date::date >= (CURRENT_DATE - INTERVAL '30 days')
         GROUP BY 1, 2
     )
     INSERT INTO core_uber_weekly (
