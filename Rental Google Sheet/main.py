@@ -143,7 +143,7 @@ def sync_rental_data():
                 if len(r) > 14 and r[14]:
                     vcode = str(r[14]).strip()
                     vname = str(r[13]).strip() if r[13] else ''
-                    vmodel = str(r[11]).strip() if len(r) > 11 and r[11] else 'All'
+                    vmodel = str(r[12]).strip() if len(r) > 12 and r[12] else 'All'
                     try: frent = float(r[15]) if len(r) > 15 else None
                     except: frent = None
                     add_partner(vcode, vname, 'Hyderabad', 'Operator', 'Fixed Rent Driver', 'Uber', 'Fixed', frent, None, vmodel)
