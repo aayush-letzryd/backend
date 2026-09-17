@@ -223,11 +223,14 @@ CREATE OR REPLACE FUNCTION public.fn_recalculate_vehicle_status(
 RETURNS VOID AS $$
 DECLARE
     v_onboarding RECORD;
-    v_svs RECORD;
+    v_u RECORD;
+    v_o RECORD;
     v_alloc_today RECORD;
     v_drop_today RECORD;
+    v_recent_drop RECORD;
+    v_alloc_after_drop RECORD;
     v_cm RECORD;
-    v_rm_today RECORD;
+    v_svs RECORD;
     v_ti RECORD;
     v_final_status VARCHAR(30);
     v_cohort VARCHAR(20);
@@ -256,19 +259,60 @@ BEGIN
         RETURN;
     END IF;
 
-    -- Priority 0: Ground Truth from sheet_vehicle_status
-    SELECT final_status, cohort, partner_id, partner_name, new_partner_name, vehicle_model, city
-    INTO v_svs
-    FROM public.sheet_vehicle_status
-    WHERE vehicle_number = p_vehicle_number
-      AND status_date = p_target_date
+    -- Platform Trips Check
+    SELECT completed_trips, vendor_code 
+    INTO v_u
+    FROM public.core_uber_daily 
+    WHERE vehicle_number = p_vehicle_number AND operational_date = p_target_date
+    ORDER BY completed_trips DESC LIMIT 1;
+
+    SELECT completed_trips 
+    INTO v_o
+    FROM public.core_ola_daily 
+    WHERE vehicle_number = p_vehicle_number AND service_date = p_target_date
+    ORDER BY completed_trips DESC LIMIT 1;
+
+    -- Today's Allocation Event
+    SELECT id, partner_id, driver_name, driver_phone, hub_name, car_model, city, allocation_date
+    INTO v_alloc_today
+    FROM public.core_vehicle_allocation
+    WHERE is_deleted = FALSE
+      AND vehicle_number = p_vehicle_number
+      AND allocation_date = p_target_date
     ORDER BY id DESC
     LIMIT 1;
 
-    -- 2. Priority 1: Check active maintenance in core_maintenance
-    -- Guard: Only match open tickets (end_date IS NULL) if no newer allocation exists after start_date,
-    -- which would mean the driver has been re-deployed and the ticket is stale.
-    SELECT id, workshop_name
+    -- Today's Dropoff Event
+    SELECT id, return_type, return_date, driver_id, driver_name
+    INTO v_drop_today
+    FROM public.core_dropoffs
+    WHERE is_deleted = FALSE
+      AND vehicle_number = p_vehicle_number
+      AND return_date = p_target_date
+    ORDER BY id DESC
+    LIMIT 1;
+
+    -- Recent Dropoff before today in current cycle
+    SELECT id, return_type, return_date
+    INTO v_recent_drop
+    FROM public.core_dropoffs
+    WHERE is_deleted = FALSE AND vehicle_number = p_vehicle_number 
+      AND return_date >= DATE_TRUNC('week', p_target_date)::date 
+      AND return_date < p_target_date
+    ORDER BY return_date DESC, id DESC LIMIT 1;
+
+    -- Allocation occurring AFTER recent dropoff up to today
+    IF v_recent_drop.id IS NOT NULL THEN
+        SELECT id
+        INTO v_alloc_after_drop
+        FROM public.core_vehicle_allocation
+        WHERE is_deleted = FALSE AND vehicle_number = p_vehicle_number 
+          AND allocation_date >= v_recent_drop.return_date AND allocation_date <= p_target_date
+        LIMIT 1;
+    END IF;
+
+    -- Check Master Maintenance Table with Stale Ticket Guard
+    SELECT id
     INTO v_cm
     FROM public.core_maintenance
     WHERE is_deleted = FALSE
@@ -290,81 +334,45 @@ BEGIN
     ORDER BY start_date DESC
     LIMIT 1;
 
-    -- Priority 2: Fallback Repair and Maintenance drop-off in trailing 7 days
-    SELECT id, return_date
-    INTO v_rm_today
-    FROM public.core_dropoffs
-    WHERE is_deleted = FALSE
-      AND vehicle_number = p_vehicle_number
-      AND return_type = 'Repair and Maintenance'
-      AND return_date <= p_target_date
-      AND return_date >= p_target_date - INTERVAL '7 days'
-    ORDER BY return_date DESC, id DESC
-    LIMIT 1;
-
-    -- Priority 3: Allocation Event on Target Date
-    SELECT id, partner_id, driver_name, driver_phone, hub_name, car_model, city, allocation_date
-    INTO v_alloc_today
-    FROM public.core_vehicle_allocation
-    WHERE is_deleted = FALSE
-      AND vehicle_number = p_vehicle_number
-      AND allocation_date = p_target_date
-    ORDER BY id DESC
-    LIMIT 1;
-
-    -- Priority 4: Dropoff Event on Target Date
-    SELECT id, return_type, return_date
-    INTO v_drop_today
-    FROM public.core_dropoffs
-    WHERE is_deleted = FALSE
-      AND vehicle_number = p_vehicle_number
-      AND return_date = p_target_date
-    ORDER BY id DESC
-    LIMIT 1;
-
-    -- Priority 5: Active Trip Interval from v_vehicle_trip_intervals
-    SELECT allocation_id, vehicle_number, partner_id, driver_name, driver_phone, city, car_model, hub_name, trip_start_date, dropoff_id, trip_end_date
-    INTO v_ti
-    FROM public.v_vehicle_trip_intervals
+    -- Ground Truth from sheet_vehicle_status
+    SELECT final_status, cohort, partner_id, partner_name, new_partner_name, vehicle_model, city
+    INTO v_svs
+    FROM public.sheet_vehicle_status
     WHERE vehicle_number = p_vehicle_number
-      AND trip_start_date <= p_target_date
-      AND (trip_end_date IS NULL OR trip_end_date > p_target_date)
-    ORDER BY trip_start_date DESC
+      AND status_date = p_target_date
+    ORDER BY id DESC
     LIMIT 1;
 
-    -- Compute City, Hub, Model
+    -- Active Trip Interval
+    SELECT *
+    INTO v_ti
+    FROM public.v_vehicle_trip_intervals ti
+    WHERE ti.vehicle_number = p_vehicle_number
+      AND ti.trip_start_date <= p_target_date
+      AND (ti.trip_end_date IS NULL OR ti.trip_end_date >= p_target_date)
+    ORDER BY ti.trip_start_date DESC
+    LIMIT 1;
+
+    -- Resolve City, Hub, Model
     v_city := COALESCE(v_svs.city, v_alloc_today.city, v_ti.city, v_onboarding.city, 'UNKNOWN');
     v_hub_name := COALESCE(v_alloc_today.hub_name, v_ti.hub_name, 'MAIN_HUB');
     v_car_model := COALESCE(v_svs.vehicle_model, v_alloc_today.car_model, v_ti.car_model, v_onboarding.model);
 
-    -- Priority Evaluation
-    IF v_svs.final_status IS NOT NULL THEN
-        v_final_status := v_svs.final_status;
-        v_cohort := COALESCE(v_svs.cohort, CASE 
-            WHEN v_svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') THEN 'On Road' 
-            WHEN v_svs.final_status = 'Maintenance' THEN 'Off Road' 
-            ELSE 'In Yard' 
-        END);
-        v_partner_id := v_svs.partner_id;
-        v_partner_name := COALESCE(v_svs.partner_name, v_svs.new_partner_name);
-        v_partner_phone := NULL;
-        v_allocation_id := NULL;
-        v_allocation_date := NULL;
-        v_dropoff_id := NULL;
-        v_dropoff_date := NULL;
+    -- Hierarchy Evaluation
+    IF (COALESCE(v_u.completed_trips, 0) + COALESCE(v_o.completed_trips, 0)) > 0 THEN
+        v_final_status := 'Active';
+        v_cohort := 'On Road';
+        v_partner_id := COALESCE(v_ti.partner_id, v_alloc_today.partner_id, v_svs.partner_id, NULLIF(v_u.vendor_code, ''));
+        v_partner_name := COALESCE(v_ti.driver_name, v_alloc_today.driver_name, v_svs.partner_name, v_svs.new_partner_name);
+        v_partner_phone := COALESCE(v_ti.driver_phone, v_alloc_today.driver_phone);
+        v_allocation_id := COALESCE(v_alloc_today.id, v_ti.allocation_id);
+        v_allocation_date := COALESCE(v_alloc_today.allocation_date, v_ti.trip_start_date);
+        v_dropoff_id := COALESCE(v_drop_today.id, v_ti.dropoff_id);
+        v_dropoff_date := COALESCE(v_drop_today.return_date, v_ti.trip_end_date);
         v_maintenance_id := NULL;
-        v_billable := CASE 
-            WHEN v_svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') 
-                 OR (v_svs.partner_id IS NOT NULL AND v_svs.partner_id != '') THEN TRUE 
-            ELSE FALSE 
-        END;
-        v_waive_reason := CASE 
-            WHEN v_svs.final_status = 'Maintenance' THEN 'WORKSHOP_MAINTENANCE' 
-            WHEN v_svs.final_status = 'Drop Off' THEN 'DROPOFF_INSPECTION' 
-            WHEN v_svs.final_status = 'RFD' THEN 'RFD_IN_YARD' 
-            ELSE NULL 
-        END;
-        v_source_origin := 'SHEET_STATUS_SYNC';
+        v_billable := TRUE;
+        v_waive_reason := NULL;
+        v_source_origin := 'PLATFORM_TRIPS_VERIFIED';
 
     ELSIF v_alloc_today.id IS NOT NULL AND v_drop_today.id IS NOT NULL THEN
         v_final_status := 'Same Day D&A';
@@ -396,7 +404,22 @@ BEGIN
         v_waive_reason := NULL;
         v_source_origin := 'ALLOCATION_EVENT';
 
-    ELSIF v_drop_today.id IS NOT NULL AND v_drop_today.return_type IN ('Attrition', 'Force Recovery') THEN
+    ELSIF v_drop_today.id IS NOT NULL AND v_drop_today.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN
+        v_final_status := 'Maintenance';
+        v_cohort := 'Off Road';
+        v_partner_id := v_drop_today.driver_id;
+        v_partner_name := v_drop_today.driver_name;
+        v_partner_phone := NULL;
+        v_allocation_id := v_ti.allocation_id;
+        v_allocation_date := v_ti.trip_start_date;
+        v_dropoff_id := v_drop_today.id;
+        v_dropoff_date := v_drop_today.return_date;
+        v_maintenance_id := NULL;
+        v_billable := TRUE; -- billable on day of breakdown handover
+        v_waive_reason := NULL;
+        v_source_origin := 'DROPOFF_EVENT';
+
+    ELSIF v_drop_today.id IS NOT NULL THEN
         v_final_status := 'Drop Off';
         v_cohort := 'In Yard';
         v_partner_id := NULL;
@@ -411,26 +434,70 @@ BEGIN
         v_waive_reason := 'DROPOFF_INSPECTION';
         v_source_origin := 'DROPOFF_EVENT';
 
-    ELSIF v_cm.id IS NOT NULL OR v_rm_today.id IS NOT NULL THEN
+    ELSIF v_recent_drop.id IS NOT NULL AND v_alloc_after_drop.id IS NULL THEN
+        IF v_recent_drop.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN
+            v_final_status := 'Maintenance';
+            v_cohort := 'Off Road';
+            v_waive_reason := 'WORKSHOP_MAINTENANCE';
+        ELSE
+            v_final_status := 'RFD';
+            v_cohort := 'In Yard';
+            v_waive_reason := 'RFD_IN_YARD';
+        END IF;
+        v_partner_id := NULL;
+        v_partner_name := NULL;
+        v_partner_phone := NULL;
+        v_allocation_id := NULL;
+        v_allocation_date := NULL;
+        v_dropoff_id := v_recent_drop.id;
+        v_dropoff_date := v_recent_drop.return_date;
+        v_maintenance_id := NULL;
+        v_billable := FALSE;
+        v_source_origin := 'POST_DROPOFF_YARD';
+
+    ELSIF v_cm.id IS NOT NULL THEN
         v_final_status := 'Maintenance';
         v_cohort := 'Off Road';
-        IF UPPER(COALESCE(v_ti.partner_id, '')) LIKE '%IP%' OR UPPER(COALESCE(v_ti.partner_id, '')) LIKE '%OP%' THEN
-            v_partner_id := v_ti.partner_id;
-            v_partner_name := v_ti.driver_name;
-            v_partner_phone := v_ti.driver_phone;
-        ELSE
-            v_partner_id := NULL;
-            v_partner_name := NULL;
-            v_partner_phone := NULL;
-        END IF;
+        v_partner_id := NULL;
+        v_partner_name := NULL;
+        v_partner_phone := NULL;
         v_allocation_id := v_ti.allocation_id;
         v_allocation_date := v_ti.trip_start_date;
-        v_dropoff_id := COALESCE(v_drop_today.id, v_rm_today.id);
-        v_dropoff_date := COALESCE(v_drop_today.return_date, v_rm_today.return_date);
+        v_dropoff_id := v_ti.dropoff_id;
+        v_dropoff_date := v_ti.trip_end_date;
         v_maintenance_id := v_cm.id;
         v_billable := FALSE;
         v_waive_reason := 'WORKSHOP_MAINTENANCE';
         v_source_origin := 'MAINTENANCE_PIPELINE';
+
+    ELSIF v_svs.final_status IS NOT NULL THEN
+        v_final_status := v_svs.final_status;
+        v_cohort := COALESCE(v_svs.cohort, CASE 
+            WHEN v_svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') THEN 'On Road' 
+            WHEN v_svs.final_status = 'Maintenance' THEN 'Off Road' 
+            ELSE 'In Yard' 
+        END);
+        v_partner_id := v_svs.partner_id;
+        v_partner_name := COALESCE(v_svs.partner_name, v_svs.new_partner_name);
+        v_partner_phone := NULL;
+        v_allocation_id := v_ti.allocation_id;
+        v_allocation_date := v_ti.trip_start_date;
+        v_dropoff_id := v_ti.dropoff_id;
+        v_dropoff_date := v_ti.trip_end_date;
+        v_maintenance_id := NULL;
+        v_billable := CASE 
+            WHEN v_svs.final_status IN ('Maintenance', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned') THEN FALSE
+            WHEN v_svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') THEN TRUE
+            WHEN v_svs.partner_id IS NOT NULL AND v_svs.partner_id != '' THEN TRUE
+            ELSE FALSE
+        END;
+        v_waive_reason := CASE 
+            WHEN v_svs.final_status = 'Maintenance' THEN 'WORKSHOP_MAINTENANCE' 
+            WHEN v_svs.final_status IN ('Drop Off', 'Drop-off') THEN 'DROPOFF_INSPECTION' 
+            WHEN v_svs.final_status = 'RFD' THEN 'RFD_IN_YARD' 
+            ELSE NULL 
+        END;
+        v_source_origin := 'SHEET_STATUS_SYNC';
 
     ELSIF v_ti.allocation_id IS NOT NULL THEN
         v_final_status := 'Active';
@@ -448,7 +515,6 @@ BEGIN
         v_source_origin := 'ACTIVE_INTERVAL';
 
     ELSE
-        -- Default: RFD In Yard
         v_final_status := 'RFD';
         v_cohort := 'In Yard';
         v_partner_id := NULL;
@@ -464,45 +530,40 @@ BEGIN
         v_source_origin := 'YARD_ROLLOVER';
     END IF;
 
-    -- Zero-Burn Upsert into core_daily_vehicle_status
-    IF EXISTS (
-        SELECT 1 FROM public.core_daily_vehicle_status 
-        WHERE status_date = p_target_date AND vehicle_number = p_vehicle_number
-    ) THEN
-        UPDATE public.core_daily_vehicle_status SET
-            city = v_city,
-            final_status = v_final_status,
-            cohort = v_cohort,
-            partner_id = v_partner_id,
-            partner_name = v_partner_name,
-            partner_phone = v_partner_phone,
-            hub_name = v_hub_name,
-            car_model = v_car_model,
-            allocation_id = v_allocation_id,
-            allocation_date = v_allocation_date,
-            dropoff_id = v_dropoff_id,
-            dropoff_date = v_dropoff_date,
-            maintenance_id = v_maintenance_id,
-            billable_rent_day = v_billable,
-            rent_waived_reason = v_waive_reason,
-            source_origin = v_source_origin,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE status_date = p_target_date AND vehicle_number = p_vehicle_number;
-    ELSE
-        INSERT INTO public.core_daily_vehicle_status (
-            status_date, vehicle_number, city, final_status, cohort,
-            partner_id, partner_name, partner_phone, hub_name, car_model,
-            allocation_id, allocation_date, dropoff_id, dropoff_date, maintenance_id,
-            billable_rent_day, rent_waived_reason, source_origin, created_at, updated_at
-        ) VALUES (
-            p_target_date, p_vehicle_number, v_city, v_final_status, v_cohort,
-            v_partner_id, v_partner_name, v_partner_phone, v_hub_name, v_car_model,
-            v_allocation_id, v_allocation_date, v_dropoff_id, v_dropoff_date, v_maintenance_id,
-            v_billable, v_waive_reason, v_source_origin, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-        );
-    END IF;
+    -- Upsert into core_daily_vehicle_status
+    INSERT INTO public.core_daily_vehicle_status (
+        status_date, vehicle_number, city, final_status, cohort,
+        partner_id, partner_name, partner_phone, hub_name, car_model,
+        allocation_id, allocation_date, dropoff_id, dropoff_date, maintenance_id,
+        billable_rent_day, rent_waived_reason, source_origin, created_at, updated_at
+    ) VALUES (
+        p_target_date, p_vehicle_number, v_city, v_final_status, v_cohort,
+        v_partner_id, v_partner_name, v_partner_phone, v_hub_name, v_car_model,
+        v_allocation_id, v_allocation_date, v_dropoff_id, v_dropoff_date, v_maintenance_id,
+        v_billable, v_waive_reason, v_source_origin, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+    )
+    ON CONFLICT (status_date, vehicle_number) DO UPDATE SET
+        city = EXCLUDED.city,
+        final_status = EXCLUDED.final_status,
+        cohort = EXCLUDED.cohort,
+        partner_id = EXCLUDED.partner_id,
+        partner_name = EXCLUDED.partner_name,
+        partner_phone = EXCLUDED.partner_phone,
+        hub_name = EXCLUDED.hub_name,
+        car_model = EXCLUDED.car_model,
+        allocation_id = EXCLUDED.allocation_id,
+        allocation_date = EXCLUDED.allocation_date,
+        dropoff_id = EXCLUDED.dropoff_id,
+        dropoff_date = EXCLUDED.dropoff_date,
+        maintenance_id = EXCLUDED.maintenance_id,
+        billable_rent_day = EXCLUDED.billable_rent_day,
+        rent_waived_reason = EXCLUDED.rent_waived_reason,
+        source_origin = EXCLUDED.source_origin,
+        updated_at = CURRENT_TIMESTAMP;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Trigger on core_vehicle_allocation
 
 -- Trigger on core_vehicle_allocation
 CREATE OR REPLACE FUNCTION public.fn_trg_live_status_from_allocation()
@@ -611,87 +672,73 @@ BEGIN
             vo.registration_no AS vehicle_number,
             COALESCE(svs.city, ti.city, vo.city, 'UNKNOWN') AS city,
             
-            -- Operational Status Classification
+            -- Operational Status Classification (Trip Override & Event Hierarchy)
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN svs.final_status
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN 'Active'
                 WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'Same Day D&A'
                 WHEN alloc_today.id IS NOT NULL THEN 'Allocation'
-                WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery') THEN 'Drop Off'
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'Maintenance'
+                WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+                WHEN drop_today.id IS NOT NULL THEN 'Drop Off'
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN
+                    CASE WHEN recent_drop.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance' ELSE 'RFD' END
+                WHEN cm.id IS NOT NULL THEN 'Maintenance'
+                WHEN svs.final_status IS NOT NULL THEN svs.final_status
                 WHEN ti.allocation_id IS NOT NULL THEN 'Active'
                 ELSE 'RFD'
             END AS final_status,
             
             -- Cohort Classification
             CASE 
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN 'On Road'
+                WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'On Road'
+                WHEN alloc_today.id IS NOT NULL THEN 'On Road'
+                WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Off Road'
+                WHEN drop_today.id IS NOT NULL THEN 'In Yard'
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN
+                    CASE WHEN recent_drop.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Off Road' ELSE 'In Yard' END
+                WHEN cm.id IS NOT NULL THEN 'Off Road'
                 WHEN svs.final_status IS NOT NULL THEN 
                     COALESCE(svs.cohort, CASE 
                         WHEN svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') THEN 'On Road' 
                         WHEN svs.final_status = 'Maintenance' THEN 'Off Road' 
                         ELSE 'In Yard' 
                     END)
-                WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'On Road'
-                WHEN alloc_today.id IS NOT NULL THEN 'On Road'
-                WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery') THEN 'Off Road'
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'Off Road'
                 WHEN ti.allocation_id IS NOT NULL THEN 'On Road'
                 ELSE 'In Yard'
             END AS cohort,
             
             -- Partner ID Assignment
-            -- Rule: sheet_vehicle_status.partner_id is the authoritative source when non-null.
-            -- It reflects the ops-confirmed driver for that day.
-            -- alloc_today / ti are used ONLY when sheet has no partner (maintenance/yard days).
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN
-                    CASE
-                        -- Sheet has a confirmed partner → always use it (handles both normal days & handovers)
-                        WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN svs.partner_id
-                        -- Sheet has no partner → check if an allocation event today assigns one
-                        WHEN alloc_today.id IS NOT NULL THEN alloc_today.partner_id
-                        -- Check active trip interval
-                        WHEN ti.allocation_id IS NOT NULL THEN ti.partner_id
-                        ELSE NULL
-                    END
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
-                    CASE WHEN UPPER(COALESCE(ti.partner_id, '')) LIKE '%IP%' OR UPPER(COALESCE(ti.partner_id, '')) LIKE '%OP%' THEN ti.partner_id ELSE NULL END
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN NULL
+                WHEN alloc_today.id IS NOT NULL THEN alloc_today.partner_id
+                WHEN drop_today.id IS NOT NULL THEN drop_today.driver_id
+                WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN svs.partner_id
                 WHEN ti.allocation_id IS NOT NULL THEN ti.partner_id
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN 
+                    NULLIF(u.vendor_code, '')
                 ELSE NULL
             END AS partner_id,
             
             -- Partner Name Assignment
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN
-                    CASE
-                        WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN COALESCE(svs.partner_name, svs.new_partner_name)
-                        WHEN alloc_today.id IS NOT NULL THEN alloc_today.driver_name
-                        WHEN ti.allocation_id IS NOT NULL THEN ti.driver_name
-                        ELSE NULL
-                    END
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
-                    CASE WHEN UPPER(COALESCE(ti.partner_id, '')) LIKE '%IP%' OR UPPER(COALESCE(ti.partner_id, '')) LIKE '%OP%' THEN ti.driver_name ELSE NULL END
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN NULL
+                WHEN alloc_today.id IS NOT NULL THEN alloc_today.driver_name
+                WHEN drop_today.id IS NOT NULL THEN drop_today.driver_name
+                WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN COALESCE(svs.partner_name, svs.new_partner_name)
                 WHEN ti.allocation_id IS NOT NULL THEN ti.driver_name
                 ELSE NULL
             END AS partner_name,
             
             -- Partner Phone Assignment
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN
-                    CASE
-                        WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN NULL
-                        WHEN alloc_today.id IS NOT NULL THEN alloc_today.driver_phone
-                        WHEN ti.allocation_id IS NOT NULL THEN ti.driver_phone
-                        ELSE NULL
-                    END
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 
-                    CASE WHEN UPPER(COALESCE(ti.partner_id, '')) LIKE '%IP%' OR UPPER(COALESCE(ti.partner_id, '')) LIKE '%OP%' THEN ti.driver_phone ELSE NULL END
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN NULL
+                WHEN alloc_today.id IS NOT NULL THEN alloc_today.driver_phone
                 WHEN ti.allocation_id IS NOT NULL THEN ti.driver_phone
                 ELSE NULL
             END AS partner_phone,
             
             COALESCE(alloc_today.hub_name, ti.hub_name, 'MAIN_HUB') AS hub_name,
             COALESCE(svs.vehicle_model, alloc_today.car_model, ti.car_model, vo.model) AS car_model,
-            -- Populate allocation_id/date from events even when sheet record exists
             COALESCE(alloc_today.id, ti.allocation_id) AS allocation_id,
             COALESCE(alloc_today.allocation_date, ti.trip_start_date) AS allocation_date,
             COALESCE(drop_today.id, ti.dropoff_id) AS dropoff_id,
@@ -700,52 +747,131 @@ BEGIN
             
             -- Billing Flag
             CASE 
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN TRUE
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN FALSE
+                WHEN alloc_today.id IS NOT NULL THEN TRUE
+                WHEN drop_today.id IS NOT NULL AND drop_today.return_type NOT IN ('Attrition', 'Force Recovery', 'Non-payment / Default', 'Voluntary Return') THEN TRUE
+                WHEN drop_today.id IS NOT NULL THEN FALSE
+                WHEN cm.id IS NOT NULL THEN FALSE
                 WHEN svs.final_status IS NOT NULL THEN
                     CASE 
-                        -- Non-billable statuses always waive rent
                         WHEN svs.final_status IN ('Maintenance', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned') THEN FALSE
-                        -- Billable statuses
                         WHEN svs.final_status IN ('Active', 'Allocation', 'Same Day D&A', 'New Deployment') THEN TRUE
-                        -- Any other status with a partner is billable
                         WHEN svs.partner_id IS NOT NULL AND svs.partner_id != '' THEN TRUE
                         ELSE FALSE
                     END
-                WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN TRUE
-                WHEN alloc_today.id IS NOT NULL THEN TRUE
-                WHEN drop_today.id IS NOT NULL AND drop_today.return_type IN ('Attrition', 'Force Recovery', 'Non-payment / Default', 'Voluntary Return') THEN FALSE
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN FALSE
                 WHEN ti.allocation_id IS NOT NULL THEN TRUE
                 ELSE FALSE
             END AS billable_rent_day,
             
             -- Rent Waived Reason
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN
-                    CASE 
-                        WHEN svs.final_status = 'Maintenance' THEN 'WORKSHOP_MAINTENANCE' 
-                        WHEN svs.final_status = 'Drop Off' THEN 'DROPOFF_INSPECTION' 
-                        WHEN svs.final_status = 'RFD' THEN 'RFD_IN_YARD' 
-                        ELSE NULL 
-                    END
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'WORKSHOP_MAINTENANCE'
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN NULL
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN
+                    CASE WHEN recent_drop.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'WORKSHOP_MAINTENANCE' ELSE 'RFD_IN_YARD' END
+                WHEN cm.id IS NOT NULL THEN 'WORKSHOP_MAINTENANCE'
                 WHEN drop_today.id IS NOT NULL THEN 'DROPOFF_INSPECTION'
+                WHEN svs.final_status = 'Maintenance' THEN 'WORKSHOP_MAINTENANCE' 
+                WHEN svs.final_status IN ('Drop Off', 'Drop-off') THEN 'DROPOFF_INSPECTION' 
+                WHEN svs.final_status = 'RFD' THEN 'RFD_IN_YARD' 
                 WHEN ti.allocation_id IS NULL THEN 'RFD_IN_YARD'
                 ELSE NULL
             END AS rent_waived_reason,
             
             -- Provenance Source Origin
             CASE 
-                WHEN svs.final_status IS NOT NULL THEN 'SHEET_STATUS_SYNC'
+                WHEN (COALESCE(u.completed_trips, 0) + COALESCE(o.completed_trips, 0)) > 0 THEN 'PLATFORM_TRIPS_VERIFIED'
                 WHEN alloc_today.id IS NOT NULL AND drop_today.id IS NOT NULL THEN 'SAME_DAY_HANDOVER'
                 WHEN alloc_today.id IS NOT NULL THEN 'ALLOCATION_EVENT'
                 WHEN drop_today.id IS NOT NULL THEN 'DROPOFF_EVENT'
-                WHEN cm.id IS NOT NULL OR rm_today.id IS NOT NULL THEN 'MAINTENANCE_PIPELINE'
+                WHEN recent_drop.id IS NOT NULL AND (alloc_after_drop.id IS NULL) THEN 'POST_DROPOFF_YARD'
+                WHEN cm.id IS NOT NULL THEN 'MAINTENANCE_PIPELINE'
+                WHEN svs.final_status IS NOT NULL THEN 'SHEET_STATUS_SYNC'
                 WHEN ti.allocation_id IS NOT NULL THEN 'ACTIVE_INTERVAL'
                 ELSE 'YARD_ROLLOVER'
             END AS source_origin
         FROM public.core_vehicle_onboarding vo
         
-        -- Priority 0: Ground Truth from sheet_vehicle_status
+        -- Platform Trips Check
+        LEFT JOIN LATERAL (
+            SELECT completed_trips, vendor_code 
+            FROM public.core_uber_daily 
+            WHERE vehicle_number = vo.registration_no AND operational_date = p_target_date
+            ORDER BY completed_trips DESC LIMIT 1
+        ) u ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT completed_trips 
+            FROM public.core_ola_daily 
+            WHERE vehicle_number = vo.registration_no AND service_date = p_target_date
+            ORDER BY completed_trips DESC LIMIT 1
+        ) o ON TRUE
+
+        -- Today's Allocation Event
+        LEFT JOIN LATERAL (
+            SELECT id, partner_id, driver_name, driver_phone, hub_name, car_model, city, allocation_date
+            FROM public.core_vehicle_allocation
+            WHERE is_deleted = FALSE
+              AND vehicle_number = vo.registration_no
+              AND allocation_date = p_target_date
+            ORDER BY id DESC
+            LIMIT 1
+        ) alloc_today ON TRUE
+
+        -- Today's Dropoff Event
+        LEFT JOIN LATERAL (
+            SELECT id, return_type, return_date, driver_id, driver_name
+            FROM public.core_dropoffs
+            WHERE is_deleted = FALSE
+              AND vehicle_number = vo.registration_no
+              AND return_date = p_target_date
+            ORDER BY id DESC
+            LIMIT 1
+        ) drop_today ON TRUE
+
+        -- Recent Dropoff before today in current cycle (from Monday of current week)
+        LEFT JOIN LATERAL (
+            SELECT id, return_type, return_date
+            FROM public.core_dropoffs
+            WHERE is_deleted = FALSE AND vehicle_number = vo.registration_no 
+              AND return_date >= DATE_TRUNC('week', p_target_date)::date 
+              AND return_date < p_target_date
+            ORDER BY return_date DESC, id DESC LIMIT 1
+        ) recent_drop ON TRUE
+
+        -- Allocation occurring AFTER recent dropoff up to today
+        LEFT JOIN LATERAL (
+            SELECT id
+            FROM public.core_vehicle_allocation
+            WHERE is_deleted = FALSE AND vehicle_number = vo.registration_no 
+              AND allocation_date >= recent_drop.return_date AND allocation_date <= p_target_date
+            LIMIT 1
+        ) alloc_after_drop ON recent_drop.id IS NOT NULL
+
+        -- Check Master Maintenance Table with Stale Ticket Guard
+        LEFT JOIN LATERAL (
+            SELECT id
+            FROM public.core_maintenance
+            WHERE is_deleted = FALSE
+              AND vehicle_number = vo.registration_no
+              AND start_date <= p_target_date
+              AND (
+                  end_date >= p_target_date
+                  OR (
+                      end_date IS NULL
+                      AND NOT EXISTS (
+                          SELECT 1 FROM public.core_vehicle_allocation a
+                          WHERE a.vehicle_number = vo.registration_no
+                            AND a.is_deleted = FALSE
+                            AND a.allocation_date > start_date
+                            AND a.allocation_date <= p_target_date
+                      )
+                  )
+              )
+            ORDER BY start_date DESC
+            LIMIT 1
+        ) cm ON TRUE
+
+        -- Ground Truth from sheet_vehicle_status
         LEFT JOIN LATERAL (
             SELECT 
                 final_status,
@@ -762,60 +888,13 @@ BEGIN
             LIMIT 1
         ) svs ON TRUE
 
-        -- Priority 1: Check Master Maintenance Table
-        LEFT JOIN LATERAL (
-            SELECT id
-            FROM public.core_maintenance
-            WHERE is_deleted = FALSE
-              AND vehicle_number = vo.registration_no
-              AND start_date <= p_target_date
-              AND (end_date IS NULL OR end_date >= p_target_date)
-            ORDER BY start_date DESC
-            LIMIT 1
-        ) cm ON TRUE
-
-        -- Priority 2: Fallback Dropoff Maintenance Check
-        LEFT JOIN LATERAL (
-            SELECT id, return_date
-            FROM public.core_dropoffs
-            WHERE is_deleted = FALSE
-              AND vehicle_number = vo.registration_no
-              AND return_type = 'Repair and Maintenance'
-              AND return_date <= p_target_date
-              AND return_date >= p_target_date - INTERVAL '7 days'
-            ORDER BY return_date DESC, id DESC
-            LIMIT 1
-        ) rm_today ON TRUE
-        
-        -- Priority 3: Allocation Event on Target Date
-        LEFT JOIN LATERAL (
-            SELECT id, partner_id, driver_name, driver_phone, hub_name, car_model, city, allocation_date
-            FROM public.core_vehicle_allocation
-            WHERE is_deleted = FALSE
-              AND vehicle_number = vo.registration_no
-              AND allocation_date = p_target_date
-            ORDER BY id DESC
-            LIMIT 1
-        ) alloc_today ON TRUE
-
-        -- Priority 4: Dropoff Event on Target Date
-        LEFT JOIN LATERAL (
-            SELECT id, return_type, return_date
-            FROM public.core_dropoffs
-            WHERE is_deleted = FALSE
-              AND vehicle_number = vo.registration_no
-              AND return_date = p_target_date
-            ORDER BY id DESC
-            LIMIT 1
-        ) drop_today ON TRUE
-
-        -- Priority 5: Active Trip Interval
+        -- Active Trip Interval
         LEFT JOIN LATERAL (
             SELECT *
             FROM public.v_vehicle_trip_intervals ti
             WHERE ti.vehicle_number = vo.registration_no
               AND ti.trip_start_date <= p_target_date
-              AND (ti.trip_end_date IS NULL OR ti.trip_end_date > p_target_date)
+              AND (ti.trip_end_date IS NULL OR ti.trip_end_date >= p_target_date)
             ORDER BY ti.trip_start_date DESC
             LIMIT 1
         ) ti ON TRUE
