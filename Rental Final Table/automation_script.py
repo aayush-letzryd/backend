@@ -46,19 +46,31 @@ def get_connection():
 
 def load_master_rental_context(cur):
     """
-    Preloads active vehicle contracts from core_rent and rate slabs from sheet_rental_slabs
-    into memory for high-performance vectorized lookups.
+    Preloads active vehicle and partner contracts from core_rent and rate slabs from sheet_rental_slabs
+    into memory for high-performance vectorized lookups adhering to the standard 4-Tier Plan Logic.
     """
     cur.execute("SELECT * FROM core_rent WHERE is_active = TRUE;")
     core_rent_rows = cur.fetchall()
-    core_rent_map = {}
+    
+    partner_veh_map = {}
+    partner_model_map = {}
+    veh_model_map = {}
+    
     for r in core_rent_rows:
-        core_rent_map[r['vehicle_number'].strip().upper()] = r
+        p_id = (r['partner_id'] or '').strip().upper()
+        v_no = (r['vehicle_number'] or '').strip().upper()
+        m_name = (r['vehicle_model'] or '').strip().lower()
+        if p_id and v_no:
+            partner_veh_map[(p_id, v_no)] = r
+        if p_id and m_name:
+            partner_model_map[(p_id, m_name)] = r
+        if v_no and v_no not in veh_model_map and r['vehicle_model']:
+            veh_model_map[v_no] = r['vehicle_model']
 
     cur.execute("SELECT * FROM sheet_rental_slabs ORDER BY min_trips DESC;")
     slabs_list = cur.fetchall()
 
-    return core_rent_map, slabs_list
+    return partner_veh_map, partner_model_map, veh_model_map, slabs_list
 
 def calculate_single_vehicle_day(
     veh_clean,
@@ -68,107 +80,125 @@ def calculate_single_vehicle_day(
     is_billable,
     weekly_trips,
     ola_trips,
-    core_rent_map,
+    partner_veh_map,
+    partner_model_map,
+    veh_model_map,
     slabs_list,
     fallback_city='Bengaluru',
-    fallback_partner=None
+    fallback_partner=None,
+    fallback_model=None
 ):
     """
-    Pure in-memory calculation of daily rent and indemnity.
+    Pure in-memory calculation of daily rent and indemnity adhering to standard 4-Tier Plan Logic:
+      Tier 1: Non-billable status or unassigned yard -> ₹0.00
+      Tier 2: Partner-specific exception rate card (keyed by partner_id / LID)
+      Tier 3: Model-specific rates (e.g. Mumbai Dzire = 1130, Hyderabad EC3 = 1400)
+      Tier 4: Dynamic Reducing Rent Slabs by weekly completed trips
     """
-    contract = core_rent_map.get(veh_clean)
-    if not contract:
-        city = fallback_city
-        model = 'Maruti Wagonr Tour H3 CNG'
-        partner_id = fallback_partner or 'UNMAPPED'
-        custom_rent = None
-        custom_indem = 30.00
-        plan_scheme = 'Uber Reducing Rent'
-    else:
-        city = contract['city']
-        model = contract['vehicle_model']
-        if fallback_partner and fallback_partner != 'UNMAPPED':
-            partner_id = fallback_partner
-        elif not is_billable or attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
-            partner_id = ''
-        else:
-            partner_id = contract['partner_id']
-        custom_rent = contract['custom_daily_rent']
-        custom_indem = contract['custom_daily_indemnity']
-        plan_scheme = contract['plan_scheme']
+    p_id_clean = (fallback_partner or '').strip().upper()
+    v_clean = (veh_clean or '').strip().upper()
 
-    # MANDATE: Primary condition for charging daily rent is successful trip activity (>0)
-    # If trips > 0, vehicle was active on road -> MUST BE BILLABLE REGARDLESS OF ATTENDANCE STATUS!
+    actual_model = fallback_model or veh_model_map.get(v_clean) or 'Maruti Wagonr Tour H3 CNG'
+    m_token = actual_model.split()[0].lower()
+    city = fallback_city or 'Bengaluru'
+
+    # Contract lookup: Priority 1: (partner_id, vehicle_number), Priority 2: (partner_id, model)
+    contract = partner_veh_map.get((p_id_clean, v_clean))
+    if not contract and p_id_clean:
+        for (cp_id, cm_name), cr in partner_model_map.items():
+            if cp_id == p_id_clean and (m_token in cm_name or cm_name in actual_model.lower()):
+                contract = cr
+                break
+
+    partner_id = p_id_clean if (p_id_clean and p_id_clean != 'UNMAPPED') else (contract['partner_id'] if contract else '')
+    custom_rent = contract['custom_daily_rent'] if contract else None
+    plan_scheme = contract['plan_scheme'] if contract else 'Uber Reducing Rent'
+
+    # MANDATE: If unassigned or yard status without active driver, partner_id is empty
+    if not is_billable or attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
+        partner_id = ''
+
+    # Primary condition for charging daily rent is successful trip activity (>0)
     if (float(weekly_trips or 0) > 0 or float(ola_trips or 0) > 0):
         is_billable = True
         if attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
             attendance_status = 'Active'
 
-    # Non-billable attendance status (Maintenance, Breakdown, RFD, Drop-Off) ONLY applies if trips == 0
-    if not is_billable:
+    # Tier 1: Non-billable attendance status -> ₹0.00
+    if not is_billable or partner_id == '':
         return (
-            log_date, week_id, veh_clean, partner_id, city, model,
+            log_date, week_id, v_clean, partner_id, city, actual_model,
             attendance_status, False, weekly_trips, 0.00, 0.00, 0.00,
             f"Non-billable status: {attendance_status}"
         )
 
-    # Priority 1: Custom partner deal override
-    if custom_rent is not None and custom_rent > 0:
-        applied_rent = float(custom_rent)
-        calc_rule = f"Priority 1: Partner Contract ({applied_rent}/day)"
-    # Priority 2: Multi-app Ola Penalty (Bangalore)
-    elif 'bengaluru' in city.lower() and float(ola_trips or 0) >= 1.0 and 'operator' not in plan_scheme.lower():
-        applied_rent = 1050.00
-        calc_rule = "Priority 2: Ola Multi-App Penalty Base Rate (1050/day)"
-    # Priority 2: Standard Plan Slab lookup
-    else:
-        driver_type = 'Operator' if ('operator' in plan_scheme.lower() or 'fleet' in plan_scheme.lower()) else 'Individual'
-        applied_rent = None
-        calc_rule = None
-        
-        for slab in slabs_list:
-            # City match
-            if slab['city'].lower() not in city.lower() and city.lower() not in slab['city'].lower():
-                continue
-            # Model match
-            model_first_token = model.split()[0].lower()
-            if model_first_token not in slab['vehicle_model'].lower() and slab['vehicle_model'].lower() not in model.lower():
-                continue
-            # Driver type match
-            if slab['driver_type'] != 'All' and slab['driver_type'].lower() != driver_type.lower():
-                continue
-            # Trip threshold match
-            min_t = slab['min_trips']
-            max_t = slab['max_trips'] if slab['max_trips'] is not None else 9999
-            if min_t <= weekly_trips <= max_t:
-                applied_rent = float(slab['daily_rent'])
-                calc_rule = f"Priority 2: Slab Tier {slab['trip_slab_label']} ({applied_rent}/day)"
-                break
+    # --- MUMBAI PLAN LOGIC ---
+    # In Mumbai, Daily Revenue Share = (Plan Rate) + 30 Indemnity baked in.
+    # To maintain 100% exact parity with Mumbai Ops Sheet, applied_daily_rent stores the merged rate and indemnity = 0.00.
+    if 'mumbai' in city.lower():
+        if 'dzire' in actual_model.lower():
+            applied_rent = 1130.00  # 1100 base + 30 indemnity
+            calc_rule = "Priority 1: Mumbai Dzire Standard Rate (1100 + 30 = 1130/day)"
+        elif custom_rent is not None and custom_rent > 0:
+            applied_rent = float(custom_rent)
+            calc_rule = f"Priority 1: Mumbai Partner Rate Card ({applied_rent}/day)"
+        else:
+            applied_rent = 1000.00  # 970 + 30 default base
+            for slab in slabs_list:
+                if 'mumbai' in slab['city'].lower() and 'wagon' in slab['vehicle_model'].lower():
+                    min_t = slab['min_trips']
+                    max_t = slab['max_trips'] if slab['max_trips'] is not None else 9999
+                    if min_t <= weekly_trips <= max_t:
+                        applied_rent = float(slab['daily_rent']) + 30.00
+                        calc_rule = f"Priority 2: Mumbai Dynamic Slab ({applied_rent}/day)"
+                        break
+            calc_rule = calc_rule or "Priority 3: Mumbai Fallback Base (1000/day)"
+        applied_indemnity = 0.00
+        net_daily = applied_rent
 
-        if applied_rent is None:
-            if 'hyderabad' in city.lower():
-                if 'wagon' in model.lower(): applied_rent = 1050.00
-                elif 'dzire' in model.lower(): applied_rent = 1200.00
-                elif 'xcent' in model.lower(): applied_rent = 0.00
-                elif 'ec3' in model.lower(): applied_rent = 1400.00
+    # --- HYDERABAD & BENGALURU PLAN LOGIC ---
+    else:
+        # Priority 1: Partner Exception Card
+        if custom_rent is not None and custom_rent > 0:
+            applied_rent = float(custom_rent)
+            calc_rule = f"Priority 1: Partner Exception Card ({applied_rent}/day)"
+        # Priority 2: Multi-app Ola Penalty (Bangalore)
+        elif 'bengaluru' in city.lower() and float(ola_trips or 0) >= 1.0 and 'operator' not in plan_scheme.lower():
+            applied_rent = 1050.00
+            calc_rule = "Priority 2: Ola Multi-App Penalty Base Rate (1050/day)"
+        # Priority 3: Dynamic Slabs (TBS / EBS)
+        else:
+            driver_type = 'Operator' if ('operator' in plan_scheme.lower() or 'fleet' in plan_scheme.lower()) else 'Individual'
+            applied_rent = None
+            calc_rule = None
+            for slab in slabs_list:
+                if slab['city'].lower() not in city.lower() and city.lower() not in slab['city'].lower():
+                    continue
+                model_first_token = actual_model.split()[0].lower()
+                if model_first_token not in slab['vehicle_model'].lower() and slab['vehicle_model'].lower() not in actual_model.lower():
+                    continue
+                if slab['driver_type'] != 'All' and slab['driver_type'].lower() != driver_type.lower():
+                    continue
+                min_t = slab['min_trips']
+                max_t = slab['max_trips'] if slab['max_trips'] is not None else 9999
+                if min_t <= weekly_trips <= max_t:
+                    applied_rent = float(slab['daily_rent'])
+                    calc_rule = f"Priority 3: Slab Tier {slab['trip_slab_label']} ({applied_rent}/day)"
+                    break
+            
+            if applied_rent is None:
+                if 'ec3' in actual_model.lower() or 'ev' in actual_model.lower(): applied_rent = 1400.00
+                elif 'dzire' in actual_model.lower(): applied_rent = 1100.00
+                elif 'xcent' in actual_model.lower(): applied_rent = 0.00 if 'hyderabad' in city.lower() else 550.00
+                elif 'wagon' in actual_model.lower(): applied_rent = 989.00 if 'hyderabad' in city.lower() else 1050.00
                 else: applied_rent = 1050.00
-            elif 'dzire' in model.lower(): applied_rent = 1100.00
-            elif 'ec3' in model.lower() or 'ev' in model.lower(): applied_rent = 1400.00
-            elif 'xcent' in model.lower(): applied_rent = 550.00
-            elif 'wagon' in model.lower(): applied_rent = 989.00
-            else: applied_rent = 1050.00
-            calc_rule = f"Priority 3: Fallback Base ({applied_rent}/day)"
+                calc_rule = f"Priority 4: Fallback Base ({applied_rent}/day)"
 
-    # Indemnity determination
-    if custom_indem is not None:
-        applied_indemnity = float(custom_indem)
-    else:
-        applied_indemnity = 0.00 if 'xcent' in model.lower() else 30.00
-
-    net_daily = applied_rent + applied_indemnity
+        applied_indemnity = 0.00 if 'xcent' in actual_model.lower() else 30.00
+        net_daily = applied_rent + applied_indemnity
 
     return (
-        log_date, week_id, veh_clean, partner_id, city, model,
+        log_date, week_id, v_clean, partner_id, city, actual_model,
         attendance_status, True, weekly_trips, applied_rent, applied_indemnity, net_daily,
         calc_rule
     )
@@ -203,8 +233,8 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
     print("  SYNCING DAILY_RENT_LOG DIRECTLY FROM CORE_DAILY_VEHICLE_STATUS ")
     print("=================================================================\n")
 
-    core_rent_map, slabs_list = load_master_rental_context(cur)
-    print(f"Loaded {len(core_rent_map)} vehicle contracts and {len(slabs_list)} rate card slabs.")
+    partner_veh_map, partner_model_map, veh_model_map, slabs_list = load_master_rental_context(cur)
+    print(f"Loaded {len(partner_veh_map)} vehicle contracts, {len(partner_model_map)} partner model contracts, and {len(slabs_list)} rate card slabs.")
 
     # Determine date window
     cur.execute("""
@@ -287,10 +317,13 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
             is_billable=is_billable,
             weekly_trips=trips,
             ola_trips=0.0,
-            core_rent_map=core_rent_map,
+            partner_veh_map=partner_veh_map,
+            partner_model_map=partner_model_map,
+            veh_model_map=veh_model_map,
             slabs_list=slabs_list,
             fallback_city=row['city'] or 'Bengaluru',
-            fallback_partner=row['partner_id']
+            fallback_partner=row['partner_id'],
+            fallback_model=row['vehicle_model']
         )
         records_dict[(veh_clean, log_date)] = rec
 
