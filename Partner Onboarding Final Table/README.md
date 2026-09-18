@@ -24,7 +24,7 @@ It consolidates incoming partner entries from both operational channels:
 
 ### Consolidated Master Data Flow
 
-`
+`	ext
 +---------------------------------------------------------------------------------+
 |                       Google Sheets Landing Table                               |
 |                     public.sheet_driver_onboarding                              |

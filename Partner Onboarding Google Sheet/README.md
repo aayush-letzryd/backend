@@ -18,7 +18,7 @@ The **LetzRyd Partner Onboarding Google Sheet Pipeline** provides real-time data
 
 ### Operational Data Flow
 
-`
+`	ext
 +---------------------------------------------------------------------------------+
 |                            Pan India Master Sheet                               |
 |                  Tab: 'Onboarding form_V2' (View-Only Access)                   |
@@ -115,8 +115,6 @@ CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
 ---
 
 ## 4. Operational Runbook & Verification Queries
-
-### Run Verification Audit
 
 `sql
 -- Query 4.1: Total records & unique phone numbers in landing table
