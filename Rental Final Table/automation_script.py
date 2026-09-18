@@ -274,39 +274,59 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
 
     print(f"Querying vehicle status from {start_d} to {end_d}...")
 
-    # Query trip counts from core_uber_daily and core_ola_daily for official completed trips in this date window
+    # Query trip counts per (vehicle, partner) for the date window.
+    # This prevents mid-week handovers from pooling trips and wrongly triggering discount slabs.
     cur.execute("""
-        SELECT 
-            UPPER(REPLACE(v.vehicle_number, ' ', '')) AS car_no,
-            COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) AS trip_count
-        FROM (
-            SELECT DISTINCT vehicle_number FROM public.core_daily_vehicle_status WHERE status_date BETWEEN %s AND %s
-        ) v
-        LEFT JOIN (
-            SELECT UPPER(REPLACE(vehicle_number, ' ', '')) AS veh, SUM(completed_trips) AS uber_trips
-            FROM public.core_uber_daily
+        WITH daily_attendance AS (
+            SELECT 
+                cdvs.status_date,
+                UPPER(REPLACE(cdvs.vehicle_number, ' ', '')) AS veh,
+                COALESCE(NULLIF(svs.partner_id, ''), cdvs.partner_id) AS partner_id
+            FROM core_daily_vehicle_status cdvs
+            LEFT JOIN sheet_vehicle_status svs
+                ON svs.vehicle_number = cdvs.vehicle_number
+               AND svs.status_date = cdvs.status_date
+            WHERE cdvs.status_date BETWEEN %s AND %s
+        ),
+        daily_trips AS (
+            SELECT 
+                operational_date AS trip_date,
+                UPPER(REPLACE(vehicle_number, ' ', '')) AS veh,
+                completed_trips AS trips
+            FROM core_uber_daily
             WHERE operational_date BETWEEN %s AND %s
-            GROUP BY UPPER(REPLACE(vehicle_number, ' ', ''))
-        ) u ON UPPER(REPLACE(v.vehicle_number, ' ', '')) = u.veh
-        LEFT JOIN (
-            SELECT UPPER(REPLACE(vehicle_number, ' ', '')) AS veh, SUM(completed_trips) AS ola_trips
-            FROM public.core_ola_daily
+            UNION ALL
+            SELECT 
+                service_date AS trip_date,
+                UPPER(REPLACE(vehicle_number, ' ', '')) AS veh,
+                completed_trips AS trips
+            FROM core_ola_daily
             WHERE service_date BETWEEN %s AND %s
-            GROUP BY UPPER(REPLACE(vehicle_number, ' ', ''))
-        ) o ON UPPER(REPLACE(v.vehicle_number, ' ', '')) = o.veh;
+        )
+        SELECT 
+            a.veh,
+            a.partner_id,
+            SUM(COALESCE(t.trips, 0)) AS total_partner_trips
+        FROM daily_attendance a
+        LEFT JOIN daily_trips t 
+            ON a.veh = t.veh AND a.status_date = t.trip_date
+        GROUP BY a.veh, a.partner_id;
     """, (start_d, end_d, start_d, end_d, start_d, end_d))
+    
     trip_rows = cur.fetchall()
     trip_map = {}
     for r in trip_rows:
         if isinstance(r, dict):
-            k = (r['car_no'] or '').strip().upper()
-            v = r['trip_count']
+            k_veh = (r['veh'] or '').strip().upper()
+            k_partner = (r['partner_id'] or '').strip()
+            v = r['total_partner_trips']
         else:
-            k = (r[0] or '').strip().upper()
-            v = r[1]
-        if k:
-            trip_map[k] = float(v or 0)
-    print(f"Loaded trip counts for {len(trip_map)} vehicles from uber_pipeline_trips.")
+            k_veh = (r[0] or '').strip().upper()
+            k_partner = (r[1] or '').strip()
+            v = r[2]
+        if k_veh and k_partner:
+            trip_map[(k_veh, k_partner)] = float(v or 0)
+    print(f"Loaded trip counts for {len(trip_map)} (vehicle, partner) pairings.")
 
     # Query attendance — LEFT JOIN sheet_vehicle_status to get the billing partner_id
     # that the Excel Hisaab uses directly (sheet_vehicle_status.partner_id = NULL means non-billable).
@@ -340,7 +360,8 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
         week_id = f"CY{log_date.strftime('%y')}WK{log_date.isocalendar()[1]:02d}"
         status = row['attendance_status']
         is_billable = bool(row['billable_rent_day'])
-        trips = trip_map.get(veh_clean, 0)
+        partner_for_trips = (row['partner_id'] or '').strip()
+        trips = trip_map.get((veh_clean, partner_for_trips), 0)
         
         rec = calculate_single_vehicle_day(
             veh_clean=veh_clean,
