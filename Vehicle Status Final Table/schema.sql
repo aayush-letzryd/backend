@@ -228,7 +228,7 @@ DECLARE
     v_alloc_today RECORD;
     v_drop_today RECORD;
     v_recent_drop RECORD;
-    v_alloc_after_drop RECORD;
+    v_alloc_after_drop_id BIGINT := NULL;
     v_cm RECORD;
     v_svs RECORD;
     v_ti RECORD;
@@ -302,9 +302,10 @@ BEGIN
     ORDER BY return_date DESC, id DESC LIMIT 1;
 
     -- Allocation occurring AFTER recent dropoff up to today
+    v_alloc_after_drop_id := NULL;
     IF v_recent_drop.id IS NOT NULL THEN
         SELECT id
-        INTO v_alloc_after_drop
+        INTO v_alloc_after_drop_id
         FROM public.core_vehicle_allocation
         WHERE is_deleted = FALSE AND vehicle_number = p_vehicle_number 
           AND allocation_date >= v_recent_drop.return_date AND allocation_date <= p_target_date
@@ -434,7 +435,7 @@ BEGIN
         v_waive_reason := 'DROPOFF_INSPECTION';
         v_source_origin := 'DROPOFF_EVENT';
 
-    ELSIF v_recent_drop.id IS NOT NULL AND v_alloc_after_drop.id IS NULL THEN
+    ELSIF v_recent_drop.id IS NOT NULL AND v_alloc_after_drop_id IS NULL THEN
         IF v_recent_drop.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN
             v_final_status := 'Maintenance';
             v_cohort := 'Off Road';
