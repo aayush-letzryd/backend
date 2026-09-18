@@ -1,39 +1,67 @@
-﻿# LetzRyd Partner Onboarding Live Pipeline - Knowledge Transfer Documentation
+# LetzRyd Partner Onboarding Live Pipeline - Knowledge Transfer Documentation
 
-Target Database: YOUR_DB_HOST_HERE:5432  
-Database Name: postgres  
-Target Landing Table: public.sheet_driver_onboarding  
-Source Google Sheet Tab: Onboarding form_V2 (from Pan India Master Sheet)  
-Clean Intermediate Sheet Tab: sheet_driver_onboarding  
-Technology Stack: Google Apps Script (JavaScript), PostgreSQL 14+, JDBC  
-
----
-
-## 1. Executive Summary & Overview
-
-The **LetzRyd Partner Onboarding Google Sheet Pipeline** provides automated data ingestion, multi-field standardization, and zero-burn upserts for all driver-partner onboarding submissions from Google Sheets into the public.sheet_driver_onboarding PostgreSQL landing table.
-
-### Primary System Guarantees
-- **Direct Background Pulling**: Bypasses formula cell freeze and IMPORTRANGE limitations using Apps Script openByUrl().
-- **Micro-Batch JDBC Engine**: Ingests data using parameterized batching (BATCH_SIZE = 5) with row-level error fallback, preventing SQL size limit exceptions.
-- **IST Timestamp Contract**: Stored as clean TIMESTAMP WITHOUT TIME ZONE in Indian Standard Time (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata').
-- **Deterministic Canonical Partner IDs**: Validated pattern ^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$.
-- **47-Issue Data Hygiene**: Cleans OCR errors, DL expiry date strings, phone floats/scientific notation, and text case.
+| System Metadata | Details |
+|---|---|
+| **Target Database Host** | YOUR_DB_HOST_HERE:5432 |
+| **Database Engine** | PostgreSQL 14+ |
+| **Database Name** | postgres |
+| **Target Landing Table** | public.sheet_driver_onboarding |
+| **Source Master Sheet** | Pan India Master Sheet (Tab: Onboarding form_V2) |
+| **Clean Intermediate Tab** | sheet_driver_onboarding |
+| **Technology Stack** | Google Apps Script (JavaScript), PostgreSQL JDBC |
 
 ---
 
-## 2. Directory Contents
+## 1. Executive Summary & Architecture Overview
+
+The **LetzRyd Partner Onboarding Google Sheet Pipeline** provides real-time data ingestion, multi-field standardization, and zero-burn upserts for all driver-partner onboarding records coming from Google Sheets into the PostgreSQL public.sheet_driver_onboarding landing table.
+
+### Operational Data Flow
+
+`
++---------------------------------------------------------------------------------+
+|                            Pan India Master Sheet                               |
+|                  Tab: 'Onboarding form_V2' (View-Only Access)                   |
++---------------------------------------------------------------------------------+
+                                         |
+                                         | Direct Apps Script Background Pull
+                                         | (openByUrl - No IMPORTRANGE dependency)
+                                         v
++---------------------------------------------------------------------------------+
+|                         Google Apps Script Pipeline Engine                      |
+|                  - 47-Issue Standardization (ISS-16 to ISS-62)                  |
+|                  - Micro-Batch JDBC Upserts (BATCH_SIZE = 5)                    |
+|                  - Headless UI Safety & Row-Level Fallback                      |
++---------------------------------------------------------------------------------+
+                     |                                           |
+                     v                                           v
++------------------------------------------+   +----------------------------------+
+|           Editable Google Sheet          |   |        PostgreSQL Database       |
+|       Tab: sheet_driver_onboarding       |   |  Table: sheet_driver_onboarding  |
++------------------------------------------+   +----------------------------------+
+`
+
+### Key Engineering Guarantees
+- **Direct Background Pulling**: Eliminates formula freeze and cell limit issues by reading directly in memory via openByUrl().
+- **Micro-Batch JDBC Engine**: Processes rows using parameterized batching (BATCH_SIZE = 5) with row-level error fallback, preventing SQL statement size limit exceptions (Argument too large: sql).
+- **IST Timestamp Contract**: Timestamps are stored as clean TIMESTAMP WITHOUT TIME ZONE in Indian Standard Time (Asia/Kolkata).
+- **Deterministic Canonical Partner IDs**: Validated company-wide pattern ^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$.
+- **47-Issue Data Hygiene**: Automatically sanitizes OCR errors, DL expiry date strings, phone number floats/scientific notation, text case formatting, and missing documents.
+
+---
+
+## 2. Directory Structure & Key Artifacts
 
 | File | Description |
 |---|---|
 | [partner_onboarding_pipeline_appscript.js](./partner_onboarding_pipeline_appscript.js) | Production Google Apps Script engine featuring 1-minute automated polling, 47-issue standardization engine, micro-batch JDBC upsert, and headless UI safety. |
-| [schema.sql](./schema.sql) | PostgreSQL DDL definitions for sheet_driver_onboarding, performance indexes, and verification queries. |
-| [data_issues.md](./data_issues.md) | Comprehensive audit of all 47 data quality anomalies (ISS-16 through ISS-62) from Master_Issue_Standardization_Catalog.xlsx and their programmatic transformations. |
+| [schema.sql](./schema.sql) | PostgreSQL DDL definitions for public.sheet_driver_onboarding, performance indexes, and operational verification queries. |
+| [data_issues.md](./data_issues.md) | Comprehensive audit of all 47 data quality anomalies (ISS-16 through ISS-62) from Master_Issue_Standardization_Catalog.xlsx and their exact programmatic transformations. |
 | [README.md](./README.md) | Complete Knowledge Transfer (KT) document, system architecture, and operational runbook. |
 
 ---
 
-## 3. Database Schema: public.sheet_driver_onboarding
+## 3. Database Schema DDL: public.sheet_driver_onboarding
 
 `sql
 CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
@@ -86,9 +114,12 @@ CREATE TABLE IF NOT EXISTS public.sheet_driver_onboarding (
 
 ---
 
-## 4. Verification Queries
+## 4. Operational Runbook & Verification Queries
+
+### Run Verification Audit
 
 `sql
+-- Query 4.1: Total records & unique phone numbers in landing table
 SELECT 
     count(*) AS total_rows,
     count(DISTINCT driver_phone) AS unique_phone_count,
@@ -96,4 +127,10 @@ SELECT
     max(id) AS max_id,
     max(submission_timestamp) AS latest_submission
 FROM public.sheet_driver_onboarding;
+
+-- Query 4.2: City distribution in landing staging
+SELECT city, count(*) AS total_records
+FROM public.sheet_driver_onboarding
+GROUP BY city
+ORDER BY total_records DESC;
 `
