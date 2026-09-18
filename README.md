@@ -20,13 +20,13 @@ This repository hosts production scripts, architecture specifications, database 
 ---
 
 ### 2. [Partner Onboarding Google Sheet](./Partner%20Onboarding%20Google%20Sheet/)
-- **Description**: Direct real-time data pipeline and cross-sheet extraction without IMPORTRANGE, synchronizing driver KYC onboarding records (`Onboarding form_V2`) and portal submissions (`july_form_onboarding`) into `public.core_partner_onboarding`.
+- **Description**: Real-time automated data ingestion pipeline synchronizing driver KYC onboarding records (Onboarding form_V2) from the Pan India Master Sheet into the PostgreSQL landing table public.sheet_driver_onboarding.
 - **Key Files**:
-  - [`partner_onboarding_pipeline_appscript.js`](./Partner%20Onboarding%20Google%20Sheet/partner_onboarding_pipeline_appscript.js): Google Apps Script engine for cross-sheet pulling, 47-issue standardization, and PostgreSQL zero-burn upserts.
-  - [`schema.sql`](./Partner%20Onboarding%20Google%20Sheet/schema.sql): PostgreSQL DDL for `sheet_driver_onboarding`, `core_partner_onboarding`, and the automated consolidation procedure `refresh_core_partner_onboarding()`.
-  - [`data_issues.md`](./Partner%20Onboarding%20Google%20Sheet/data_issues.md): Comprehensive data quality audit documenting all 47 identified anomalies (ISS-16 through ISS-62) from `Master_Issue_Standardization_Catalog.xlsx`.
-  - [`README.md`](./Partner%20Onboarding%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document and operational runbook.
-- **Target Tables**: `public.sheet_driver_onboarding` + `public.july_form_onboarding` $\to$ `public.core_partner_onboarding`
+  - [partner_onboarding_pipeline_appscript.js](./Partner%20Onboarding%20Google%20Sheet/partner_onboarding_pipeline_appscript.js): Production Google Apps Script engine for background pulling, 47-issue standardization, and micro-batch JDBC upserts.
+  - [schema.sql](./Partner%20Onboarding%20Google%20Sheet/schema.sql): PostgreSQL DDL for public.sheet_driver_onboarding landing table, B-Tree indexes, and verification queries.
+  - [data_issues.md](./Partner%20Onboarding%20Google%20Sheet/data_issues.md): Comprehensive data quality audit documenting all 47 identified anomalies (ISS-16 through ISS-62) from Master_Issue_Standardization_Catalog.xlsx.
+  - [README.md](./Partner%20Onboarding%20Google%20Sheet/README.md): Exhaustive Knowledge Transfer (KT) document and operational runbook for Google Sheet ingestion.
+- **Target Table**: public.sheet_driver_onboarding
 
 ---
 
@@ -240,6 +240,24 @@ This repository hosts production scripts, architecture specifications, database 
   - Real-time driver and custody enrichment: Ingestion triggers dynamically stamp `partner_id`, `partner_name`, `driver_phone`, `vehicle_status`, and `cohort` from `core_daily_vehicle_status`.
   - Unauthorized idle movement alert: Instant flags for vehicles clocking > 5.0 km while in yard (`RFD`) or workshop (`Maintenance`).
   - Zero-burn continuous sequence: 37,548 gapless records spanning 6,281,304.58 total fleet kilometers.
+
+---
+
+### 19. [Partner Onboarding Final Table](./Partner%20Onboarding%20Final%20Table/)
+- **Description**: Real-time unified master Single Source of Truth (public.core_partner_onboarding) consolidating driver-partner registrations across Google Sheets (sheet_driver_onboarding) and the Web Portal (july_form_onboarding).
+- **Key Files**:
+  - [schema.sql](./Partner%20Onboarding%20Final%20Table/schema.sql): PostgreSQL DDL for public.core_partner_onboarding, filtered view ctive_core_partner_onboarding, advisory locks (777111222), real-time triggers (	rg_sheet_driver_onboarding_sync, 	rg_july_form_onboarding_sync), and consolidation procedure 
+efresh_core_partner_onboarding().
+  - [data_issues.md](./Partner%20Onboarding%20Final%20Table/data_issues.md): Master audit catalog of all 47 data quality anomalies, document extraction fixes, and standardization rules.
+  - [README.md](./Partner%20Onboarding%20Final%20Table/README.md): Master architecture documentation, trigger specifications, and operational runbook.
+- **Target Table**: public.core_partner_onboarding (Active View: public.active_core_partner_onboarding)
+- **Primary Features**:
+  - Unified Single Source of Truth on unique driver phone number.
+  - Gapless sequential primary key (id allocated via advisory lock pg_advisory_xact_lock(777111222)).
+  - Native PostgreSQL triggers providing instant live synchronization (<10ms).
+  - Source origin tracking (GOOGLE_SHEET, PORTAL_FORM, MERGED).
+  - Permanent archival & non-destructive soft deletes (is_deleted = TRUE).
+  - Canonical Partner ID enforcement (^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$).
 
 ---
 
