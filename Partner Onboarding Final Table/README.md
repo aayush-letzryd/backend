@@ -24,7 +24,7 @@ It consolidates incoming partner entries from both operational channels:
 
 ### Consolidated Master Data Flow
 
-`	ext
+```text
 +---------------------------------------------------------------------------------+
 |                       Google Sheets Landing Table                               |
 |                     public.sheet_driver_onboarding                              |
@@ -58,7 +58,7 @@ It consolidates incoming partner entries from both operational channels:
 |                     public.active_core_partner_onboarding                       |
 |                          (WHERE is_deleted = FALSE)                             |
 +---------------------------------------------------------------------------------+
-`
+```
 
 ### Key Engineering Guarantees
 - **Gapless Sequential Primary Key**: Sequence allocation governed by transactional advisory locking (pg_advisory_xact_lock(777111222)) guaranteeing continuous id (1..N) without sequence burning or gaps.

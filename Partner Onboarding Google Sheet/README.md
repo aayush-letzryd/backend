@@ -18,7 +18,7 @@ The **LetzRyd Partner Onboarding Google Sheet Pipeline** provides real-time data
 
 ### Operational Data Flow
 
-`	ext
+```text
 +---------------------------------------------------------------------------------+
 |                            Pan India Master Sheet                               |
 |                  Tab: 'Onboarding form_V2' (View-Only Access)                   |
@@ -39,7 +39,7 @@ The **LetzRyd Partner Onboarding Google Sheet Pipeline** provides real-time data
 |           Editable Google Sheet          |   |        PostgreSQL Database       |
 |       Tab: sheet_driver_onboarding       |   |  Table: sheet_driver_onboarding  |
 +------------------------------------------+   +----------------------------------+
-`
+```
 
 ### Key Engineering Guarantees
 - **Direct Background Pulling**: Eliminates formula freeze and cell limit issues by reading directly in memory via openByUrl().
