@@ -114,15 +114,26 @@ def calculate_single_vehicle_day(
     custom_rent = contract['custom_daily_rent'] if contract else None
     plan_scheme = contract['plan_scheme'] if contract else 'Uber Reducing Rent'
 
-    # MANDATE: If unassigned or yard status without active driver, partner_id is empty
-    if not is_billable or attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
+    # MANDATE: Unconditionally zero-rent statuses (Yard / Unassigned / Dropoff / RFD) always clear partner.
+    # Maintenance/Breakdown/Accident CAN be billable when Ops explicitly sets billable_rent_day = True.
+    UNCONDITIONAL_ZERO_STATUSES = ('Drop Off', 'Drop-off', 'RFD', 'Unassigned')
+    CONDITIONAL_ZERO_STATUSES   = ('Maintenance', 'Breakdown', 'Accident')
+
+    if attendance_status in UNCONDITIONAL_ZERO_STATUSES:
+        # Yard / Drop-off vehicles are NEVER billable regardless of billable_rent_day
+        partner_id = ''
+        is_billable = False
+    elif not is_billable and attendance_status in CONDITIONAL_ZERO_STATUSES:
+        # Maintenance/Breakdown/Accident are zero-rent only when Ops did NOT mark them billable
         partner_id = ''
 
-    # Primary condition for charging daily rent is successful trip activity (>0)
+    # Primary condition for charging daily rent is successful trip activity (>0) — overrides non-billable
     if (float(weekly_trips or 0) > 0 or float(ola_trips or 0) > 0):
         is_billable = True
-        if attendance_status in ('Maintenance', 'Breakdown', 'Accident', 'Drop Off', 'Drop-off', 'RFD', 'Unassigned'):
-            attendance_status = 'Active'
+        if attendance_status in UNCONDITIONAL_ZERO_STATUSES:
+            attendance_status = 'Active'  # Trips override yard/RFD status
+        elif attendance_status in CONDITIONAL_ZERO_STATUSES:
+            attendance_status = 'Active'  # Trips override maintenance status
 
     # Tier 1: Non-billable attendance status -> ₹0.00
     if not is_billable or partner_id == '':
@@ -166,9 +177,19 @@ def calculate_single_vehicle_day(
         elif 'bengaluru' in city.lower() and float(ola_trips or 0) >= 1.0 and 'operator' not in plan_scheme.lower():
             applied_rent = 1050.00
             calc_rule = "Priority 2: Ola Multi-App Penalty Base Rate (1050/day)"
-        # Priority 3: Dynamic Slabs (TBS / EBS)
+        # Priority 3: Dynamic Slabs (TBS / EBS / LIP / Uber Reducing Rent)
         else:
             driver_type = 'Operator' if ('operator' in plan_scheme.lower() or 'fleet' in plan_scheme.lower()) else 'Individual'
+            # Determine target slab plan_scheme based on the contract's plan type.
+            # LIP, Uber TBS, Uber Reducing Rent, D2R, D2O → use 'Uber Reducing Rent' slabs (reducing tiers).
+            # All Platform Flat / Operator Custom Flat → use 'All Platform' slab.
+            # Default to 'Uber Reducing Rent' when no contract exists (unknown partner defaults to reducing tier).
+            ps_lower = plan_scheme.lower()
+            if any(k in ps_lower for k in ('all platform', 'operator custom flat')):
+                target_slab_scheme = 'All Platform'
+            else:
+                target_slab_scheme = 'Uber Reducing Rent'
+
             applied_rent = None
             calc_rule = None
             for slab in slabs_list:
@@ -178,6 +199,10 @@ def calculate_single_vehicle_day(
                 if model_first_token not in slab['vehicle_model'].lower() and slab['vehicle_model'].lower() not in actual_model.lower():
                     continue
                 if slab['driver_type'] != 'All' and slab['driver_type'].lower() != driver_type.lower():
+                    continue
+                # Only match slabs for the correct plan_scheme (prevents 'All Platform' 1050 slab from
+                # overriding 'Uber Reducing Rent' 989 slab for LIP/TBS/D2R/D2O partners).
+                if slab.get('plan_scheme') and slab['plan_scheme'] != target_slab_scheme:
                     continue
                 min_t = slab['min_trips']
                 max_t = slab['max_trips'] if slab['max_trips'] is not None else 9999
@@ -283,19 +308,27 @@ def sync_from_core_daily_vehicle_status(cur, conn, start_date_str=None, end_date
             trip_map[k] = float(v or 0)
     print(f"Loaded trip counts for {len(trip_map)} vehicles from uber_pipeline_trips.")
 
-    # Query attendance
+    # Query attendance — LEFT JOIN sheet_vehicle_status to get the billing partner_id
+    # that the Excel Hisaab uses directly (sheet_vehicle_status.partner_id = NULL means non-billable).
+    # core_daily_vehicle_status forward-fills partner_id from allocation, which can differ from the
+    # Excel source-of-truth on Maintenance days where the sheet has no partner assigned.
     cur.execute("""
         SELECT 
-            status_date AS log_date,
-            vehicle_number,
-            city,
-            car_model AS vehicle_model,
-            partner_id,
-            final_status AS attendance_status,
-            billable_rent_day
-        FROM core_daily_vehicle_status
-        WHERE status_date BETWEEN %s AND %s
-        ORDER BY status_date, vehicle_number;
+            cdvs.status_date AS log_date,
+            cdvs.vehicle_number,
+            cdvs.city,
+            cdvs.car_model AS vehicle_model,
+            -- Use sheet_vehicle_status.partner_id as the billing partner (Excel source of truth).
+            -- Fall back to cdvs.partner_id only when the sheet has no row for that day.
+            COALESCE(NULLIF(svs.partner_id, ''), cdvs.partner_id) AS partner_id,
+            cdvs.final_status AS attendance_status,
+            cdvs.billable_rent_day
+        FROM core_daily_vehicle_status cdvs
+        LEFT JOIN sheet_vehicle_status svs
+            ON svs.vehicle_number = cdvs.vehicle_number
+           AND svs.status_date = cdvs.status_date
+        WHERE cdvs.status_date BETWEEN %s AND %s
+        ORDER BY cdvs.status_date, cdvs.vehicle_number;
     """, (start_d, end_d))
     status_rows = cur.fetchall()
     print(f"Found {len(status_rows)} daily attendance records in core_daily_vehicle_status.\n")
