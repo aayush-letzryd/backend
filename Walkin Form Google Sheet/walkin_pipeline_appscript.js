@@ -30,7 +30,7 @@ const DB_CONFIG = {
   password: "YOUR_DB_PASSWORD_HERE",
   
   // Optional URL if running in a standalone script bound to another file:
-  sheetUrl: "YOUR_SPREADSHEET_URL_HERE",
+  sheetUrl: "https://docs.google.com/spreadsheets/d/1vKz6g6JI8g7Px2ilaaT_QphHHtwSJ5IFYvu_BGRYypw/edit?usp=sharing",
   
   // Target tab name:
   sheetName: "walkin_form"
