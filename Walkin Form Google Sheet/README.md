@@ -102,15 +102,18 @@ flowchart TD
 
 ## 3. Step-by-Step Working Process
 
-### 3.1 The Original Master Google Sheet
-The original master sheet is maintained by on-ground field executives across branches (Hyderabad, Bengaluru, Mumbai). Frontline executives submit responses either through connected Google Forms or direct table entries. This sheet is access-restricted to operational staff.
+### 3.1 The Original Master Google Sheet (Source Sheet)
+The original operational sheet where on-ground field executives enter walk-in partner data across branches (Hyderabad, Bengaluru, Mumbai) or through connected Google Forms.
+- **Source Sheet URL**: [LetzRyd Walk-in Master Source](https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit?gid=2075911242#gid=2075911242)
+- **Access Model**: Operational staff only. The development/engineering team does not have edit access to this source sheet, which is why a secondary bridge sheet was provisioned to run the ingestion automation.
 
-### 3.2 The Secondary Data Hub Google Sheet
-Because direct production database credentials must not be exposed in user-facing operational sheets, a dedicated Secondary Data Hub Google Sheet is provisioned.
+### 3.2 The Secondary Data Hub Google Sheet (Execution Pipeline Sheet)
+Because we do not have edit access to the source sheet, and direct production database credentials must not be exposed in user-facing operational sheets, a dedicated Secondary Data Hub Google Sheet is provisioned where the automation code runs.
+- **Secondary Execution Sheet URL**: [LetzRyd Staging & Pipeline Hub](https://docs.google.com/spreadsheets/d/1vKz6g6JI8g7Px2ilaaT_QphHHtwSJ5IFYvu_BGRYypw/edit?usp=sharing)
 - Tab Name: `walkin_form`
 - Data Ingestion: Ingests all records dynamically using the formula:
   ```excel
-  =IMPORTRANGE("https://docs.google.com/spreadsheets/d/<MASTER_SHEET_ID>/edit", "Form Responses 1!A:K")
+  =IMPORTRANGE("https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit", "Form Responses 1!A:K")
   ```
 - This architecture isolates end-user operations from database write pipelines, preventing accidental code modification or unauthorized credential disclosure.
 
