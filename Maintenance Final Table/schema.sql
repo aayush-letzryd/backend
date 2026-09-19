@@ -312,6 +312,7 @@ DECLARE
     v_ins_disc NUMERIC(12, 2);
     v_payable NUMERIC(12, 2);
     v_status VARCHAR(50);
+    v_attrs JSONB := '{}'::jsonb;
 BEGIN
     -- Handle Soft Delete
     IF TG_OP = 'DELETE' THEN
@@ -334,6 +335,10 @@ BEGIN
     v_in_kms := public.fn_parse_maintenance_int(NEW.vehicle_k_m_s);
     v_ins_claimed := CASE WHEN LOWER(TRIM(COALESCE(NEW.insurance_claimed, ''))) IN ('yes', 'true', '1') THEN TRUE ELSE FALSE END;
 
+    IF v_clean_veh IN ('TEST', 'TESTVEHICLE', 'ROLLERTEST') OR v_clean_veh ILIKE '%TEST%' THEN
+        v_attrs := jsonb_set(v_attrs, '{is_test}', 'true'::jsonb);
+    END IF;
+
     -- Check for paired outward release in july_maintenance_out
     SELECT * INTO v_out FROM public.july_maintenance_out WHERE inward_id = NEW.id ORDER BY id DESC LIMIT 1;
     IF FOUND THEN
@@ -343,11 +348,14 @@ BEGIN
             v_end_date := v_start_date; -- Non-negative duration enforcement
         END IF;
         v_out_kms := public.fn_parse_maintenance_int(v_out.vehicle_out_k_m_s);
+        IF v_in_kms IS NOT NULL AND v_out_kms IS NOT NULL AND v_out_kms < v_in_kms THEN
+            v_attrs := jsonb_set(v_attrs, '{odometer_warning}', to_jsonb(format('Outward odometer (%s) lower than intake odometer (%s)', v_out_kms, v_in_kms)));
+        END IF;
         v_inv_date := public.fn_parse_maintenance_date(v_out.invoice_date);
         v_inv_amt := public.fn_parse_maintenance_numeric(v_out.invoice_amount);
         v_ins_disc := public.fn_parse_maintenance_numeric(v_out.insurance_liability_discounts);
         v_payable := public.fn_parse_maintenance_numeric(v_out.letzryd_payable);
-        v_status := COALESCE(v_out.final_status, 'COMPLETED_RFD');
+        v_status := COALESCE(v_out.final_status, 'Completed & RFD');
     ELSE
         v_end_date := NULL;
         v_out_dt := NULL;
@@ -362,7 +370,7 @@ BEGIN
     -- Acquire Advisory Lock for Gapless ID Assignment
     PERFORM pg_advisory_xact_lock(888999111);
 
-    -- Check if record already exists in core_maintenance
+    -- 1. If record already exists by portal_maintenance_in_id, update it
     IF EXISTS (SELECT 1 FROM public.core_maintenance WHERE portal_maintenance_in_id = NEW.id) THEN
         UPDATE public.core_maintenance SET
             source_type = 'WEB_PORTAL',
@@ -401,10 +409,79 @@ BEGIN
             damage_photos = NEW.vehicle_damage_photos,
             outward_photos = v_out.vehicle_out_photos,
             invoice_file = v_out.invoice_file,
+            extra_attributes = COALESCE(extra_attributes, '{}'::jsonb) || v_attrs,
             is_deleted = FALSE,
             deleted_at = NULL,
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE portal_maintenance_in_id = NEW.id;
+
+    -- 2. PORTAL PRECEDENCE: If an active GOOGLE_SHEET record already exists for this vehicle & date, upgrade it in-place
+    ELSIF EXISTS (
+        SELECT 1 FROM public.core_maintenance 
+        WHERE vehicle_number = v_clean_veh 
+          AND source_type = 'GOOGLE_SHEET' 
+          AND is_deleted = FALSE 
+          AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date))
+    ) THEN
+        UPDATE public.core_maintenance SET
+            source_type = 'WEB_PORTAL',
+            portal_maintenance_in_id = NEW.id,
+            portal_maintenance_out_id = v_out.id,
+            city = v_clean_city,
+            vehicle_location = NEW.vehicle_location,
+            start_date = v_start_date,
+            end_date = v_end_date,
+            in_date_time = v_in_dt,
+            out_date_time = v_out_dt,
+            estimated_delivery_date = v_est_delivery,
+            rfd_date = v_end_date,
+            maintenance_status = v_status,
+            cohort = 'Off Road',
+            repair_type = NEW.repair_type,
+            workshop_name = NEW.workshop_name,
+            in_kms = v_in_kms,
+            out_kms = v_out_kms,
+            remarks = COALESCE(NEW.remarks, v_out.remarks),
+            estimated_amount = v_est_amt,
+            invoice_no = v_out.invoice_no,
+            invoice_date = v_inv_date,
+            invoice_amount = v_inv_amt,
+            insurance_claimed = v_ins_claimed,
+            insurance_brokerage = NEW.insurance_brokerage,
+            claim_number = NEW.claim_number,
+            insurance_liability_discounts = v_ins_disc,
+            letzryd_payable = v_payable,
+            type_of_payment = v_out.type_of_payment,
+            payment_status = v_out.payment_status,
+            utr_no = v_out.utr_no,
+            approved_by = COALESCE(NEW.approved_by, v_out.approved_by),
+            approval_date = COALESCE(v_appr_date, public.fn_parse_maintenance_date(v_out.approval_date)),
+            approval_file = COALESCE(NEW.approval_file, v_out.approval_file),
+            damage_photos = NEW.vehicle_damage_photos,
+            outward_photos = v_out.vehicle_out_photos,
+            invoice_file = v_out.invoice_file,
+            extra_attributes = COALESCE(extra_attributes, '{}'::jsonb) || v_attrs,
+            is_deleted = FALSE,
+            deleted_at = NULL,
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+        WHERE vehicle_number = v_clean_veh 
+          AND source_type = 'GOOGLE_SHEET' 
+          AND is_deleted = FALSE 
+          AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date));
+
+        -- Soft-delete any redundant subsequent-day sheet records covered by this portal repair window
+        UPDATE public.core_maintenance
+        SET is_deleted = TRUE,
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            extra_attributes = jsonb_set(COALESCE(extra_attributes, '{}'::jsonb), '{superseded_by_portal}', to_jsonb(NEW.id))
+        WHERE vehicle_number = v_clean_veh
+          AND source_type = 'GOOGLE_SHEET'
+          AND is_deleted = FALSE
+          AND start_date > v_start_date
+          AND (v_end_date IS NULL OR start_date <= v_end_date);
+
+    -- 3. Otherwise, assign next gapless ID and insert
     ELSE
         SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_maintenance;
 
@@ -418,7 +495,7 @@ BEGIN
             insurance_claimed, insurance_brokerage, claim_number, insurance_liability_discounts, letzryd_payable,
             type_of_payment, payment_status, utr_no, approved_by, approval_date,
             approval_file, damage_photos, outward_photos, invoice_file,
-            is_deleted, deleted_at, created_at, updated_at
+            extra_attributes, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
             v_next_id, 'WEB_PORTAL', NEW.id, v_out.id, NULL,
             v_clean_veh, v_clean_city, NEW.vehicle_location, NULL,
@@ -429,7 +506,7 @@ BEGIN
             v_ins_claimed, NEW.insurance_brokerage, NEW.claim_number, v_ins_disc, v_payable,
             v_out.type_of_payment, v_out.payment_status, v_out.utr_no, COALESCE(NEW.approved_by, v_out.approved_by), COALESCE(v_appr_date, public.fn_parse_maintenance_date(v_out.approval_date)),
             COALESCE(NEW.approval_file, v_out.approval_file), NEW.vehicle_damage_photos, v_out.vehicle_out_photos, v_out.invoice_file,
-            FALSE, NULL,
+            v_attrs, FALSE, NULL,
             (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
             (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
@@ -459,6 +536,10 @@ DECLARE
     v_ins_disc NUMERIC(12, 2);
     v_payable NUMERIC(12, 2);
     v_out_kms INTEGER;
+    v_in_kms INTEGER;
+    v_veh VARCHAR(50);
+    v_start_date DATE;
+    v_attrs JSONB;
 BEGIN
     IF TG_OP = 'DELETE' THEN
         -- Revert outward details on core_maintenance row
@@ -491,13 +572,27 @@ BEGIN
     v_ins_disc := public.fn_parse_maintenance_numeric(NEW.insurance_liability_discounts);
     v_payable := public.fn_parse_maintenance_numeric(NEW.letzryd_payable);
 
+    -- Lookup intake vehicle and in_kms
+    SELECT vehicle_number, start_date, in_kms, extra_attributes 
+    INTO v_veh, v_start_date, v_in_kms, v_attrs
+    FROM public.core_maintenance 
+    WHERE portal_maintenance_in_id = NEW.inward_id;
+
+    IF v_end_date IS NOT NULL AND v_start_date IS NOT NULL AND v_end_date < v_start_date THEN
+        v_end_date := v_start_date;
+    END IF;
+
+    IF v_in_kms IS NOT NULL AND v_out_kms IS NOT NULL AND v_out_kms < v_in_kms THEN
+        v_attrs := jsonb_set(COALESCE(v_attrs, '{}'::jsonb), '{odometer_warning}', to_jsonb(format('Outward odometer (%s) lower than intake odometer (%s)', v_out_kms, v_in_kms)));
+    END IF;
+
     UPDATE public.core_maintenance SET
         portal_maintenance_out_id = NEW.id,
-        end_date = CASE WHEN v_end_date IS NOT NULL AND v_end_date < start_date THEN start_date ELSE v_end_date END,
+        end_date = v_end_date,
         out_date_time = v_out_dt,
         out_kms = v_out_kms,
         rfd_date = v_end_date,
-        maintenance_status = COALESCE(NEW.final_status, 'COMPLETED_RFD'),
+        maintenance_status = COALESCE(NEW.final_status, 'Completed & RFD'),
         invoice_no = NEW.invoice_no,
         invoice_date = v_inv_date,
         invoice_amount = v_inv_amt,
@@ -512,8 +607,24 @@ BEGIN
         outward_photos = NEW.vehicle_out_photos,
         invoice_file = NEW.invoice_file,
         remarks = COALESCE(remarks, NEW.remarks),
+        partner_name = COALESCE(partner_name, NEW.partner_name, NEW.driver_name),
+        partner_ids = COALESCE(partner_ids, NEW.partner_id, NEW.driver_id),
+        extra_attributes = COALESCE(v_attrs, extra_attributes),
         updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
     WHERE portal_maintenance_in_id = NEW.inward_id;
+
+    -- If vehicle has subsequent sheet records between start and end date, ensure they are marked superseded
+    IF v_veh IS NOT NULL AND v_start_date IS NOT NULL AND v_end_date IS NOT NULL THEN
+        UPDATE public.core_maintenance
+        SET is_deleted = TRUE,
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            extra_attributes = jsonb_set(COALESCE(extra_attributes, '{}'::jsonb), '{superseded_by_portal}', to_jsonb(NEW.inward_id))
+        WHERE vehicle_number = v_veh
+          AND source_type = 'GOOGLE_SHEET'
+          AND is_deleted = FALSE
+          AND start_date BETWEEN v_start_date AND v_end_date;
+    END IF;
 
     RETURN NEW;
 END;
@@ -566,13 +677,17 @@ BEGIN
     v_drop_date := NEW.drop_off_date;
     v_alloc_date := NEW.allocation_date;
 
-    -- PORTAL PRIORITY CHECK:
-    -- If this vehicle already has a portal ticket covering this date window, enrich metadata only, do not duplicate!
+    -- PORTAL PRIORITY CHECK (including open-ended tickets end_date IS NULL):
     IF EXISTS (
         SELECT 1 FROM public.core_maintenance 
         WHERE vehicle_number = v_clean_veh 
           AND source_type = 'WEB_PORTAL'
-          AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date))
+          AND is_deleted = FALSE
+          AND (
+              start_date = v_start_date 
+              OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date)
+              OR (end_date IS NULL AND v_start_date >= start_date)
+          )
     ) THEN
         -- Enrich the portal record with sheet metadata (model, driver, DM name)
         UPDATE public.core_maintenance SET
@@ -585,7 +700,12 @@ BEGIN
             updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         WHERE vehicle_number = v_clean_veh 
           AND source_type = 'WEB_PORTAL'
-          AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date));
+          AND is_deleted = FALSE
+          AND (
+              start_date = v_start_date 
+              OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date)
+              OR (end_date IS NULL AND v_start_date >= start_date)
+          );
         RETURN NEW;
     END IF;
 
@@ -678,6 +798,7 @@ DECLARE
     v_out_kms INTEGER;
     v_ins_claimed BOOLEAN;
     v_status VARCHAR(50);
+    v_attrs JSONB;
 BEGIN
     -- Acquire exclusive advisory lock during rebuild
     PERFORM pg_advisory_xact_lock(888999111);
@@ -702,6 +823,11 @@ BEGIN
         v_in_kms := public.fn_parse_maintenance_int(v_in.vehicle_k_m_s);
         v_ins_claimed := CASE WHEN LOWER(TRIM(COALESCE(v_in.insurance_claimed, ''))) IN ('yes', 'true', '1') THEN TRUE ELSE FALSE END;
 
+        v_attrs := '{}'::jsonb;
+        IF v_clean_veh IN ('TEST', 'TESTVEHICLE', 'ROLLERTEST') OR v_clean_veh ILIKE '%TEST%' THEN
+            v_attrs := jsonb_set(v_attrs, '{is_test}', 'true'::jsonb);
+        END IF;
+
         -- Find paired outward release
         SELECT * INTO v_out FROM public.july_maintenance_out WHERE inward_id = v_in.id ORDER BY id DESC LIMIT 1;
         IF FOUND THEN
@@ -711,10 +837,13 @@ BEGIN
                 v_end_date := v_start_date;
             END IF;
             v_out_kms := public.fn_parse_maintenance_int(v_out.vehicle_out_k_m_s);
+            IF v_in_kms IS NOT NULL AND v_out_kms IS NOT NULL AND v_out_kms < v_in_kms THEN
+                v_attrs := jsonb_set(v_attrs, '{odometer_warning}', to_jsonb(format('Outward odometer (%s) lower than intake odometer (%s)', v_out_kms, v_in_kms)));
+            END IF;
             v_inv_amt := public.fn_parse_maintenance_numeric(v_out.invoice_amount);
             v_ins_disc := public.fn_parse_maintenance_numeric(v_out.insurance_liability_discounts);
             v_payable := public.fn_parse_maintenance_numeric(v_out.letzryd_payable);
-            v_status := COALESCE(v_out.final_status, 'COMPLETED_RFD');
+            v_status := COALESCE(v_out.final_status, 'Completed & RFD');
         ELSE
             v_end_date := NULL;
             v_out_dt := NULL;
@@ -735,18 +864,21 @@ BEGIN
             insurance_claimed, insurance_brokerage, claim_number, insurance_liability_discounts, letzryd_payable,
             type_of_payment, payment_status, utr_no, approved_by, approval_date,
             approval_file, damage_photos, outward_photos, invoice_file,
-            is_deleted, deleted_at, created_at, updated_at
+            extra_attributes, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
             v_curr_id, 'WEB_PORTAL', v_in.id, v_out.id, NULL,
             v_clean_veh, v_clean_city, v_in.vehicle_location, NULL,
             v_start_date, v_end_date, v_in_dt, v_out_dt, v_est_delivery, v_end_date,
-            v_status, 'Off Road', NULL, NULL, NULL, NULL, NULL, NULL,
+            v_status, 'Off Road', 
+            COALESCE(v_out.partner_name, v_out.driver_name),
+            COALESCE(v_out.partner_id, v_out.driver_id),
+            NULL, NULL, NULL, NULL,
             v_in.repair_type, v_in.workshop_name, v_in_kms, v_out_kms, NULL, COALESCE(v_in.remarks, v_out.remarks),
             v_est_amt, v_out.invoice_no, public.fn_parse_maintenance_date(v_out.invoice_date), v_inv_amt,
             v_ins_claimed, v_in.insurance_brokerage, v_in.claim_number, v_ins_disc, v_payable,
             v_out.type_of_payment, v_out.payment_status, v_out.utr_no, COALESCE(v_in.approved_by, v_out.approved_by), COALESCE(v_appr_date, public.fn_parse_maintenance_date(v_out.approval_date)),
             COALESCE(v_in.approval_file, v_out.approval_file), v_in.vehicle_damage_photos, v_out.vehicle_out_photos, v_out.invoice_file,
-            FALSE, NULL,
+            v_attrs, FALSE, NULL,
             COALESCE(v_in.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
             (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
@@ -762,12 +894,17 @@ BEGIN
         v_clean_city := public.fn_clean_maintenance_city(v_sheet.city, v_clean_veh);
         v_start_date := v_sheet.date;
 
-        -- Check if vehicle has portal record on this date window (Portal Priority check)
+        -- Portal Priority check (including open-ended tickets end_date IS NULL)
         IF EXISTS (
             SELECT 1 FROM public.core_maintenance 
             WHERE vehicle_number = v_clean_veh 
               AND source_type = 'WEB_PORTAL'
-              AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date))
+              AND is_deleted = FALSE
+              AND (
+                  start_date = v_start_date 
+                  OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date)
+                  OR (end_date IS NULL AND v_start_date >= start_date)
+              )
         ) THEN
             -- Enrich existing portal record with sheet metadata
             UPDATE public.core_maintenance SET
@@ -780,7 +917,12 @@ BEGIN
                 updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
             WHERE vehicle_number = v_clean_veh 
               AND source_type = 'WEB_PORTAL'
-              AND (start_date = v_start_date OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date));
+              AND is_deleted = FALSE
+              AND (
+                  start_date = v_start_date 
+                  OR (end_date IS NOT NULL AND v_start_date BETWEEN start_date AND end_date)
+                  OR (end_date IS NULL AND v_start_date >= start_date)
+              );
         ELSE
             -- Insert new Google Sheet record
             v_curr_id := v_curr_id + 1;
@@ -795,7 +937,7 @@ BEGIN
                 insurance_claimed, insurance_brokerage, claim_number, insurance_liability_discounts, letzryd_payable,
                 type_of_payment, payment_status, utr_no, approved_by, approval_date,
                 approval_file, damage_photos, outward_photos, invoice_file,
-                is_deleted, deleted_at, created_at, updated_at
+                extra_attributes, is_deleted, deleted_at, created_at, updated_at
             ) VALUES (
                 v_curr_id, 'GOOGLE_SHEET', NULL, NULL, v_sheet.id,
                 v_clean_veh, v_clean_city, NULL, v_sheet.vehicle_model,
@@ -807,7 +949,7 @@ BEGIN
                 FALSE, NULL, NULL, 0.00, 0.00,
                 NULL, NULL, NULL, NULL, NULL,
                 NULL, NULL, NULL, NULL,
-                FALSE, NULL,
+                '{}'::jsonb, FALSE, NULL,
                 COALESCE(v_sheet.created_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')),
                 (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
             );
