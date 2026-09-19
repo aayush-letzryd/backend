@@ -513,6 +513,9 @@ BEGIN
     END IF;
 
     RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'fn_sync_core_maintenance_from_portal_in error shielded: % (SQLSTATE: %). Source table operation unaffected.', SQLERRM, SQLSTATE;
+    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -627,6 +630,9 @@ BEGIN
     END IF;
 
     RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'fn_sync_core_maintenance_from_portal_out error shielded: % (SQLSTATE: %). Source table operation unaffected.', SQLERRM, SQLSTATE;
+    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
@@ -744,7 +750,7 @@ BEGIN
             insurance_claimed, insurance_brokerage, claim_number, insurance_liability_discounts, letzryd_payable,
             type_of_payment, payment_status, utr_no, approved_by, approval_date,
             approval_file, damage_photos, outward_photos, invoice_file,
-            is_deleted, deleted_at, created_at, updated_at
+            extra_attributes, is_deleted, deleted_at, created_at, updated_at
         ) VALUES (
             v_next_id, 'GOOGLE_SHEET', NULL, NULL, NEW.id,
             v_clean_veh, v_clean_city, NULL, NEW.vehicle_model,
@@ -756,13 +762,16 @@ BEGIN
             FALSE, NULL, NULL, 0.00, 0.00,
             NULL, NULL, NULL, NULL, NULL,
             NULL, NULL, NULL, NULL,
-            FALSE, NULL,
+            '{}'::jsonb, FALSE, NULL,
             (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
             (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
         );
     END IF;
 
     RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    RAISE WARNING 'fn_sync_core_maintenance_from_sheet error shielded: % (SQLSTATE: %). Source table operation unaffected.', SQLERRM, SQLSTATE;
+    RETURN COALESCE(NEW, OLD);
 END;
 $$ LANGUAGE plpgsql;
 
