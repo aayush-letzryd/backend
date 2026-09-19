@@ -289,7 +289,7 @@ def run_backfill():
                     IF EXISTS (SELECT 1 FROM public.core_vehicle_onboarding WHERE registration_no = public.fn_clean_plate(j.vehicle_number)) THEN
                         UPDATE public.core_vehicle_onboarding
                         SET 
-                            source_system = 'MERGED_PORTAL_SHEET',
+                            source_system = CASE WHEN sheet_vehicle_id IS NOT NULL THEN 'MERGED_PORTAL_SHEET' ELSE 'PORTAL_FORM' END,
                             source_table = 'july_vehicle_onboarding',
                             portal_vehicle_id = j.id,
                             letzryd_unique_no = COALESCE(NULLIF(j.letzryd_unique_no, ''), letzryd_unique_no),
