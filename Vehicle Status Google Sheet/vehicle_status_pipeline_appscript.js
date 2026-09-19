@@ -811,9 +811,9 @@ function setupTriggers() {
   deleteAllTriggers();
   ScriptApp.newTrigger("syncRecentVehicleStatus")
     .timeBased()
-    .everyMinutes(2) // 2-minute interval paired with MD5 fingerprint saves 99% quota
+    .everyMinutes(1) // 1-minute interval paired with MD5 fingerprint saves 99% quota
     .create();
-  showAlert("Automated Trigger Installed", "2-minute background sync trigger installed successfully.\nMD5 fingerprinting active.");
+  showAlert("Automated Trigger Installed", "1-minute background sync trigger installed successfully.\nMD5 fingerprinting active.");
 }
 
 function deleteAllTriggers() {
