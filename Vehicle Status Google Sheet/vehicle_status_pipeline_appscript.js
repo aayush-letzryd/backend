@@ -287,11 +287,9 @@ function cleanCohort(val, status) {
     var low = s.toLowerCase();
     if (low === "on road") return "On Road";
     if (low === "off road") return "Off Road";
-    if (low === "in yard") return "In Yard";
   }
   if (status === "Active" || status === "Allocation" || status === "Same Day D&A") return "On Road";
-  if (status === "Maintenance" || status === "Drop Off") return "Off Road";
-  return "In Yard";
+  return "Off Road";
 }
 
 function cleanPartnerId(val) {
