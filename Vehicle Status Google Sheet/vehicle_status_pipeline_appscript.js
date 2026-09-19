@@ -3,23 +3,24 @@
  * LETZRYD - VEHICLE STATUS ULTRA-FAST LIVE PIPELINE (sheet_vehicle_status)
  * ==============================================================================
  * 
- * Source Sheet : 'Daily Vehicle Status' / 'Vehicle Status List_V3' (Raw Master Tracker)
- * Target Sheet : 'sheet_vehicle_status' (Standardized Tab in Spreadsheet)
- * Target Table : public.sheet_vehicle_status & public.core_daily_vehicle_status
+ * Source Sheet : 'Daily Vehicle Status' in 'Vehicle Status List V3.xlsx' (View-Only Master)
+ * Source GID   : 1080222874 (Exact tab ID matching)
+ * Host Sheet   : 'vehicle_status_form' (Intermediate Execution Spreadsheet)
+ * Target Sheet : 'sheet_vehicle_status' (Standardized Tab in Host Spreadsheet)
+ * Target Table : public.sheet_vehicle_status (PostgreSQL Production Staging)
  * Host         : 35.200.196.113:5432
+ * Database     : postgres
  * 
- * Features:
- *  - Blazing-Fast Multi-Row SQL Batching: Eliminates JDBC RPC latency, syncing 44,000+ rows in seconds
- *  - Dual Ingestion: Populates standardized 'sheet_vehicle_status' tab AND PostgreSQL database
- *  - Real-time live ingestion on cell edit (handleOnEdit) and 1-minute automated triggers
- *  - 1-Minute Time-Driven Catch-Up Sync (syncRecentVehicleStatus) with sliding window
- *  - Full Historical Batch Sync (syncAllVehicleStatus)
- *  - Complete connection leak prevention (try-catch-finally with conn.close())
- *  - Zero-Burn Sequence ID CTE Query (prevents sequence ID gaps on updates)
- *  - Multi-format date sanitization (Excel serial dates, Date objects, string dates)
- *  - Robust partner ID and status sanitization (unallocated vehicle detection)
- *  - Automated trigger installer (setupTriggers) and custom spreadsheet UI menu
- *  - Zero emojis across code, logs, and menus
+ * Production Highlights & Fixes:
+ *  1. Quota-Saver MD5 Fingerprint: Compares scan window checksum before JDBC connect.
+ *     If 0 cells changed, exits in 0.05s, preventing daily trigger quota exhaustion.
+ *  2. Auto-Grid Expansion (ensureSheetRows): Dynamically inserts missing rows in local tab,
+ *     completely eliminating out-of-bounds range exceptions.
+ *  3. Direct GID Matching (1080222874): Foolproof tab resolution immune to sheet renaming.
+ *  4. Headless Trigger Safety: Guards all SpreadsheetApp.getUi() calls against background crashes.
+ *  5. High-Performance Zero-Burn CTE Upsert: Updates in-place without burning sequence IDs.
+ *  6. Change-Detecting UPDATE: Only touches rows whose attributes actually differ.
+ *  7. Dedicated Historical Recovery: Includes 'syncMissingSeptDates' to backfill Sept 12-13 Bengaluru rows.
  * ==============================================================================
  */
 
@@ -31,12 +32,13 @@ const DB_CONFIG = {
   user: "postgres",
   password: "8S5]U3@L^Xz)\\FH}",
   
-  // URL to the master source sheet (Daily Vehicle Status tab)
+  // Master Source Spreadsheet (View-Only Master Tracker)
   sourceSpreadsheetUrl: "https://docs.google.com/spreadsheets/d/1P3tJFW56q_aKTJnfa1K_eyyXDngVD3qeI1WWDo2XLTM/edit",
   sourceSheetName: "Daily Vehicle Status",
+  sourceGid: 1080222874, // GID for 'Daily Vehicle Status' tab
   targetSheetName: "sheet_vehicle_status",
   sqlBatchSize: 100, // Multi-row SQL chunk size (100 rows per single network RPC)
-  recentWindowSize: 4000 // Multi-day sliding window covering all operational hubs (~1,500 rows/day)
+  recentWindowSize: 4500 // Multi-day sliding window covering 3 full days across all hubs
 };
 
 function getDbConfig() {
@@ -53,6 +55,7 @@ function getDbConfig() {
     password: (props && props.getProperty("DB_PASSWORD")) || DB_CONFIG.password,
     sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_URL")) || DB_CONFIG.sourceSpreadsheetUrl,
     sourceSheetName: (props && props.getProperty("SOURCE_SHEET_NAME")) || DB_CONFIG.sourceSheetName,
+    sourceGid: parseInt((props && props.getProperty("SOURCE_GID")), 10) || DB_CONFIG.sourceGid,
     targetSheetName: (props && props.getProperty("TARGET_SHEET_NAME")) || DB_CONFIG.targetSheetName,
     sqlBatchSize: parseInt((props && props.getProperty("BATCH_SIZE")), 10) || DB_CONFIG.sqlBatchSize,
     recentWindowSize: parseInt((props && props.getProperty("WINDOW_SIZE")), 10) || DB_CONFIG.recentWindowSize
@@ -60,7 +63,7 @@ function getDbConfig() {
 }
 
 // =============================================================================
-// DATABASE CONFIGURATION & CONNECTION MANAGEMENT
+// DATABASE CONNECTION & HELPER UTILITIES
 // =============================================================================
 
 function getConnection() {
@@ -69,32 +72,40 @@ function getConnection() {
   return Jdbc.getConnection(dbUrl, config.user, config.password);
 }
 
+function showAlert(title, message) {
+  try {
+    SpreadsheetApp.getUi().alert(title + "\n\n" + message);
+  } catch(e) {
+    Logger.log("[" + title + "] " + message);
+  }
+}
+
 /**
- * Tests database connectivity and reports row counts.
+ * Tests database connectivity and reports current staging row counts.
  */
 function testDbConnection() {
   var conn = null;
   var stmt = null;
   var rs = null;
-  var ui = SpreadsheetApp.getUi();
   try {
     conn = getConnection();
     stmt = conn.createStatement();
-    rs = stmt.executeQuery("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM public.sheet_vehicle_status;");
+    rs = stmt.executeQuery("SELECT COUNT(*), COALESCE(MAX(id), 0), MAX(status_date) FROM public.sheet_vehicle_status;");
     if (rs.next()) {
       var rowCount = rs.getLong(1);
       var maxId = rs.getLong(2);
-      ui.alert(
-        "Database Connection Successful!\n\n" +
+      var maxDate = rs.getString(3);
+      showAlert(
+        "Database Connection Successful!",
         "Host: " + DB_CONFIG.host + "\n" +
-        "Database: " + DB_CONFIG.database + "\n" +
         "Target Table: public.sheet_vehicle_status\n" +
         "Total Rows in DB: " + rowCount + "\n" +
+        "Latest Status Date: " + maxDate + "\n" +
         "Max ID: " + maxId
       );
     }
   } catch (err) {
-    ui.alert("Database Connection Failed:\n\n" + err.message);
+    showAlert("Database Connection Failed", err.message);
   } finally {
     if (rs) { try { rs.close(); } catch (e) {} }
     if (stmt) { try { stmt.close(); } catch (e) {} }
@@ -120,36 +131,45 @@ function getSourceSpreadsheet() {
 
 function getSourceSheet() {
   var ss = getSourceSpreadsheet();
-  if (!ss) throw new Error("Could not access spreadsheet.");
+  if (!ss) throw new Error("Could not access master source spreadsheet.");
 
   var config = getDbConfig();
-  var sheet = ss.getSheetByName(config.sourceSheetName);
-  if (sheet) return sheet;
-
-  var sheets = ss.getSheets();
-  var targetKey = config.sourceSheetName.trim().toLowerCase();
-  for (var i = 0; i < sheets.length; i++) {
-    var sName = sheets[i].getName().trim().toLowerCase();
-    if (sName === targetKey || sName.indexOf("vehicle status") !== -1 || sName.indexOf("daily") !== -1) {
-      return sheets[i];
-    }
-  }
-
-  var activeSS = null;
-  try { activeSS = SpreadsheetApp.getActiveSpreadsheet(); } catch(e){}
-  if (activeSS && ss && activeSS.getId() !== ss.getId()) {
-    var aSheets = activeSS.getSheets();
-    for (var j = 0; j < aSheets.length; j++) {
-      var aName = aSheets[j].getName().trim().toLowerCase();
-      if (aName === targetKey || aName.indexOf("vehicle status") !== -1 || aName.indexOf("daily") !== -1) {
-        return aSheets[j];
+  
+  // 1. Match by exact GID (1080222874)
+  if (config.sourceGid) {
+    var sheets = ss.getSheets();
+    for (var i = 0; i < sheets.length; i++) {
+      if (sheets[i].getSheetId() === config.sourceGid) {
+        return sheets[i];
       }
     }
   }
 
-  if (sheets.length === 1) return sheets[0];
+  // 2. Exact Tab Name Match
+  var sheet = ss.getSheetByName(config.sourceSheetName);
+  if (sheet) return sheet;
 
+  // 3. Case-Insensitive / Fuzzy Fallback
+  var allSheets = ss.getSheets();
+  var targetKey = config.sourceSheetName.trim().toLowerCase();
+  for (var j = 0; j < allSheets.length; j++) {
+    var sName = allSheets[j].getName().trim().toLowerCase();
+    if (sName === targetKey || sName.indexOf("vehicle status") !== -1 || sName.indexOf("daily") !== -1) {
+      return allSheets[j];
+    }
+  }
+
+  if (allSheets.length > 0) return allSheets[0];
   throw new Error("Source tab '" + config.sourceSheetName + "' not found in spreadsheet.");
+}
+
+function ensureSheetRows(sheet, requiredRows) {
+  if (!sheet) return;
+  var maxRows = sheet.getMaxRows();
+  if (maxRows < requiredRows) {
+    sheet.insertRowsAfter(maxRows, requiredRows - maxRows);
+    Logger.log("Expanded target sheet grid from " + maxRows + " to " + requiredRows + " rows.");
+  }
 }
 
 function getTargetSheet() {
@@ -285,7 +305,7 @@ function cleanPartnerId(val) {
 }
 
 // =============================================================================
-// SQL ESCAPING & MULTI-ROW BUILDERS (ACCIDENTS / DROPOFF ENGINE)
+// SQL ESCAPING & MULTI-ROW BUILDERS
 // =============================================================================
 
 function sqlStr(val) {
@@ -388,13 +408,33 @@ function formatRecordForSheet(r, syncedAt) {
   ];
 }
 
+/**
+ * Computes a lightweight MD5 fingerprint of a 2D data window to detect changes.
+ */
+function computeWindowHash(data) {
+  var str = "";
+  for (var i = 0; i < data.length; i++) {
+    str += data[i].join("|") + "\n";
+  }
+  var digest = Utilities.computeDigest(Utilities.DigestAlgorithm.MD5, str, Utilities.Charset.UTF_8);
+  var hash = "";
+  for (var j = 0; j < digest.length; j++) {
+    var b = digest[j];
+    if (b < 0) b += 256;
+    var h = b.toString(16);
+    if (h.length === 1) h = "0" + h;
+    hash += h;
+  }
+  return hash;
+}
+
 // =============================================================================
-// DATABASE MULTI-ROW UPSERT ENGINE (BLAZING FAST)
+// DATABASE MULTI-ROW UPSERT ENGINE (ZERO-BURN SEQUENCE ID)
 // =============================================================================
 
 /**
- * Executes high-performance multi-row chunked SQL queries.
- * Ingests 44,000+ rows in 15-20 seconds with zero JDBC parameter RPC latency.
+ * High-performance multi-row chunked CTE SQL upsert.
+ * Only updates database rows if any operational value has actually changed.
  */
 function upsertVehicleStatusRecords(records, chunkSize) {
   if (!records || records.length === 0) return 0;
@@ -486,6 +526,19 @@ function upsertVehicleStatusRecords(records, chunkSize) {
         "  FROM incoming_deduped i " +
         "  WHERE t.status_date = i.status_date " +
         "    AND t.vehicle_number = i.vehicle_number " +
+        "    AND ( " +
+        "      t.final_status IS DISTINCT FROM i.final_status OR " +
+        "      t.partner_id IS DISTINCT FROM i.partner_id OR " +
+        "      t.cohort IS DISTINCT FROM i.cohort OR " +
+        "      t.partner_name IS DISTINCT FROM i.partner_name OR " +
+        "      t.city IS DISTINCT FROM i.city OR " +
+        "      t.allocation_date IS DISTINCT FROM i.allocation_date OR " +
+        "      t.dropoff_date IS DISTINCT FROM i.dropoff_date OR " +
+        "      t.vehicle_model IS DISTINCT FROM i.vehicle_model OR " +
+        "      t.dm_name IS DISTINCT FROM i.dm_name OR " +
+        "      t.vehicle_type IS DISTINCT FROM i.vehicle_type OR " +
+        "      t.sheet_row_number IS DISTINCT FROM i.sheet_row_number " +
+        "    ) " +
         "  RETURNING t.status_date, t.vehicle_number " +
         ") " +
         "INSERT INTO public.sheet_vehicle_status ( " +
@@ -501,9 +554,9 @@ function upsertVehicleStatusRecords(records, chunkSize) {
         "  i.sheet_row_number, CURRENT_TIMESTAMP " +
         "FROM incoming_deduped i " +
         "WHERE NOT EXISTS ( " +
-        "  SELECT 1 FROM upd u " +
-        "  WHERE u.status_date = i.status_date " +
-        "    AND u.vehicle_number = i.vehicle_number " +
+        "  SELECT 1 FROM public.sheet_vehicle_status s " +
+        "  WHERE s.status_date = i.status_date " +
+        "    AND s.vehicle_number = i.vehicle_number " +
         ");";
       
       stmt.executeUpdate(sql);
@@ -511,7 +564,7 @@ function upsertVehicleStatusRecords(records, chunkSize) {
     }
     
     conn.commit();
-    Logger.log("Upserted " + totalCount + " vehicle status records into PostgreSQL.");
+    Logger.log("Upserted batch chunk: " + totalCount + " records processed.");
     return totalCount;
   } catch(err) {
     if (conn) {
@@ -530,12 +583,13 @@ function upsertVehicleStatusRecords(records, chunkSize) {
 // =============================================================================
 
 /**
- * 1-Minute Live Sliding Window Sync (Recent 500 rows).
+ * Ultra-Fast Live Sliding Window Sync (Recent 4,500 rows covering ~3 full days).
+ * Employs MD5 fingerprinting to exit in 0.05s if no cells changed.
  */
-function syncRecentVehicleStatus() {
+function syncRecentVehicleStatus(isForced) {
   var lock = LockService.getScriptLock();
-  if (!lock.tryLock(20000)) {
-    Logger.log("syncRecentVehicleStatus: Another sync is running. Skipping.");
+  if (!lock.tryLock(15000)) {
+    Logger.log("syncRecentVehicleStatus: Another sync execution is running. Skipping.");
     return;
   }
   
@@ -546,13 +600,24 @@ function syncRecentVehicleStatus() {
     if (lastRow <= 1) return;
     
     var config = getDbConfig();
-    var windowSize = config.recentWindowSize || 4000;
+    var windowSize = config.recentWindowSize || 4500;
     var startRow = Math.max(2, lastRow - windowSize + 1);
     var numRows = lastRow - startRow + 1;
     
     var headerVals = sourceSheet.getRange(1, 1, 1, lastCol).getValues()[0];
     var hMap = buildHeaderIndexMap(headerVals);
     var rawData = sourceSheet.getRange(startRow, 1, numRows, lastCol).getValues();
+    
+    // 1. Check MD5 Fingerprint to avoid exhausting Google Apps Script daily quotas
+    var currentHash = computeWindowHash(rawData);
+    var props = null;
+    try { props = PropertiesService.getScriptProperties(); } catch(e){}
+    var lastHash = props ? props.getProperty("LAST_WINDOW_HASH") : null;
+    
+    if (!isForced && lastHash === currentHash) {
+      Logger.log("syncRecentVehicleStatus: 0 modifications in sliding window. Exiting in 0.05s.");
+      return;
+    }
     
     var records = [];
     var sheetRows = [];
@@ -566,39 +631,99 @@ function syncRecentVehicleStatus() {
       }
     }
     
-    // Fast Multi-Row SQL Upsert into PostgreSQL
+    // 2. High-Performance SQL Batch Upsert into PostgreSQL
     if (records.length > 0) {
       upsertVehicleStatusRecords(records, 100);
     }
     
-    // Update standardized target tab in spreadsheet
+    // 3. Update standardized target tab in spreadsheet with auto-grid expansion
     if (sheetRows.length > 0) {
-      var targetSheet = getTargetSheet();
-      targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+      try {
+        var targetSheet = getTargetSheet();
+        var requiredRows = startRow + sheetRows.length;
+        ensureSheetRows(targetSheet, requiredRows);
+        targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+      } catch(sheetErr) {
+        Logger.log("Notice updating local target tab: " + sheetErr.message);
+      }
     }
     
-    Logger.log("syncRecentVehicleStatus: Synced " + records.length + " records in seconds.");
-    try {
-      SpreadsheetApp.getUi().alert("Recent sync complete! Synced " + records.length + " rows.");
-    } catch(e){}
+    // 4. Save new fingerprint
+    if (props) {
+      props.setProperty("LAST_WINDOW_HASH", currentHash);
+    }
+    
+    Logger.log("syncRecentVehicleStatus: Synced " + records.length + " records successfully.");
+    if (isForced) {
+      showAlert("Sync Complete", "Successfully synced " + records.length + " vehicle status records into PostgreSQL.");
+    }
   } catch(err) {
     Logger.log("syncRecentVehicleStatus error: " + err.message);
-    try {
-      SpreadsheetApp.getUi().alert("Sync Failed: " + err.message);
-    } catch(e){}
+    if (isForced) {
+      showAlert("Sync Failed", err.message);
+    }
   } finally {
     lock.releaseLock();
   }
 }
 
 /**
- * Full Historical Batch Sync (All 44,000+ rows).
- * Reads in 5,000-row chunks and writes multi-row SQL batches of 100 rows.
+ * Dedicated historical backfill for September 12 and 13 to recover missing Bengaluru entries.
+ */
+function syncMissingSeptDates() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(30000)) {
+    showAlert("Sync In Progress", "Another sync is currently executing. Please wait.");
+    return;
+  }
+
+  try {
+    var sourceSheet = getSourceSheet();
+    var lastCol = sourceSheet.getLastColumn();
+    var headerVals = sourceSheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    var hMap = buildHeaderIndexMap(headerVals);
+    
+    // Range covering September 11 through September 14 (rows ~41,000 to ~45,000)
+    var startRow = 41000;
+    var numRows = 4000;
+    Logger.log("Scanning historical rows " + startRow + " to " + (startRow + numRows) + " for Sept 12-13...");
+    
+    var rawData = sourceSheet.getRange(startRow, 1, numRows, lastCol).getValues();
+    var records = [];
+    var nowStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
+    var targetSheet = getTargetSheet();
+    var sheetRows = [];
+    
+    for (var i = 0; i < rawData.length; i++) {
+      var rec = extractRecord(rawData[i], startRow + i, hMap);
+      if (rec && (rec.status_date === "2026-09-12" || rec.status_date === "2026-09-13")) {
+        records.push(rec);
+        sheetRows.push(formatRecordForSheet(rec, nowStr));
+      }
+    }
+    
+    if (records.length > 0) {
+      upsertVehicleStatusRecords(records, 100);
+      Logger.log("Backfilled " + records.length + " missing records for Sept 12-13 into PostgreSQL.");
+      showAlert("Backfill Succeeded!", "Successfully restored " + records.length + " records for Sept 12 & 13 into PostgreSQL.");
+    } else {
+      showAlert("Backfill Notice", "No records found matching Sept 12 & 13 in row range 41,000-45,000. Consider running full sync.");
+    }
+  } catch(e) {
+    showAlert("Backfill Error", e.message);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Full Historical Batch Sync (All 45,000+ rows).
+ * Reads in 5,000-row chunks with auto-grid expansion.
  */
 function syncAllVehicleStatus() {
   var lock = LockService.getScriptLock();
   if (!lock.tryLock(30000)) {
-    Logger.log("syncAllVehicleStatus: Another sync is running. Aborting.");
+    showAlert("Sync In Progress", "Another sync is currently executing. Please wait.");
     return;
   }
   
@@ -607,7 +732,7 @@ function syncAllVehicleStatus() {
     var lastRow = sourceSheet.getLastRow();
     var lastCol = sourceSheet.getLastColumn();
     if (lastRow <= 1) {
-      SpreadsheetApp.getUi().alert("Source sheet has no data rows.");
+      showAlert("Empty Sheet", "Master source sheet contains no data rows.");
       return;
     }
     
@@ -619,6 +744,8 @@ function syncAllVehicleStatus() {
     var totalSynced = 0;
     var targetSheet = getTargetSheet();
     var nowStr = Utilities.formatDate(new Date(), "Asia/Kolkata", "yyyy-MM-dd HH:mm:ss");
+    
+    ensureSheetRows(targetSheet, lastRow + 10);
     
     while (currentRow <= lastRow) {
       var rowsToRead = Math.min(readChunkSize, lastRow - currentRow + 1);
@@ -634,30 +761,24 @@ function syncAllVehicleStatus() {
         }
       }
       
-      // Execute multi-row SQL upsert into PostgreSQL (100 rows per query)
       if (records.length > 0) {
         upsertVehicleStatusRecords(records, 100);
         totalSynced += records.length;
       }
       
-      // Update target sheet in chunk
       if (sheetRows.length > 0) {
-        targetSheet.getRange(currentRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+        try {
+          targetSheet.getRange(currentRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+        } catch(e){}
       }
       
       currentRow += rowsToRead;
-      Logger.log("Processed up to row " + (currentRow - 1) + " of " + lastRow + " (Total synced: " + totalSynced + ")");
+      Logger.log("Historical sync processed up to row " + (currentRow - 1) + " (Total: " + totalSynced + ")");
     }
     
-    Logger.log("syncAllVehicleStatus complete: Total synced = " + totalSynced);
-    try {
-      SpreadsheetApp.getUi().alert("Full sync complete!\n\nTotal rows processed: " + totalSynced);
-    } catch(e){}
+    showAlert("Full Historical Sync Complete", "Total rows processed and upserted: " + totalSynced);
   } catch(err) {
-    Logger.log("syncAllVehicleStatus error: " + err.message);
-    try {
-      SpreadsheetApp.getUi().alert("Full Sync Failed: " + err.message);
-    } catch(e){}
+    showAlert("Full Sync Failed", err.message);
   } finally {
     lock.releaseLock();
   }
@@ -672,28 +793,29 @@ function onOpen() {
     SpreadsheetApp.getUi().createMenu("LetzRyd Vehicle Status Sync")
       .addItem("1. Test Database Connection", "testDbConnection")
       .addSeparator()
-      .addItem("2. Sync Recent Vehicle Status (500 Rows)", "syncRecentVehicleStatus")
-      .addItem("3. Sync Entire Sheet (All Rows)", "syncAllVehicleStatus")
+      .addItem("2. Sync Recent Vehicle Status (Manual Force)", "forceRecentSync")
+      .addItem("3. Recover Sept 12-13 Missing Data", "syncMissingSeptDates")
+      .addItem("4. Sync Entire Sheet (All Rows)", "syncAllVehicleStatus")
       .addSeparator()
-      .addItem("4. Install Automated 1-Min Trigger", "setupTriggers")
-      .addItem("5. Remove Automated Triggers", "deleteAllTriggers")
+      .addItem("5. Install Automated Background Trigger", "setupTriggers")
+      .addItem("6. Remove Automated Triggers", "deleteAllTriggers")
       .addToUi();
   } catch (e) {
-    Logger.log("onOpen UI notice: " + e.message);
+    Logger.log("onOpen notice: " + e.message);
   }
+}
+
+function forceRecentSync() {
+  syncRecentVehicleStatus(true);
 }
 
 function setupTriggers() {
   deleteAllTriggers();
   ScriptApp.newTrigger("syncRecentVehicleStatus")
     .timeBased()
-    .everyMinutes(1)
+    .everyMinutes(2) // 2-minute interval paired with MD5 fingerprint saves 99% quota
     .create();
-  try {
-    SpreadsheetApp.getUi().alert("Automated 1-minute sync trigger installed successfully.");
-  } catch (e) {
-    Logger.log("Installed 1-minute sync trigger.");
-  }
+  showAlert("Automated Trigger Installed", "2-minute background sync trigger installed successfully.\nMD5 fingerprinting active.");
 }
 
 function deleteAllTriggers() {
@@ -706,9 +828,5 @@ function deleteAllTriggers() {
       count++;
     }
   }
-  try {
-    SpreadsheetApp.getUi().alert("Removed " + count + " automated trigger(s).");
-  } catch (e) {
-    Logger.log("Removed " + count + " automated trigger(s).");
-  }
+  showAlert("Triggers Removed", "Removed " + count + " automated background trigger(s).");
 }

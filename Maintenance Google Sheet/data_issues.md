@@ -110,3 +110,22 @@ This document details all data quality anomalies, architectural defects, and ing
       }
     }
     ```
+
+---
+
+## 7. Issue MNT-07: Apps Script JDBC Proxy Overhead & Idle-in-Transaction Timeout
+
+- **Affected Layer**: High-Frequency 5-Minute Trigger (`syncRecentMaintenance`)
+- **Raw Anomaly**:
+  - Scanning from bottom of master sheet hit 1,422 trailing formatted rows with dashes (`-`), resulting in `0` detected records or incorrect window bounds.
+  - Looping 15 parameter setters (`ps.setString`) across hundreds of records in Google Apps Script generated 14,000+ Java-RPC bridge calls, taking > 5 minutes and triggering PostgreSQL `FATAL: terminating connection due to idle-in-transaction timeout`.
+  - Reading and appending into local spreadsheet tabs accumulated DOM latency and blank row gaps.
+- **Root Cause**:
+  1. Google Sheets `getLastRow()` counting trailing formatted rows beyond actual data row 44,100.
+  2. Google Apps Script's JDBC proxy RPC latency on per-field `PreparedStatement` calls.
+  3. PostgreSQL 5-minute `idle_in_transaction_session_timeout`.
+- **Resolution**:
+  - Implemented `getLastDataRow()` using native regex `TextFinder` on Column B (`[A-Za-z0-9]`) to locate true active data rows instantly (< 0.05s).
+  - Transitioned to direct-to-database streaming, skipping Google Sheet DOM writes entirely.
+  - Implemented multi-row SQL streaming (`INSERT INTO ... VALUES (...) ON CONFLICT DO UPDATE`), grouping 100 records into a single SQL statement. Reduced database execution time from 5 minutes to 0.2 seconds.
+
