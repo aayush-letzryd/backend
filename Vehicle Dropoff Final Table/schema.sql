@@ -386,6 +386,14 @@ BEGIN
     END IF;
 
     RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    -- Exception Shield: Protect source table from downstream failures
+    RAISE WARNING 'Shielding active: fn_sync_sheet_dropoffs failed to sync to core_dropoffs: %, SQLSTATE: %', SQLERRM, SQLSTATE;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -576,6 +584,14 @@ BEGIN
     END IF;
 
     RETURN NEW;
+EXCEPTION WHEN OTHERS THEN
+    -- Exception Shield: Protect source table from downstream failures
+    RAISE WARNING 'Shielding active: fn_sync_july_vehicle_dropoffs failed to sync to core_dropoffs: %, SQLSTATE: %', SQLERRM, SQLSTATE;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    ELSE
+        RETURN NEW;
+    END IF;
 END;
 $$ LANGUAGE plpgsql;
 
