@@ -30,7 +30,30 @@ DB_HOST = os.getenv("DB_HOST", "YOUR_DB_HOST_HERE")
 DB_PORT = int(os.getenv("DB_PORT", "5432"))
 DB_NAME = os.getenv("DB_NAME", "postgres")
 DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "YOUR_DB_PASSWORD_HERE")
+DB_PASSWORD = os.getenv("DB_PASSWORD") or os.getenv("DB_PASS", "YOUR_DB_PASSWORD_HERE")
+
+# Auto-load from .env if present and default credentials are unchanged
+if DB_HOST == "YOUR_DB_HOST_HERE" or DB_PASSWORD == "YOUR_DB_PASSWORD_HERE":
+    env_paths = [".env", "../.env", "../../.env"]
+    for p in env_paths:
+        if os.path.exists(p):
+            with open(p) as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        k, v = k.strip(), v.strip()
+                        if k == "DB_HOST" and DB_HOST == "YOUR_DB_HOST_HERE":
+                            DB_HOST = v
+                        elif k == "DB_PORT":
+                            DB_PORT = int(v)
+                        elif k == "DB_NAME":
+                            DB_NAME = v
+                        elif k == "DB_USER":
+                            DB_USER = v
+                        elif (k == "DB_PASSWORD" or k == "DB_PASS") and DB_PASSWORD == "YOUR_DB_PASSWORD_HERE":
+                            DB_PASSWORD = v
+            break
 
 def get_connection():
     if DB_HOST == "YOUR_DB_HOST_HERE" or DB_PASSWORD == "YOUR_DB_PASSWORD_HERE":

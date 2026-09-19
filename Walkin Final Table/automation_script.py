@@ -18,11 +18,11 @@ IST = zoneinfo.ZoneInfo("Asia/Kolkata")
 import psycopg2
 from psycopg2.extras import RealDictCursor
 
-DB_HOST = os.getenv('DB_HOST', 'YOUR_DB_HOST_HERE')
+DB_HOST = os.getenv('DB_HOST', '35.200.196.113')
 DB_PORT = int(os.getenv('DB_PORT', '5432'))
 DB_NAME = os.getenv('DB_NAME', 'postgres')
 DB_USER = os.getenv('DB_USER', 'postgres')
-DB_PASSWORD = os.getenv('DB_PASSWORD', 'YOUR_DB_PASSWORD_HERE')
+DB_PASSWORD = os.getenv('DB_PASSWORD') or os.getenv('DB_PASS') or r'8S5]U3@L^Xz)\FH}'
 
 def get_db_connection():
     return psycopg2.connect(

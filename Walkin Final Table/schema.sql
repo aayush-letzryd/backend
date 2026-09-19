@@ -128,7 +128,9 @@ DECLARE
     v_time_str VARCHAR(20);
     v_ts TIMESTAMP WITHOUT TIME ZONE;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
+    -- FAIL-SAFE BLOCK: Guarantees that source table sheet_walkins is NEVER impacted
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -172,7 +174,10 @@ BEGIN
         ELSE 'NEW_CANDIDATE'
     END;
 
-    v_is_joined := (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%');
+    v_is_joined := COALESCE(
+        (NEW.joined_status ILIKE 'joined%' AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%false%'),
+        FALSE
+    );
 
     IF TG_OP = 'INSERT' THEN
         PERFORM pg_advisory_xact_lock(777888999);
@@ -255,6 +260,12 @@ BEGIN
             );
             PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
         END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- Fail-safe decoupling: Guarantees that source table sheet_walkins operations NEVER fail
+        RAISE WARNING 'core_walkin sync warning for sheet_walkins: %', SQLERRM;
+    END;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
     END IF;
     RETURN NEW;
 END;
@@ -285,7 +296,9 @@ DECLARE
     v_exec_name VARCHAR(255);
     v_exec_email VARCHAR(255);
 BEGIN
-    IF TG_OP = 'DELETE' THEN
+    -- FAIL-SAFE BLOCK: Guarantees that source table july_new_walkins is NEVER impacted
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -323,8 +336,11 @@ BEGIN
         ELSE 'OTHER'
     END;
 
-    v_is_joined := (NEW.joined_status ILIKE '%onboard%' OR NEW.joined_status ILIKE '%joined%' OR NEW.joined_status ILIKE '%active%')
-                   AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%reject%';
+    v_is_joined := COALESCE(
+        (NEW.joined_status ILIKE '%onboard%' OR NEW.joined_status ILIKE '%joined%' OR NEW.joined_status ILIKE '%active%')
+        AND NEW.joined_status NOT ILIKE '%not%' AND NEW.joined_status NOT ILIKE '%reject%',
+        FALSE
+    );
 
     v_date := COALESCE(NEW.event_date, (NEW.created_at AT TIME ZONE 'Asia/Kolkata')::date, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')::date);
     v_time_str := COALESCE(NEW.enquiry_time, TO_CHAR(NEW.created_at AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'), TO_CHAR(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata', 'HH24:MI'));
@@ -430,6 +446,12 @@ BEGIN
             );
             PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
         END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- Fail-safe decoupling: Guarantees that source table july_new_walkins operations NEVER fail
+        RAISE WARNING 'core_walkin sync warning for portal_new: %', SQLERRM;
+    END;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
     END IF;
     RETURN NEW;
 END;
@@ -459,7 +481,9 @@ DECLARE
     v_exec_name VARCHAR(255);
     v_exec_email VARCHAR(255);
 BEGIN
-    IF TG_OP = 'DELETE' THEN
+    -- FAIL-SAFE BLOCK: Guarantees that source table july_existing_walkins is NEVER impacted
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
         UPDATE public.core_walkin
         SET is_deleted = TRUE,
             deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
@@ -590,6 +614,12 @@ BEGIN
             );
             PERFORM setval('public.core_walkin_id_seq', v_next_id, true);
         END IF;
+    EXCEPTION WHEN OTHERS THEN
+        -- Fail-safe decoupling: Guarantees that source table july_existing_walkins operations NEVER fail
+        RAISE WARNING 'core_walkin sync warning for portal_existing: %', SQLERRM;
+    END;
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
     END IF;
     RETURN NEW;
 END;
@@ -605,4 +635,31 @@ FOR EACH ROW EXECUTE FUNCTION fn_sync_core_walkin_from_portal_existing();
 -- -----------------------------------------------------------------------------
 CREATE OR REPLACE VIEW public.active_core_walkin AS
 SELECT * FROM public.core_walkin WHERE is_deleted = FALSE;
+
+-- -----------------------------------------------------------------------------
+-- 6. Deduplicated & Merged Analytics View (Unifies Dual Same-Day Submissions)
+-- -----------------------------------------------------------------------------
+CREATE OR REPLACE VIEW public.vw_core_walkin_merged AS
+SELECT 
+    MIN(id) AS master_id,
+    phone_number,
+    walkin_date,
+    MAX(city) AS city,
+    MAX(full_name) AS full_name,
+    COALESCE(MAX(NULLIF(aadhaar_number, '')), '') AS aadhaar_number,
+    COALESCE(MAX(NULLIF(dl_number, '')), '') AS dl_number,
+    COALESCE(MAX(NULLIF(dl_image_url, '')), '') AS dl_image_url,
+    COALESCE(MAX(NULLIF(aadhaar_image_url, '')), '') AS aadhaar_image_url,
+    MAX(visiting_reason_category) AS visiting_reason_category,
+    STRING_AGG(DISTINCT visiting_reason, ' | ') AS visiting_reasons_combined,
+    STRING_AGG(DISTINCT NULLIF(remarks, ''), ' | ') AS remarks_combined,
+    STRING_AGG(DISTINCT NULLIF(visit_notes, ''), ' | ') AS visit_notes_combined,
+    BOOL_OR(is_joined) AS is_joined,
+    STRING_AGG(DISTINCT source_system, ', ') AS combined_sources,
+    COUNT(*) AS submission_count,
+    MIN(walkin_timestamp) AS first_seen_at
+FROM public.core_walkin
+WHERE is_deleted = FALSE
+GROUP BY phone_number, walkin_date;
+
 

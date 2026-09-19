@@ -60,8 +60,8 @@ In `sheet_vehicle_allocations`, there are severe internal contradictions between
 * 13 rows have `driver_plan = 'D2R'` but `type_of_plan = 'D2O - Fixed'` or `'D2O - Only Uber'`.
 
 ### Resolution Logic:
-* Add a standardized column `canonical_plan` in `core_vehicle_allocation`.
-* Preserve the raw values in `driver_plan_raw` and `type_of_plan_raw` for auditability, but infer the normalized billing plan for Hisaab.
+* Preserve raw operational values in `driver_plan`, `type_of_plan`, and `rental_plan` within `core_vehicle_allocation` to guarantee zero source data corruption and full auditability.
+* Billing reconciliation and canonical tariff derivation are performed downstream in the Hisaab billing pipeline (`public.core_hisaab`).
 
 ---
 
@@ -119,5 +119,33 @@ The company's standard Operator/Driver ID format embeds the driver's phone numbe
   ```
 * This catches all user entry variations: `Drop-Off`, `drop off`, `Drop Off`, `dropoff`, `Dropoff`, `drop_off`.
 * Any matching record is blocked at the gate and never enters `core_vehicle_allocation`. If an existing allocation is modified to a drop-off, it is automatically removed from core.
-* Removing these 85 leaked drop-offs reconciled `core_vehicle_allocation` from 7,335 down to exactly **7,251 clean, continuous allocations** with zero sequence gaps.
+* Removing these 85 leaked drop-offs reconciled `core_vehicle_allocation` from 7,335 down to clean, continuous allocations with zero sequence gaps.
+
+---
+
+## 8. Lease-to-Own Prefix Inconsistency (`LETZOWN...`)
+
+### The Issue:
+* In Mumbai, LetzRyd operates a Lease-to-Own plan where driver IDs are prefixed with `LETZOWNMUM` (e.g., `LETZOWNMUM8308435250` for driver Nagesh Namdev Kadam on vehicle `MH03FC6383`).
+* Because gatekeeper regex only permitted `^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$`, these valid allocations were dropped at the gate.
+
+### Resolution Logic:
+* Add normalization step in triggers and backfill procedure:
+  ```sql
+  REGEXP_REPLACE(driver_id, '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP')
+  ```
+* This standardizes `LETZOWNMUM8308435250` $\rightarrow$ `LETZMUMIP8308435250`, allowing it to pass quality gatekeeping seamlessly.
+
+---
+
+## 9. Web Portal Walk-in Lead ID Resolution (`LR-xxxx`)
+
+### The Issue:
+* Portal executives occasionally enter walk-in lead tracking codes (`LR-6720`, `LR-6085`) into the `driver_id` field instead of the registered partner ID.
+* Because the Google Sheet contains the registered partner ID (`LETZBLR6366022794`, `LETZBLR7511177048`), the portal records failed gatekeeping and could not merge into core records 6688 and 6689, losing inspection photos and checklist data.
+
+### Resolution Logic:
+* When `driver_id ~* '^LR-[0-9]+'` and a valid 10-digit phone number is present, synthesize the canonical partner ID as `'LETZ' || <CITY_CODE> || 'IP' || <10-DIGIT-PHONE>`.
+* Enables automatic dual-source merging (`source_origin = 'MERGED'`) with complete photo and checklist preservation.
+
 

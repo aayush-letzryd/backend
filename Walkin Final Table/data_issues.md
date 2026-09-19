@@ -26,16 +26,16 @@ Per operational guidelines:
 
 ### ISS-01: Executive Email Typed into Candidate Last Name (Portal Form)
 - **Source Table**: `public.july_new_walkins`
-- **Affected Rows**: Phone `9866153295` (`Utpal Dhar radha.krishna@letzryd.com`) and Phone `9027310514` (`Bittu Chauhan radha.krishna@letzryd.com`).
-- **Root Cause**: Field executive (Radha Krishna) typed or browser autofilled his company email into the last name input field on the portal form.
+- **Affected Rows**: 9 candidates across multiple executives (Radha Krishna, Ankita, Sandeep), e.g. Phones `9866153295` (`Utpal Dhar radha.krishna@letzryd.com`), `9027310514` (`Bittu Chauhan radha.krishna@letzryd.com`), `9652539266` (`Goddanla Pochaiah radha.krishna@letzryd.com`), `7738192978` (`Lakhan ankita@letzryd.com`), `7093738811` (`kishore kumar sandeep@letzryd.com`).
+- **Root Cause**: Field executives' browser autofill automatically populates their saved corporate email into the candidate's last name input field on the portal form.
 - **Pipeline Handling**: Preserved verbatim as submitted.
-- **Ops Recommendation**: Add validation on the Portal form to disallow `@` in name fields, and check browser autofill settings on hub laptops.
+- **Ops Recommendation**: Add `autoComplete="off"` on the Portal form and disallow `@` in candidate name fields.
 
 ---
 
 ### ISS-02: Placeholder Aadhaar Numbers (Portal Form)
 - **Source Table**: `public.july_new_walkins`
-- **Affected Rows**: Phone `9027310514` (`aadhaar_number` = `1111 1111 1111`).
+- **Affected Rows**: 19 records contain empty strings `''` or repetitive sequences (`1111 1111 1111`, `1111 1111 1112`).
 - **Root Cause**: The Aadhaar input field allowed repetitive dummy numbers.
 - **Pipeline Handling**: Preserved verbatim as submitted.
 - **Ops Recommendation**: Enforce 12-digit numeric validation and reject repeated sequences (`0000 0000 0000`, `1111 1111 1111`).
@@ -60,9 +60,9 @@ Per operational guidelines:
 
 ### ISS-05: Dual Submissions on the Same Day (Google Form + Portal Form)
 - **Source Tables**: `sheet_walkins` and `july_new_walkins`
-- **Affected Rows**: 3 candidates submitted on August 21 and August 31 (phones `9347929919`, `9866153295`, `9027310514`).
+- **Affected Rows**: 7 candidates submitted on the same date (phones `9652539266`, `9549024324`, `9110513610`, `8305762724`, `9027310514`, `9866153295`, `9347929919`).
 - **Root Cause**: Hub executives entered the candidate in both Google Forms and the Portal Form on the same afternoon.
-- **Pipeline Handling**: Both entries are preserved as separate walk-in events with their respective source indicators (`GOOGLE_SHEET` and `PORTAL_NEW`). No data is merged or dropped.
+- **Pipeline Handling**: Raw entries are preserved as separate events in `core_walkin` for 100% auditability. Downstream BI queries should use `public.vw_core_walkin_merged` to view deduplicated records without double counting.
 - **Ops Recommendation**: Establish standard operating procedures (SOP) on whether hub executives should use Google Forms or Portal Forms.
 
 ---
@@ -71,3 +71,18 @@ Per operational guidelines:
 - **Source Tables**: Free-text tags in Google Sheet vs fixed dropdown in Portal.
 - **Pipeline Handling**: The verbatim reason string is retained in `visiting_reason`, while a standardized reporting category is populated in `visiting_reason_category`.
 - **Ops Recommendation**: Align dropdown choices between the Google Form and the Portal Form.
+
+---
+
+### ISS-07: Trigger Column Mismatch on `july_existing_walkins` (Resolved)
+- **Source Table**: `public.july_existing_walkins`
+- **Root Cause**: The live PostgreSQL trigger function `fn_sync_core_walkin_from_portal_existing` had an outdated definition referencing `NEW.operating_place` and `NEW.remarks`, causing runtime crashes on insert/update.
+- **Resolution**: Re-deployed corrected function mapping `NEW.visit_notes` and setting `operating_place` to `NULL`. Confirmed live passing tests.
+
+---
+
+### ISS-08: `is_joined` Tri-State Inconsistency (`NULL` vs `FALSE`) (Resolved)
+- **Source Table**: `public.sheet_walkins`
+- **Root Cause**: When `joined_status` was NULL, `NULL ILIKE ...` returned `NULL`, inserting 86 rows with `is_joined = NULL` into `core_walkin`.
+- **Resolution**: Wrapped trigger assignments in `COALESCE(..., FALSE)` and backfilled existing 86 rows to `FALSE`. Live `core_walkin` now has strictly 0 NULLs.
+

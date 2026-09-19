@@ -201,7 +201,8 @@ BEGIN
 
     -- Normalization
     v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
-    v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
+    v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.operator_driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP');
+    v_norm_partner_id := REGEXP_REPLACE(v_norm_partner_id, '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
 
     -- Gatekeeper check
@@ -209,9 +210,13 @@ BEGIN
         RETURN NEW;
     END IF;
 
-    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (handles drop-off, drop off, dropoff, drop_off)
+    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (soft-delete to preserve sequence & audit trail)
     IF REGEXP_REPLACE(LOWER(TRIM(COALESCE(NEW.allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff' THEN
-        DELETE FROM public.core_vehicle_allocation WHERE sheet_record_id = NEW.id;
+        UPDATE public.core_vehicle_allocation
+        SET is_deleted = TRUE,
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+        WHERE sheet_record_id = NEW.id;
         RETURN NEW;
     END IF;
 
@@ -247,7 +252,7 @@ BEGIN
     INTO v_existing_id, v_existing_portal_id
     FROM public.core_vehicle_allocation
     WHERE (sheet_record_id = NEW.id) 
-       OR (allocation_date = NEW.allocation_date AND vehicle_number = v_clean_vnum AND partner_id = v_norm_partner_id)
+       OR (allocation_date = NEW.allocation_date AND vehicle_number = v_clean_vnum AND (partner_id = v_norm_partner_id OR driver_phone = v_clean_phone))
     ORDER BY (sheet_record_id = NEW.id) DESC
     LIMIT 1;
 
@@ -382,22 +387,6 @@ BEGIN
         RETURN OLD;
     END IF;
 
-    -- Normalization
-    v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
-    v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
-    v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
-
-    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (handles drop-off, drop off, dropoff, drop_off)
-    IF REGEXP_REPLACE(LOWER(TRIM(COALESCE(NEW.allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff' THEN
-        DELETE FROM public.core_vehicle_allocation WHERE portal_record_id = NEW.id;
-        RETURN NEW;
-    END IF;
-
-    -- Gatekeeper check (Rejects 51 test records!)
-    IF NEW.allocation_date IS NULL OR LENGTH(v_clean_vnum) NOT BETWEEN 8 AND 12 OR v_norm_partner_id !~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$' THEN
-        RETURN NEW;
-    END IF;
-
     -- City canonicalization
     v_clean_city := CASE 
         WHEN LOWER(TRIM(COALESCE(NEW.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'Bengaluru'
@@ -406,6 +395,38 @@ BEGIN
         WHEN LOWER(TRIM(COALESCE(NEW.city_name, ''))) IN ('pune', 'pun') THEN 'Pune'
         ELSE LEFT(INITCAP(TRIM(COALESCE(NEW.city_name, 'Unknown'))), 100)
     END;
+
+    -- Normalization
+    v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
+    v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.driver_phone, ''), '\D', '', 'g'), 10);
+    v_norm_partner_id := REGEXP_REPLACE(UPPER(TRIM(COALESCE(NEW.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP');
+    v_norm_partner_id := REGEXP_REPLACE(v_norm_partner_id, '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP');
+
+    -- Walk-in lead code resolution (e.g. LR-6720 entered instead of LETZ partner ID)
+    IF v_norm_partner_id ~* '^LR-[0-9]+' AND LENGTH(v_clean_phone) = 10 THEN
+        v_norm_partner_id := 'LETZ' || CASE 
+            WHEN v_clean_city = 'Bengaluru' THEN 'BLRIP'
+            WHEN v_clean_city = 'Hyderabad' THEN 'HYDIP'
+            WHEN v_clean_city = 'Mumbai' THEN 'MUMIP'
+            WHEN v_clean_city = 'Pune' THEN 'PUNIP'
+            ELSE 'BLRIP'
+        END || v_clean_phone;
+    END IF;
+
+    -- Drop-off filter: Drop-off entries belong strictly to the drop-off pipeline (soft-delete to preserve sequence & audit trail)
+    IF REGEXP_REPLACE(LOWER(TRIM(COALESCE(NEW.allocation_type, ''))), '[\s\-_]', '', 'g') = 'dropoff' THEN
+        UPDATE public.core_vehicle_allocation
+        SET is_deleted = TRUE,
+            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+        WHERE portal_record_id = NEW.id;
+        RETURN NEW;
+    END IF;
+
+    -- Gatekeeper check (Rejects invalid test records)
+    IF NEW.allocation_date IS NULL OR LENGTH(v_clean_vnum) NOT BETWEEN 8 AND 12 OR v_norm_partner_id !~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$' THEN
+        RETURN NEW;
+    END IF;
 
     -- Allocation type standardization
     v_clean_alloc_type := CASE
@@ -437,7 +458,7 @@ BEGIN
     INTO v_existing_id, v_existing_sheet_id
     FROM public.core_vehicle_allocation
     WHERE (portal_record_id = NEW.id) 
-       OR (allocation_date = NEW.allocation_date AND vehicle_number = v_clean_vnum AND partner_id = v_norm_partner_id)
+       OR (allocation_date = NEW.allocation_date AND vehicle_number = v_clean_vnum AND (partner_id = v_norm_partner_id OR driver_phone = v_clean_phone))
     ORDER BY (portal_record_id = NEW.id) DESC
     LIMIT 1;
 
@@ -618,7 +639,7 @@ BEGIN
         NULL::INTEGER AS portal_record_id,
         s.allocation_date,
         REGEXP_REPLACE(UPPER(COALESCE(s.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS vehicle_number,
-        REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS partner_id,
+        REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS partner_id,
         RIGHT(REGEXP_REPLACE(COALESCE(s.driver_phone, ''), '\D', '', 'g'), 10) AS driver_phone,
         LEFT(TRIM(REGEXP_REPLACE(COALESCE(s.driver_name, 'UNKNOWN'), '\s+', ' ', 'g')), 255) AS driver_name,
         CASE 
@@ -715,7 +736,7 @@ BEGIN
     FROM public.sheet_vehicle_allocations s
     WHERE s.allocation_date IS NOT NULL
       AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(s.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
-      AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+      AND REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(s.operator_driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
       AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(s.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff';
 
     GET DIAGNOSTICS v_sheet_count = ROW_COUNT;
@@ -724,17 +745,50 @@ BEGIN
     WITH portal_ranked AS (
         SELECT p.*,
                REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS clean_vnum,
-               REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS norm_id,
+               CASE 
+                   WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                       'LETZ' || CASE 
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                           ELSE 'BLRIP'
+                       END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                   ELSE 
+                       REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+               END AS norm_id,
                ROW_NUMBER() OVER (
                    PARTITION BY p.allocation_date, 
                                 REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g'),
-                                REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+                                CASE 
+                                   WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                                       'LETZ' || CASE 
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                                           ELSE 'BLRIP'
+                                       END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                                   ELSE 
+                                       REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+                                END
                    ORDER BY p.created_at DESC NULLS LAST, p.id DESC
                ) as rn
         FROM public.july_allocation_form p
         WHERE p.allocation_date IS NOT NULL
           AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
-          AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+          AND CASE 
+                WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                    'LETZ' || CASE 
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                        ELSE 'BLRIP'
+                    END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                ELSE 
+                    REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+              END ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
           AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(p.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff'
     ),
     portal_clean AS (
@@ -813,7 +867,7 @@ BEGIN
     FROM portal_clean p
     WHERE c.allocation_date = p.allocation_date
       AND c.vehicle_number = p.clean_vnum
-      AND c.partner_id = p.norm_id;
+      AND (c.partner_id = p.norm_id OR c.driver_phone = RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10));
 
     GET DIAGNOSTICS v_portal_merged = ROW_COUNT;
 
@@ -823,17 +877,50 @@ BEGIN
     WITH portal_ranked AS (
         SELECT p.*,
                REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g') AS clean_vnum,
-               REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') AS norm_id,
+               CASE 
+                   WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                       'LETZ' || CASE 
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                           ELSE 'BLRIP'
+                       END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                   ELSE 
+                       REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+               END AS norm_id,
                ROW_NUMBER() OVER (
                    PARTITION BY p.allocation_date, 
                                 REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g'),
-                                REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+                                CASE 
+                                   WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                                       'LETZ' || CASE 
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                                           WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                                           ELSE 'BLRIP'
+                                       END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                                   ELSE 
+                                       REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+                                END
                    ORDER BY p.created_at DESC NULLS LAST, p.id DESC
                ) as rn
         FROM public.july_allocation_form p
         WHERE p.allocation_date IS NOT NULL
           AND LENGTH(REGEXP_REPLACE(UPPER(COALESCE(p.vehicle_number, '')), '[^A-Z0-9]', '', 'g')) BETWEEN 8 AND 12
-          AND REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP') ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
+          AND CASE 
+                WHEN UPPER(TRIM(COALESCE(p.driver_id, ''))) ~* '^LR-[0-9]+' AND LENGTH(RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)) = 10 THEN
+                    'LETZ' || CASE 
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('bangalore', 'bengaluru', 'blr') THEN 'BLRIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('hyderabad', 'hyd') THEN 'HYDIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('mumbai', 'mum') THEN 'MUMIP'
+                        WHEN LOWER(TRIM(COALESCE(p.city_name, ''))) IN ('pune', 'pun') THEN 'PUNIP'
+                        ELSE 'BLRIP'
+                    END || RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10)
+                ELSE 
+                    REGEXP_REPLACE(REGEXP_REPLACE(UPPER(TRIM(COALESCE(p.driver_id, ''))), '^LETZOWN(BLR|HYD|MUM|PUN)', 'LETZ\1IP'), '^(LETZ(?:BLR|HYD|MUM|PUN))OP', '\1IP')
+              END ~ '^LETZ(BLR|HYD|MUM|PUN)(IP)?[0-9]{10}$'
           AND REGEXP_REPLACE(LOWER(TRIM(COALESCE(p.allocation_type, ''))), '[\s\-_]', '', 'g') != 'dropoff'
     ),
     portal_clean AS (
@@ -846,7 +933,7 @@ BEGIN
         LEFT JOIN public.core_vehicle_allocation c 
           ON c.allocation_date = p.allocation_date
          AND c.vehicle_number = p.clean_vnum
-         AND c.partner_id = p.norm_id
+         AND (c.partner_id = p.norm_id OR c.driver_phone = RIGHT(REGEXP_REPLACE(COALESCE(p.driver_phone, ''), '\D', '', 'g'), 10))
         WHERE c.id IS NULL
     )
     INSERT INTO public.core_vehicle_allocation (

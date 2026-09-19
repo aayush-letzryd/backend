@@ -144,126 +144,136 @@ DECLARE
     v_next_id BIGINT;
     v_partner_id VARCHAR(50);
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_partner_onboarding
-        SET is_deleted = TRUE, 
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), 
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE source_sheet_row_id = OLD.id AND source_origin = 'GOOGLE_SHEET';
-        RETURN OLD;
-    END IF;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            UPDATE public.core_partner_onboarding
+            SET is_deleted = CASE WHEN source_origin = 'GOOGLE_SHEET' THEN TRUE ELSE is_deleted END,
+                source_origin = CASE WHEN source_origin = 'MERGED' THEN 'PORTAL_FORM' ELSE source_origin END,
+                source_sheet_row_id = CASE WHEN source_origin = 'MERGED' THEN NULL ELSE source_sheet_row_id END,
+                deleted_at = CASE WHEN source_origin = 'GOOGLE_SHEET' THEN (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') ELSE deleted_at END,
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE source_sheet_row_id = OLD.id;
+            RETURN OLD;
+        END IF;
 
-    IF NEW.driver_phone IS NOT NULL THEN
-        v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.driver_phone, '[^0-9]', '', 'g'), 10);
-        IF LENGTH(v_clean_phone) = 10 THEN
-            PERFORM pg_advisory_xact_lock(777111222);
+        IF NEW.driver_phone IS NOT NULL THEN
+            v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.driver_phone, '[^0-9]', '', 'g'), 10);
+            IF LENGTH(v_clean_phone) = 10 THEN
+                PERFORM pg_advisory_xact_lock(777111222);
 
-            v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
+                v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
 
-            SELECT id, source_origin INTO v_existing_id, v_existing_origin
-            FROM public.core_partner_onboarding
-            WHERE phone_number = v_clean_phone;
+                SELECT id, source_origin INTO v_existing_id, v_existing_origin
+                FROM public.core_partner_onboarding
+                WHERE phone_number = v_clean_phone;
 
-            IF v_existing_id IS NOT NULL THEN
-                UPDATE public.core_partner_onboarding
-                SET
-                    partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
-                    driver_name = UPPER(NEW.driver_name),
-                    whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(NEW.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone, core_partner_onboarding.whatsapp_number),
-                    dob = COALESCE(NEW.dob, core_partner_onboarding.dob),
-                    city = COALESCE(NEW.city, core_partner_onboarding.city),
-                    onboarding_type = COALESCE(NEW.onboarding_type, core_partner_onboarding.onboarding_type),
-                    father_name = COALESCE(NEW.father_name, core_partner_onboarding.father_name),
-                    present_address = COALESCE(NEW.present_address, NEW.aadhaar_address, core_partner_onboarding.present_address),
-                    permanent_address = COALESCE(NEW.aadhaar_address, core_partner_onboarding.permanent_address),
-                    emergency_name = COALESCE(NEW.emergency_name, core_partner_onboarding.emergency_name),
-                    emergency_phone = COALESCE(NEW.emergency_phone, core_partner_onboarding.emergency_phone),
-                    reference_name = COALESCE(NEW.reference_name, core_partner_onboarding.reference_name),
-                    reference_phone = COALESCE(NEW.reference_phone, core_partner_onboarding.reference_phone),
-                    dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
-                    dl_expiry_date = COALESCE(NEW.dl_expiry, core_partner_onboarding.dl_expiry_date),
-                    pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
-                    aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
-                    pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
-                    account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
-                    account_number = COALESCE(NEW.account_number, core_partner_onboarding.account_number),
-                    ifsc_code = COALESCE(NEW.ifsc_code, core_partner_onboarding.ifsc_code),
-                    upi_id = COALESCE(NEW.upi_id, core_partner_onboarding.upi_id),
-                    selfie_photo = COALESCE(NEW.selfie_photo, core_partner_onboarding.selfie_photo),
-                    dl_front = COALESCE(NEW.dl_front, core_partner_onboarding.dl_front),
-                    dl_back = COALESCE(NEW.dl_back, core_partner_onboarding.dl_back),
-                    aadhaar_card_front = COALESCE(NEW.aadhaar_front, core_partner_onboarding.aadhaar_card_front),
-                    aadhaar_card_back = COALESCE(NEW.aadhaar_back, core_partner_onboarding.aadhaar_card_back),
-                    pan_card_photo = COALESCE(NEW.pan_card, core_partner_onboarding.pan_card_photo),
-                    local_address_proof = COALESCE(NEW.local_address_proof, core_partner_onboarding.local_address_proof),
-                    cancelled_cheque_photo = COALESCE(NEW.bank_details_doc, core_partner_onboarding.cancelled_cheque_photo),
-                    security_deposit = CASE WHEN COALESCE(NEW.deposit_amount, 0.00) > 0 THEN NEW.deposit_amount ELSE core_partner_onboarding.security_deposit END,
-                    source_sheet_row_id = NEW.id,
-                    source_origin = CASE WHEN v_existing_origin IN ('PORTAL_FORM', 'MERGED') THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
-                    is_deleted = FALSE,
-                    deleted_at = NULL,
-                    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                WHERE id = v_existing_id;
-            ELSE
-                SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
+                IF v_existing_id IS NOT NULL THEN
+                    UPDATE public.core_partner_onboarding
+                    SET
+                        partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
+                        driver_name = COALESCE(UPPER(TRIM(NEW.driver_name)), core_partner_onboarding.driver_name),
+                        whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(NEW.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone, core_partner_onboarding.whatsapp_number),
+                        dob = COALESCE(NEW.dob, core_partner_onboarding.dob),
+                        city = COALESCE(NEW.city, core_partner_onboarding.city),
+                        onboarding_type = COALESCE(NEW.onboarding_type, core_partner_onboarding.onboarding_type),
+                        lead_source = COALESCE(NEW.lead_source, core_partner_onboarding.lead_source),
+                        driver_plan = COALESCE(NEW.driver_plan, core_partner_onboarding.driver_plan),
+                        father_name = COALESCE(NEW.father_name, core_partner_onboarding.father_name),
+                        present_address = COALESCE(NEW.present_address, NEW.aadhaar_address, core_partner_onboarding.present_address),
+                        permanent_address = COALESCE(NEW.aadhaar_address, core_partner_onboarding.permanent_address),
+                        emergency_name = COALESCE(NEW.emergency_name, core_partner_onboarding.emergency_name),
+                        emergency_phone = COALESCE(NEW.emergency_phone, core_partner_onboarding.emergency_phone),
+                        reference_name = COALESCE(NEW.reference_name, core_partner_onboarding.reference_name),
+                        reference_phone = COALESCE(NEW.reference_phone, core_partner_onboarding.reference_phone),
+                        dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
+                        dl_expiry_date = COALESCE(NEW.dl_expiry, core_partner_onboarding.dl_expiry_date),
+                        pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
+                        aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
+                        pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
+                        account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
+                        account_number = COALESCE(NEW.account_number, core_partner_onboarding.account_number),
+                        ifsc_code = COALESCE(NEW.ifsc_code, core_partner_onboarding.ifsc_code),
+                        upi_id = COALESCE(NEW.upi_id, core_partner_onboarding.upi_id),
+                        selfie_photo = COALESCE(NEW.selfie_photo, core_partner_onboarding.selfie_photo),
+                        dl_front = COALESCE(NEW.dl_front, core_partner_onboarding.dl_front),
+                        dl_back = COALESCE(NEW.dl_back, core_partner_onboarding.dl_back),
+                        aadhaar_card_front = COALESCE(NEW.aadhaar_front, core_partner_onboarding.aadhaar_card_front),
+                        aadhaar_card_back = COALESCE(NEW.aadhaar_back, core_partner_onboarding.aadhaar_card_back),
+                        pan_card_photo = COALESCE(NEW.pan_card, core_partner_onboarding.pan_card_photo),
+                        local_address_proof = COALESCE(NEW.local_address_proof, core_partner_onboarding.local_address_proof),
+                        cancelled_cheque_photo = COALESCE(NEW.bank_details_doc, core_partner_onboarding.cancelled_cheque_photo),
+                        security_deposit = CASE WHEN COALESCE(NEW.deposit_amount, 0.00) > 0 THEN NEW.deposit_amount ELSE core_partner_onboarding.security_deposit END,
+                        source_sheet_row_id = NEW.id,
+                        source_origin = CASE WHEN v_existing_origin IN ('PORTAL_FORM', 'MERGED') THEN 'MERGED' ELSE 'GOOGLE_SHEET' END,
+                        is_deleted = FALSE,
+                        deleted_at = NULL,
+                        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+                    WHERE id = v_existing_id;
+                ELSE
+                    SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
 
-                INSERT INTO public.core_partner_onboarding (
-                    id, partner_id, driver_name, phone_number, whatsapp_number, dob,
-                    city, onboarding_type, lead_source, driver_plan, father_name,
-                    present_address, permanent_address, emergency_name, emergency_phone,
-                    reference_name, reference_phone, dl_number, dl_expiry_date,
-                    pan_number, aadhaar_number, pan_aadhaar_linked, account_name,
-                    account_number, ifsc_code, upi_id, security_deposit,
-                    selfie_photo, dl_front, dl_back, aadhaar_card_front, aadhaar_card_back,
-                    pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
-                    source_origin, source_sheet_row_id, onboarding_timestamp, is_deleted, created_at, updated_at
-                ) VALUES (
-                    v_next_id,
-                    v_partner_id,
-                    UPPER(NEW.driver_name),
-                    v_clean_phone,
-                    COALESCE(RIGHT(REGEXP_REPLACE(NEW.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone),
-                    NEW.dob,
-                    COALESCE(NEW.city, 'Bengaluru'),
-                    COALESCE(NEW.onboarding_type, 'Individual'),
-                    NEW.lead_source,
-                    NEW.driver_plan,
-                    NEW.father_name,
-                    COALESCE(NEW.present_address, NEW.aadhaar_address),
-                    NEW.aadhaar_address,
-                    NEW.emergency_name,
-                    NEW.emergency_phone,
-                    NEW.reference_name,
-                    NEW.reference_phone,
-                    NEW.dl_number,
-                    NEW.dl_expiry,
-                    NEW.pan_number,
-                    REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
-                    NEW.pan_aadhaar_linked,
-                    NEW.account_name,
-                    NEW.account_number,
-                    NEW.ifsc_code,
-                    NEW.upi_id,
-                    COALESCE(NEW.deposit_amount, 0.00),
-                    NEW.selfie_photo,
-                    NEW.dl_front,
-                    NEW.dl_back,
-                    NEW.aadhaar_front,
-                    NEW.aadhaar_back,
-                    NEW.pan_card,
-                    NEW.local_address_proof,
-                    NEW.bank_details_doc,
-                    'Draft',
-                    'GOOGLE_SHEET',
-                    NEW.id,
-                    NEW.submission_timestamp,
-                    FALSE,
-                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                );
+                    INSERT INTO public.core_partner_onboarding (
+                        id, partner_id, driver_name, phone_number, whatsapp_number, dob,
+                        city, onboarding_type, lead_source, driver_plan, father_name,
+                        present_address, permanent_address, emergency_name, emergency_phone,
+                        reference_name, reference_phone, dl_number, dl_expiry_date,
+                        pan_number, aadhaar_number, pan_aadhaar_linked, account_name,
+                        account_number, ifsc_code, upi_id, security_deposit,
+                        selfie_photo, dl_front, dl_back, aadhaar_card_front, aadhaar_card_back,
+                        pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
+                        source_origin, source_sheet_row_id, onboarding_timestamp, is_deleted, created_at, updated_at
+                    ) VALUES (
+                        v_next_id,
+                        v_partner_id,
+                        UPPER(TRIM(NEW.driver_name)),
+                        v_clean_phone,
+                        COALESCE(RIGHT(REGEXP_REPLACE(NEW.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone),
+                        NEW.dob,
+                        COALESCE(NEW.city, 'Bengaluru'),
+                        COALESCE(NEW.onboarding_type, 'Individual'),
+                        NEW.lead_source,
+                        NEW.driver_plan,
+                        NEW.father_name,
+                        COALESCE(NEW.present_address, NEW.aadhaar_address),
+                        NEW.aadhaar_address,
+                        NEW.emergency_name,
+                        NEW.emergency_phone,
+                        NEW.reference_name,
+                        NEW.reference_phone,
+                        NEW.dl_number,
+                        NEW.dl_expiry,
+                        NEW.pan_number,
+                        REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
+                        NEW.pan_aadhaar_linked,
+                        NEW.account_name,
+                        NEW.account_number,
+                        NEW.ifsc_code,
+                        NEW.upi_id,
+                        COALESCE(NEW.deposit_amount, 0.00),
+                        NEW.selfie_photo,
+                        NEW.dl_front,
+                        NEW.dl_back,
+                        NEW.aadhaar_front,
+                        NEW.aadhaar_back,
+                        NEW.pan_card,
+                        NEW.local_address_proof,
+                        NEW.bank_details_doc,
+                        'Draft',
+                        'GOOGLE_SHEET',
+                        NEW.id,
+                        NEW.submission_timestamp,
+                        FALSE,
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+                    );
+                END IF;
+                -- Keep sequence in sync with max id
+                PERFORM setval('public.core_partner_onboarding_id_seq', (SELECT MAX(id) FROM public.core_partner_onboarding));
             END IF;
         END IF;
-    END IF;
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'fn_sync_sheet_driver_onboarding error shielded for id %: %', COALESCE(NEW.id, 0), SQLERRM;
+    END;
 
     RETURN NEW;
 END;
@@ -285,129 +295,157 @@ DECLARE
     v_partner_id VARCHAR(50);
     v_parsed_dob DATE;
     v_parsed_dl_exp DATE;
+    v_parsed_deposit NUMERIC(12, 2);
+    v_clean_ref_phone VARCHAR(20);
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_partner_onboarding
-        SET is_deleted = TRUE, 
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), 
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE source_portal_form_id = OLD.id AND source_origin = 'PORTAL_FORM';
-        RETURN OLD;
-    END IF;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            UPDATE public.core_partner_onboarding
+            SET is_deleted = CASE WHEN source_origin = 'PORTAL_FORM' THEN TRUE ELSE is_deleted END,
+                source_origin = CASE WHEN source_origin = 'MERGED' THEN 'GOOGLE_SHEET' ELSE source_origin END,
+                source_portal_form_id = CASE WHEN source_origin = 'MERGED' THEN NULL ELSE source_portal_form_id END,
+                deleted_at = CASE WHEN source_origin = 'PORTAL_FORM' THEN (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') ELSE deleted_at END,
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE source_portal_form_id = OLD.id;
+            RETURN OLD;
+        END IF;
 
-    IF NEW.phone_number IS NOT NULL THEN
-        v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.phone_number, '[^0-9]', '', 'g'), 10);
-        IF LENGTH(v_clean_phone) = 10 THEN
-            PERFORM pg_advisory_xact_lock(777111222);
+        IF NEW.phone_number IS NOT NULL THEN
+            v_clean_phone := RIGHT(REGEXP_REPLACE(NEW.phone_number, '[^0-9]', '', 'g'), 10);
+            IF LENGTH(v_clean_phone) = 10 THEN
+                PERFORM pg_advisory_xact_lock(777111222);
 
-            v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
-            v_parsed_dob := public.fn_safe_cast_date(NEW.dob);
-            v_parsed_dl_exp := public.fn_safe_cast_date(NEW.dl_expiry_date);
+                v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
+                v_parsed_dob := public.fn_safe_cast_date(NEW.dob);
+                v_parsed_dl_exp := public.fn_safe_cast_date(NEW.dl_expiry_date);
+                
+                -- Safe numeric parsing for security deposit
+                BEGIN
+                    v_parsed_deposit := NULLIF(REGEXP_REPLACE(COALESCE(NEW.security_deposit, ''), '[^0-9.]', '', 'g'), '')::NUMERIC(12, 2);
+                EXCEPTION WHEN OTHERS THEN
+                    v_parsed_deposit := 0.00;
+                END;
 
-            SELECT id, source_origin INTO v_existing_id, v_existing_origin
-            FROM public.core_partner_onboarding
-            WHERE phone_number = v_clean_phone;
+                v_clean_ref_phone := RIGHT(REGEXP_REPLACE(COALESCE(NEW.ref1_phone, ''), '[^0-9]', '', 'g'), 10);
 
-            IF v_existing_id IS NOT NULL THEN
-                UPDATE public.core_partner_onboarding
-                SET
-                    partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
-                    driver_name = UPPER(NEW.driver_name),
-                    whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
-                    dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
-                    father_name = COALESCE(NEW.father_name, core_partner_onboarding.father_name),
-                    city = COALESCE(NEW.city, core_partner_onboarding.city),
-                    present_address = COALESCE(NEW.present_address, core_partner_onboarding.present_address),
-                    permanent_address = COALESCE(NEW.permanent_address, core_partner_onboarding.permanent_address),
-                    emergency_name = COALESCE(NEW.emergency_name, core_partner_onboarding.emergency_name),
-                    emergency_phone = COALESCE(NEW.emergency_phone, core_partner_onboarding.emergency_phone),
-                    emergency_relationship = COALESCE(NEW.emergency_relationship, core_partner_onboarding.emergency_relationship),
-                    dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
-                    dl_expiry_date = COALESCE(v_parsed_dl_exp, core_partner_onboarding.dl_expiry_date),
-                    pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
-                    aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
-                    pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
-                    bank_name = COALESCE(NEW.bank_name, core_partner_onboarding.bank_name),
-                    account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
-                    account_number = COALESCE(NEW.account_number, core_partner_onboarding.account_number),
-                    ifsc_code = COALESCE(NEW.ifsc_code, core_partner_onboarding.ifsc_code),
-                    upi_id = COALESCE(NEW.upi_id, core_partner_onboarding.upi_id),
-                    selfie_photo = COALESCE(NEW.selfie_photo, core_partner_onboarding.selfie_photo),
-                    dl_front = COALESCE(NEW.dl_front, core_partner_onboarding.dl_front),
-                    dl_back = COALESCE(NEW.dl_back, core_partner_onboarding.dl_back),
-                    aadhaar_card_front = COALESCE(NEW.aadhaar_card_front, core_partner_onboarding.aadhaar_card_front),
-                    aadhaar_card_back = COALESCE(NEW.aadhaar_card_back, core_partner_onboarding.aadhaar_card_back),
-                    pan_card_photo = COALESCE(NEW.pan_card_photo, core_partner_onboarding.pan_card_photo),
-                    local_address_proof = COALESCE(NEW.local_address_proof, core_partner_onboarding.local_address_proof),
-                    cancelled_cheque_photo = COALESCE(NEW.cancelled_cheque_photo, core_partner_onboarding.cancelled_cheque_photo),
-                    approval_status = COALESCE(NEW.approval_status, core_partner_onboarding.approval_status),
-                    is_documents_verified = COALESCE(NEW.documents_verified, core_partner_onboarding.is_documents_verified),
-                    is_spring_verified = COALESCE(NEW.is_spring_verified, core_partner_onboarding.is_spring_verified),
-                    source_portal_form_id = NEW.id,
-                    source_origin = CASE WHEN v_existing_origin IN ('GOOGLE_SHEET', 'MERGED') THEN 'MERGED' ELSE 'PORTAL_FORM' END,
-                    is_deleted = FALSE,
-                    deleted_at = NULL,
-                    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                WHERE id = v_existing_id;
-            ELSE
-                SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
+                SELECT id, source_origin INTO v_existing_id, v_existing_origin
+                FROM public.core_partner_onboarding
+                WHERE phone_number = v_clean_phone;
 
-                INSERT INTO public.core_partner_onboarding (
-                    id, partner_id, driver_name, phone_number, whatsapp_number,
-                    dob, father_name, city, present_address, permanent_address, emergency_name, emergency_phone,
-                    emergency_relationship, dl_number, dl_expiry_date, lead_source, pan_number, aadhaar_number,
-                    pan_aadhaar_linked, bank_name, account_name, account_number, ifsc_code,
-                    upi_id, selfie_photo, dl_front, dl_back, aadhaar_card_front,
-                    aadhaar_card_back, pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
-                    is_documents_verified, is_spring_verified, source_origin, source_portal_form_id,
-                    onboarding_timestamp, is_deleted, created_at, updated_at
-                ) VALUES (
-                    v_next_id,
-                    v_partner_id,
-                    UPPER(NEW.driver_name),
-                    v_clean_phone,
-                    RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10),
-                    v_parsed_dob,
-                    NEW.father_name,
-                    COALESCE(NEW.city, 'Bengaluru'),
-                    NEW.present_address,
-                    NEW.permanent_address,
-                    NEW.emergency_name,
-                    NEW.emergency_phone,
-                    NEW.emergency_relationship,
-                    NEW.dl_number,
-                    v_parsed_dl_exp,
-                    NEW.lead_source,
-                    NEW.pan_number,
-                    REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
-                    NEW.pan_aadhaar_linked,
-                    NEW.bank_name,
-                    NEW.account_name,
-                    NEW.account_number,
-                    NEW.ifsc_code,
-                    NEW.upi_id,
-                    NEW.selfie_photo,
-                    NEW.dl_front,
-                    NEW.dl_back,
-                    NEW.aadhaar_card_front,
-                    NEW.aadhaar_card_back,
-                    NEW.pan_card_photo,
-                    NEW.local_address_proof,
-                    NEW.cancelled_cheque_photo,
-                    COALESCE(NEW.approval_status, 'Draft'),
-                    COALESCE(NEW.documents_verified, FALSE),
-                    COALESCE(NEW.is_spring_verified, FALSE),
-                    'PORTAL_FORM',
-                    NEW.id,
-                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-                    FALSE,
-                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-                    (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-                );
+                IF v_existing_id IS NOT NULL THEN
+                    UPDATE public.core_partner_onboarding
+                    SET
+                        partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
+                        driver_name = COALESCE(UPPER(TRIM(NEW.driver_name)), core_partner_onboarding.driver_name),
+                        whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
+                        dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
+                        father_name = COALESCE(NEW.father_name, core_partner_onboarding.father_name),
+                        city = COALESCE(NEW.city, core_partner_onboarding.city),
+                        lead_source = COALESCE(NEW.lead_source, core_partner_onboarding.lead_source),
+                        driver_plan = COALESCE(NEW.rental_model, core_partner_onboarding.driver_plan),
+                        present_address = COALESCE(NEW.present_address, core_partner_onboarding.present_address),
+                        permanent_address = COALESCE(NEW.permanent_address, core_partner_onboarding.permanent_address),
+                        emergency_name = COALESCE(NEW.emergency_name, core_partner_onboarding.emergency_name),
+                        emergency_phone = COALESCE(NEW.emergency_phone, core_partner_onboarding.emergency_phone),
+                        emergency_relationship = COALESCE(NEW.emergency_relationship, core_partner_onboarding.emergency_relationship),
+                        reference_name = COALESCE(NEW.ref1_name, core_partner_onboarding.reference_name),
+                        reference_phone = COALESCE(NULLIF(v_clean_ref_phone, ''), core_partner_onboarding.reference_phone),
+                        dl_number = COALESCE(NEW.dl_number, core_partner_onboarding.dl_number),
+                        dl_expiry_date = COALESCE(v_parsed_dl_exp, core_partner_onboarding.dl_expiry_date),
+                        pan_number = COALESCE(NEW.pan_number, core_partner_onboarding.pan_number),
+                        aadhaar_number = COALESCE(REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'), core_partner_onboarding.aadhaar_number),
+                        pan_aadhaar_linked = COALESCE(NEW.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
+                        bank_name = COALESCE(NEW.bank_name, core_partner_onboarding.bank_name),
+                        account_name = COALESCE(NEW.account_name, core_partner_onboarding.account_name),
+                        account_number = COALESCE(NEW.account_number, core_partner_onboarding.account_number),
+                        ifsc_code = COALESCE(NEW.ifsc_code, core_partner_onboarding.ifsc_code),
+                        upi_id = COALESCE(NEW.upi_id, core_partner_onboarding.upi_id),
+                        security_deposit = CASE WHEN COALESCE(v_parsed_deposit, 0.00) > 0 THEN v_parsed_deposit ELSE core_partner_onboarding.security_deposit END,
+                        selfie_photo = COALESCE(NEW.selfie_photo, core_partner_onboarding.selfie_photo),
+                        dl_front = COALESCE(NEW.dl_front, core_partner_onboarding.dl_front),
+                        dl_back = COALESCE(NEW.dl_back, core_partner_onboarding.dl_back),
+                        aadhaar_card_front = COALESCE(NEW.aadhaar_card_front, NEW.aadhaar_card_photo, core_partner_onboarding.aadhaar_card_front),
+                        aadhaar_card_back = COALESCE(NEW.aadhaar_card_back, core_partner_onboarding.aadhaar_card_back),
+                        pan_card_photo = COALESCE(NEW.pan_card_photo, core_partner_onboarding.pan_card_photo),
+                        local_address_proof = COALESCE(NEW.local_address_proof, core_partner_onboarding.local_address_proof),
+                        cancelled_cheque_photo = COALESCE(NEW.cancelled_cheque_photo, core_partner_onboarding.cancelled_cheque_photo),
+                        approval_status = COALESCE(NEW.approval_status, core_partner_onboarding.approval_status),
+                        is_documents_verified = COALESCE(NEW.documents_verified, core_partner_onboarding.is_documents_verified),
+                        is_spring_verified = COALESCE(NEW.is_spring_verified, core_partner_onboarding.is_spring_verified),
+                        source_portal_form_id = NEW.id,
+                        source_origin = CASE WHEN v_existing_origin IN ('GOOGLE_SHEET', 'MERGED') THEN 'MERGED' ELSE 'PORTAL_FORM' END,
+                        is_deleted = FALSE,
+                        deleted_at = NULL,
+                        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+                    WHERE id = v_existing_id;
+                ELSE
+                    SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_partner_onboarding;
+
+                    INSERT INTO public.core_partner_onboarding (
+                        id, partner_id, driver_name, phone_number, whatsapp_number,
+                        dob, father_name, city, onboarding_type, present_address, permanent_address, emergency_name, emergency_phone,
+                        emergency_relationship, reference_name, reference_phone, dl_number, dl_expiry_date, lead_source, driver_plan,
+                        pan_number, aadhaar_number, pan_aadhaar_linked, bank_name, account_name, account_number, ifsc_code,
+                        upi_id, security_deposit, selfie_photo, dl_front, dl_back, aadhaar_card_front,
+                        aadhaar_card_back, pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
+                        is_documents_verified, is_spring_verified, source_origin, source_portal_form_id,
+                        onboarding_timestamp, is_deleted, created_at, updated_at
+                    ) VALUES (
+                        v_next_id,
+                        v_partner_id,
+                        UPPER(TRIM(NEW.driver_name)),
+                        v_clean_phone,
+                        RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10),
+                        v_parsed_dob,
+                        NEW.father_name,
+                        COALESCE(NEW.city, 'Bengaluru'),
+                        COALESCE(NEW.candidate_role, 'Individual'),
+                        NEW.present_address,
+                        NEW.permanent_address,
+                        NEW.emergency_name,
+                        NEW.emergency_phone,
+                        NEW.emergency_relationship,
+                        NEW.ref1_name,
+                        NULLIF(v_clean_ref_phone, ''),
+                        NEW.dl_number,
+                        v_parsed_dl_exp,
+                        NEW.lead_source,
+                        NEW.rental_model,
+                        NEW.pan_number,
+                        REGEXP_REPLACE(NEW.aadhaar_number, '\s+', '', 'g'),
+                        NEW.pan_aadhaar_linked,
+                        NEW.bank_name,
+                        NEW.account_name,
+                        NEW.account_number,
+                        NEW.ifsc_code,
+                        NEW.upi_id,
+                        COALESCE(v_parsed_deposit, 0.00),
+                        NEW.selfie_photo,
+                        NEW.dl_front,
+                        NEW.dl_back,
+                        COALESCE(NEW.aadhaar_card_front, NEW.aadhaar_card_photo),
+                        NEW.aadhaar_card_back,
+                        NEW.pan_card_photo,
+                        NEW.local_address_proof,
+                        NEW.cancelled_cheque_photo,
+                        COALESCE(NEW.approval_status, 'Draft'),
+                        COALESCE(NEW.documents_verified, FALSE),
+                        COALESCE(NEW.is_spring_verified, FALSE),
+                        'PORTAL_FORM',
+                        NEW.id,
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+                        FALSE,
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+                        (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+                    );
+                END IF;
+                -- Keep sequence in sync with max id
+                PERFORM setval('public.core_partner_onboarding_id_seq', (SELECT MAX(id) FROM public.core_partner_onboarding));
             END IF;
         END IF;
-    END IF;
-
+    EXCEPTION WHEN OTHERS THEN
+        RAISE WARNING 'fn_sync_july_form_onboarding error shielded for id %: %', COALESCE(NEW.id, 0), SQLERRM;
+    END;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -436,6 +474,10 @@ DECLARE
     v_existing_id BIGINT;
     v_existing_origin VARCHAR(50);
     v_next_id BIGINT;
+    v_parsed_dob DATE;
+    v_parsed_dl_exp DATE;
+    v_parsed_deposit NUMERIC(12, 2);
+    v_clean_ref_phone VARCHAR(20);
 BEGIN
     -- Acquire transactional advisory lock
     PERFORM pg_advisory_xact_lock(777111222);
@@ -459,11 +501,13 @@ BEGIN
         IF v_existing_id IS NOT NULL THEN
             UPDATE public.core_partner_onboarding
             SET
-                driver_name = UPPER(r.driver_name),
+                driver_name = COALESCE(UPPER(TRIM(r.driver_name)), core_partner_onboarding.driver_name),
                 whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(r.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone, core_partner_onboarding.whatsapp_number),
                 dob = COALESCE(r.dob, core_partner_onboarding.dob),
                 city = COALESCE(r.city, core_partner_onboarding.city),
                 onboarding_type = COALESCE(r.onboarding_type, core_partner_onboarding.onboarding_type),
+                lead_source = COALESCE(r.lead_source, core_partner_onboarding.lead_source),
+                driver_plan = COALESCE(r.driver_plan, core_partner_onboarding.driver_plan),
                 father_name = COALESCE(r.father_name, core_partner_onboarding.father_name),
                 present_address = COALESCE(r.present_address, r.aadhaar_address, core_partner_onboarding.present_address),
                 permanent_address = COALESCE(r.aadhaar_address, core_partner_onboarding.permanent_address),
@@ -511,7 +555,7 @@ BEGIN
             ) VALUES (
                 v_next_id,
                 v_partner_id,
-                UPPER(r.driver_name),
+                UPPER(TRIM(r.driver_name)),
                 v_clean_phone,
                 COALESCE(RIGHT(REGEXP_REPLACE(r.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone),
                 r.dob,
@@ -567,6 +611,16 @@ BEGIN
         ) LOOP
             v_clean_phone := r.clean_phone;
             v_partner_id := COALESCE(r.driver_id, public.fn_canonical_partner_id(r.city, v_clean_phone));
+            v_parsed_dob := public.fn_safe_cast_date(r.dob);
+            v_parsed_dl_exp := public.fn_safe_cast_date(r.dl_expiry_date);
+            
+            BEGIN
+                v_parsed_deposit := NULLIF(REGEXP_REPLACE(COALESCE(r.security_deposit, ''), '[^0-9.]', '', 'g'), '')::NUMERIC(12, 2);
+            EXCEPTION WHEN OTHERS THEN
+                v_parsed_deposit := 0.00;
+            END;
+
+            v_clean_ref_phone := RIGHT(REGEXP_REPLACE(COALESCE(r.ref1_phone, ''), '[^0-9]', '', 'g'), 10);
 
             SELECT id, source_origin INTO v_existing_id, v_existing_origin
             FROM public.core_partner_onboarding
@@ -575,15 +629,22 @@ BEGIN
             IF v_existing_id IS NOT NULL THEN
                 UPDATE public.core_partner_onboarding
                 SET
-                    driver_name = UPPER(r.driver_name),
+                    driver_name = COALESCE(UPPER(TRIM(r.driver_name)), core_partner_onboarding.driver_name),
                     whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(r.whatsapp_number, r.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
+                    dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
+                    father_name = COALESCE(r.father_name, core_partner_onboarding.father_name),
                     city = COALESCE(r.city, core_partner_onboarding.city),
+                    lead_source = COALESCE(r.lead_source, core_partner_onboarding.lead_source),
+                    driver_plan = COALESCE(r.rental_model, core_partner_onboarding.driver_plan),
                     present_address = COALESCE(r.present_address, core_partner_onboarding.present_address),
                     permanent_address = COALESCE(r.permanent_address, core_partner_onboarding.permanent_address),
                     emergency_name = COALESCE(r.emergency_name, core_partner_onboarding.emergency_name),
                     emergency_phone = COALESCE(r.emergency_phone, core_partner_onboarding.emergency_phone),
                     emergency_relationship = COALESCE(r.emergency_relationship, core_partner_onboarding.emergency_relationship),
+                    reference_name = COALESCE(r.ref1_name, core_partner_onboarding.reference_name),
+                    reference_phone = COALESCE(NULLIF(v_clean_ref_phone, ''), core_partner_onboarding.reference_phone),
                     dl_number = COALESCE(r.dl_number, core_partner_onboarding.dl_number),
+                    dl_expiry_date = COALESCE(v_parsed_dl_exp, core_partner_onboarding.dl_expiry_date),
                     pan_number = COALESCE(r.pan_number, core_partner_onboarding.pan_number),
                     aadhaar_number = COALESCE(r.aadhaar_number, core_partner_onboarding.aadhaar_number),
                     pan_aadhaar_linked = COALESCE(r.pan_aadhaar_linked, core_partner_onboarding.pan_aadhaar_linked),
@@ -592,12 +653,14 @@ BEGIN
                     account_number = COALESCE(r.account_number, core_partner_onboarding.account_number),
                     ifsc_code = COALESCE(r.ifsc_code, core_partner_onboarding.ifsc_code),
                     upi_id = COALESCE(r.upi_id, core_partner_onboarding.upi_id),
+                    security_deposit = CASE WHEN COALESCE(v_parsed_deposit, 0.00) > 0 THEN v_parsed_deposit ELSE core_partner_onboarding.security_deposit END,
                     selfie_photo = COALESCE(r.selfie_photo, core_partner_onboarding.selfie_photo),
                     dl_front = COALESCE(r.dl_front, core_partner_onboarding.dl_front),
                     dl_back = COALESCE(r.dl_back, core_partner_onboarding.dl_back),
-                    aadhaar_card_front = COALESCE(r.aadhaar_card_front, core_partner_onboarding.aadhaar_card_front),
+                    aadhaar_card_front = COALESCE(r.aadhaar_card_front, r.aadhaar_card_photo, core_partner_onboarding.aadhaar_card_front),
                     aadhaar_card_back = COALESCE(r.aadhaar_card_back, core_partner_onboarding.aadhaar_card_back),
                     pan_card_photo = COALESCE(r.pan_card_photo, core_partner_onboarding.pan_card_photo),
+                    local_address_proof = COALESCE(r.local_address_proof, core_partner_onboarding.local_address_proof),
                     cancelled_cheque_photo = COALESCE(r.cancelled_cheque_photo, core_partner_onboarding.cancelled_cheque_photo),
                     approval_status = COALESCE(r.approval_status, core_partner_onboarding.approval_status),
                     is_documents_verified = COALESCE(r.documents_verified, core_partner_onboarding.is_documents_verified),
@@ -613,27 +676,34 @@ BEGIN
 
                 INSERT INTO public.core_partner_onboarding (
                     id, partner_id, driver_name, phone_number, whatsapp_number,
-                    city, present_address, permanent_address, emergency_name, emergency_phone,
-                    emergency_relationship, dl_number, lead_source, pan_number, aadhaar_number,
-                    pan_aadhaar_linked, bank_name, account_name, account_number, ifsc_code,
-                    upi_id, selfie_photo, dl_front, dl_back, aadhaar_card_front,
-                    aadhaar_card_back, pan_card_photo, cancelled_cheque_photo, approval_status,
+                    dob, father_name, city, onboarding_type, present_address, permanent_address, emergency_name, emergency_phone,
+                    emergency_relationship, reference_name, reference_phone, dl_number, dl_expiry_date, lead_source, driver_plan,
+                    pan_number, aadhaar_number, pan_aadhaar_linked, bank_name, account_name, account_number, ifsc_code,
+                    upi_id, security_deposit, selfie_photo, dl_front, dl_back, aadhaar_card_front,
+                    aadhaar_card_back, pan_card_photo, local_address_proof, cancelled_cheque_photo, approval_status,
                     is_documents_verified, is_spring_verified, source_origin, source_portal_form_id,
                     onboarding_timestamp, is_deleted, created_at, updated_at
                 ) VALUES (
                     v_next_id,
                     v_partner_id,
-                    UPPER(r.driver_name),
+                    UPPER(TRIM(r.driver_name)),
                     v_clean_phone,
                     RIGHT(REGEXP_REPLACE(COALESCE(r.whatsapp_number, r.phone_number), '[^0-9]', '', 'g'), 10),
+                    v_parsed_dob,
+                    r.father_name,
                     COALESCE(r.city, 'Bengaluru'),
+                    COALESCE(r.candidate_role, 'Individual'),
                     r.present_address,
                     r.permanent_address,
                     r.emergency_name,
                     r.emergency_phone,
                     r.emergency_relationship,
+                    r.ref1_name,
+                    NULLIF(v_clean_ref_phone, ''),
                     r.dl_number,
+                    v_parsed_dl_exp,
                     r.lead_source,
+                    r.rental_model,
                     r.pan_number,
                     r.aadhaar_number,
                     r.pan_aadhaar_linked,
@@ -642,12 +712,14 @@ BEGIN
                     r.account_number,
                     r.ifsc_code,
                     r.upi_id,
+                    COALESCE(v_parsed_deposit, 0.00),
                     r.selfie_photo,
                     r.dl_front,
                     r.dl_back,
-                    r.aadhaar_card_front,
+                    COALESCE(r.aadhaar_card_front, r.aadhaar_card_photo),
                     r.aadhaar_card_back,
                     r.pan_card_photo,
+                    r.local_address_proof,
                     r.cancelled_cheque_photo,
                     COALESCE(r.approval_status, 'Draft'),
                     COALESCE(r.documents_verified, FALSE),
@@ -662,6 +734,9 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
+
+    -- Resynchronize sequence
+    PERFORM setval('public.core_partner_onboarding_id_seq', (SELECT MAX(id) FROM public.core_partner_onboarding));
 
 END;
 $$;
@@ -757,6 +832,27 @@ UPDATE public.core_partner_onboarding
 SET dob = NULL,
     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 WHERE dob IS NOT NULL AND (EXTRACT(YEAR FROM dob) < 1950 OR EXTRACT(YEAR FROM dob) > (EXTRACT(YEAR FROM CURRENT_DATE) - 18));
+
+-- Fix 6.7: Resynchronize sequence with max(id)
+SELECT setval('public.core_partner_onboarding_id_seq', (SELECT MAX(id) FROM public.core_partner_onboarding));
+
+-- Fix 6.8: Backfill missing security deposits, rental model, reference contact, and role from portal into core table
+UPDATE public.core_partner_onboarding c
+SET 
+    security_deposit = CASE 
+        WHEN c.security_deposit = 0.00 AND j.security_deposit ~ '^[0-9]+(\.[0-9]+)?$' 
+        THEN j.security_deposit::NUMERIC(12, 2)
+        WHEN c.security_deposit = 0.00 AND j.security_deposit IS NOT NULL AND TRIM(j.security_deposit) != '' 
+        THEN NULLIF(REGEXP_REPLACE(j.security_deposit, '[^0-9.]', '', 'g'), '')::NUMERIC(12, 2)
+        ELSE c.security_deposit 
+    END,
+    driver_plan = COALESCE(c.driver_plan, j.rental_model),
+    reference_name = COALESCE(c.reference_name, j.ref1_name),
+    reference_phone = COALESCE(c.reference_phone, NULLIF(RIGHT(REGEXP_REPLACE(j.ref1_phone, '[^0-9]', '', 'g'), 10), '')),
+    onboarding_type = COALESCE(c.onboarding_type, j.candidate_role, 'Individual'),
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+FROM public.july_form_onboarding j
+WHERE c.source_portal_form_id = j.id;
 
 -- -----------------------------------------------------------------------------
 -- 7. SAMPLE OPERATIONAL & VERIFICATION QUERIES
