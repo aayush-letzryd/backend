@@ -13,22 +13,22 @@ Vehicle drop-offs represent the critical custody handover event where a driver r
 ### Upstream Intake Systems
 1. **Google Sheets Operational Pipeline (`public.sheet_dropoffs`)**:
    - Continuous intake from ground fleet operations teams across Bengaluru, Hyderabad, Mumbai, Pune, and Delhi hubs.
-   - Total volume: 6,492 raw records.
+   - Total volume: 6,698 raw records.
 2. **Web Portal Digital Dropoff Form (`public.july_vehicle_dropoffs`)**:
    - Digital handover and workshop inspection intake with granular dues, physical damage penalties, and supervisor remarks.
-   - Total volume: 121 records.
+   - Total volume: 174 records.
 
 ### Live Production State
-- **Master Table Total Rows**: 6,531
-- **Active Master Records**: 6,397 (`is_deleted = FALSE`)
-- **Soft-Deleted Historical Records**: 134 (`is_deleted = TRUE`, including 27 quarantined test records and 107 collapsed older same-driver submissions)
+- **Master Table Total Rows**: 6,897
+- **Active Master Records**: 6,608 (`is_deleted = FALSE`)
+- **Soft-Deleted Historical Records**: 289 (`is_deleted = TRUE`, including quarantined test records and collapsed duplicate submissions)
 - **Total Table Columns**: 22 (includes dedicated `sheet_dropoff_id` and `portal_dropoff_id` foreign keys)
-- **Gapless Sequential Continuity**: IDs 1 to 6,531 (0 sequence gaps)
+- **Gapless Sequential Continuity**: IDs 1 to 6,897 (0 sequence gaps)
 - **Source Provenance Breakdown**:
-  - `GOOGLE_SHEET`: 6,254 active records
-  - `MERGED`: 114 active records
-  - `PORTAL_FORM`: 29 active records (27 test records safely soft-deleted)
-- **Multi-Driver Same-Day Events**: 55 valid same-day multi-driver handovers preserved
+  - `GOOGLE_SHEET`: 6,415 active records
+  - `MERGED`: 169 active records
+  - `PORTAL_FORM`: 24 active records (28 test records safely soft-deleted)
+- **Multi-Driver Same-Day Events**: 53 valid same-day multi-driver handovers preserved
 
 ### End-to-End System Architecture Diagram
 

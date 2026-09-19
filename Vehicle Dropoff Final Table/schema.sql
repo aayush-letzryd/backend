@@ -3,9 +3,9 @@
 -- ==============================================================================
 -- Master Table   : public.core_dropoffs (Single Source of Truth)
 -- Filtered View  : public.active_core_dropoffs (WHERE is_deleted = FALSE)
--- Source 1       : public.sheet_dropoffs (Google Sheets Drop off History - 6,492 rows)
--- Source 2       : public.july_vehicle_dropoffs (LetzRyd Web Portal Dropoff Form - 121 rows)
--- Live Row Count : 6,531 Total (6,397 Active, 134 Soft-Deleted, 0 Sequence Gaps)
+-- Source 1       : public.sheet_dropoffs (Google Sheets Drop off History - 6,698 rows)
+-- Source 2       : public.july_vehicle_dropoffs (LetzRyd Web Portal Dropoff Form - 174 rows)
+-- Live Row Count : 6,897 Total (6,608 Active, 289 Soft-Deleted, 0 Sequence Gaps)
 -- Host           : YOUR_DB_HOST_HERE:5432
 -- Database       : postgres
 -- Concurrency    : Transactional Advisory Lock 777444555
@@ -105,7 +105,8 @@ CREATE INDEX IF NOT EXISTS idx_core_dropoffs_driver_type ON public.core_dropoffs
 -- 3. ACTIVE FILTERED VIEW: public.active_core_dropoffs
 -- ------------------------------------------------------------------------------
 
-CREATE OR REPLACE VIEW public.active_core_dropoffs AS
+DROP VIEW IF EXISTS public.active_core_dropoffs CASCADE;
+CREATE VIEW public.active_core_dropoffs AS
 SELECT 
     id,
     dropoff_id,
@@ -881,6 +882,52 @@ BEGIN
             END IF;
         END LOOP;
     END IF;
+
+    -- Step C (Phase 3): Redundant Duplicate Purging & Deduplication
+    -- C1: Soft-delete corrupted 'New Allocation' records
+    UPDATE public.core_dropoffs
+    SET is_deleted = TRUE,
+        deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    WHERE driver_name ILIKE '%New Allocation%'
+      AND is_deleted = FALSE;
+
+    -- C2: Soft-delete duplicate sheet_dropoff_id pairs (keep latest ID)
+    WITH dup_sheet AS (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY sheet_dropoff_id
+                   ORDER BY id DESC
+               ) as rn
+        FROM public.core_dropoffs
+        WHERE is_deleted = FALSE AND sheet_dropoff_id IS NOT NULL
+    )
+    UPDATE public.core_dropoffs c
+    SET is_deleted = TRUE,
+        deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    FROM dup_sheet d
+    WHERE c.id = d.id AND d.rn > 1;
+
+    -- C3: Soft-delete same-driver duplicate event rows (prefer MERGED > PORTAL > SHEET, then latest ID)
+    WITH dup_event AS (
+        SELECT id,
+               ROW_NUMBER() OVER (
+                   PARTITION BY vehicle_number, return_date, driver_id
+                   ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 
+                                 WHEN data_source = 'PORTAL_FORM' THEN 2 
+                                 ELSE 3 END,
+                            id DESC
+               ) as rn
+        FROM public.core_dropoffs
+        WHERE is_deleted = FALSE
+    )
+    UPDATE public.core_dropoffs c
+    SET is_deleted = TRUE,
+        deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+        updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    FROM dup_event d
+    WHERE c.id = d.id AND d.rn > 1;
 
     RETURN v_inserted_count;
 END;
