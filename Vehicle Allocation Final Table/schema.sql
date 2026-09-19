@@ -190,14 +190,15 @@ DECLARE
     v_created_ts TIMESTAMP WITHOUT TIME ZONE;
     v_updated_ts TIMESTAMP WITHOUT TIME ZONE;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_vehicle_allocation
-        SET is_deleted = TRUE,
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE sheet_record_id = OLD.id;
-        RETURN OLD;
-    END IF;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            UPDATE public.core_vehicle_allocation
+            SET is_deleted = TRUE,
+                deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE sheet_record_id = OLD.id;
+            RETURN OLD;
+        END IF;
 
     -- Normalization
     v_clean_vnum := REGEXP_REPLACE(UPPER(COALESCE(NEW.vehicle_number, '')), '[^A-Z0-9]', '', 'g');
@@ -347,6 +348,14 @@ BEGIN
         PERFORM setval('public.core_vehicle_allocation_id_seq', v_next_id, true);
     END IF;
 
+    EXCEPTION WHEN OTHERS THEN
+        -- Fail-safe Exception Shield: Guarantees that source table sheet_vehicle_allocations operations NEVER fail
+        RAISE WARNING 'core_vehicle_allocation sync warning for sheet_vehicle_allocations: %', SQLERRM;
+    END;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
@@ -378,14 +387,15 @@ DECLARE
     v_updated_ts TIMESTAMP WITHOUT TIME ZONE;
     v_odo_val INTEGER;
 BEGIN
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_vehicle_allocation
-        SET is_deleted = TRUE,
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE portal_record_id = OLD.id;
-        RETURN OLD;
-    END IF;
+    BEGIN
+        IF TG_OP = 'DELETE' THEN
+            UPDATE public.core_vehicle_allocation
+            SET is_deleted = TRUE,
+                deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
+                updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+            WHERE portal_record_id = OLD.id;
+            RETURN OLD;
+        END IF;
 
     -- City canonicalization
     v_clean_city := CASE 
@@ -590,6 +600,14 @@ BEGIN
         PERFORM setval('public.core_vehicle_allocation_id_seq', v_next_id, true);
     END IF;
 
+    EXCEPTION WHEN OTHERS THEN
+        -- Fail-safe Exception Shield: Guarantees that source table july_allocation_form operations NEVER fail
+        RAISE WARNING 'core_vehicle_allocation sync warning for july_allocation_form: %', SQLERRM;
+    END;
+
+    IF TG_OP = 'DELETE' THEN
+        RETURN OLD;
+    END IF;
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
