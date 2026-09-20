@@ -499,6 +499,7 @@ DECLARE
     v_parsed_dl_exp DATE;
     v_parsed_deposit NUMERIC(12, 2);
     v_clean_ref_phone VARCHAR(20);
+    v_is_operator BOOLEAN;
 BEGIN
     -- Acquire transactional advisory lock
     PERFORM pg_advisory_xact_lock(777111222);
@@ -636,12 +637,6 @@ BEGIN
             ORDER BY RIGHT(REGEXP_REPLACE(phone_number, '[^0-9]', '', 'g'), 10), p.created_at DESC NULLS LAST, p.id DESC
         ) LOOP
             v_clean_phone := r.clean_phone;
-            IF r.driver_id IS NOT NULL AND r.driver_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
-                v_partner_id := r.driver_id;
-            ELSE
-                v_partner_id := public.fn_canonical_partner_id(r.city, v_clean_phone, r.candidate_role);
-            END IF;
-
             v_parsed_dob := public.fn_safe_cast_date(r.dob);
             v_parsed_dl_exp := public.fn_safe_cast_date(r.dl_expiry_date);
             
@@ -658,6 +653,18 @@ BEGIN
             WHERE phone_number = v_clean_phone;
 
             IF v_existing_id IS NOT NULL THEN
+                -- Check if partner is an Operator from either source
+                SELECT (core_partner_onboarding.onboarding_type = 'Operator' OR UPPER(TRIM(COALESCE(r.candidate_role, ''))) = 'OPERATOR')
+                INTO v_is_operator
+                FROM public.core_partner_onboarding
+                WHERE id = v_existing_id;
+
+                IF r.driver_id IS NOT NULL AND r.driver_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
+                    v_partner_id := r.driver_id;
+                ELSE
+                    v_partner_id := public.fn_canonical_partner_id(r.city, v_clean_phone, CASE WHEN v_is_operator THEN 'Operator' ELSE r.candidate_role END);
+                END IF;
+
                 UPDATE public.core_partner_onboarding
                 SET
                     partner_id = v_partner_id,
@@ -666,6 +673,7 @@ BEGIN
                     dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
                     father_name = COALESCE(r.father_name, core_partner_onboarding.father_name),
                     city = COALESCE(r.city, core_partner_onboarding.city),
+                    onboarding_type = CASE WHEN v_is_operator THEN 'Operator' ELSE core_partner_onboarding.onboarding_type END,
                     lead_source = COALESCE(r.lead_source, core_partner_onboarding.lead_source),
                     driver_plan = COALESCE(r.rental_model, core_partner_onboarding.driver_plan),
                     present_address = COALESCE(r.present_address, core_partner_onboarding.present_address),
@@ -772,6 +780,12 @@ BEGIN
 
 END;
 $$;
+
+-- -----------------------------------------------------------------------------
+-- 5.3 AUTOMATED RECONCILIATION SCHEDULER (pg_cron)
+-- -----------------------------------------------------------------------------
+-- Safety net hourly reconciliation scheduled in pg_cron (at minute 10 of every hour)
+SELECT cron.schedule('refresh_core_partner_onboarding', '10 * * * *', 'CALL public.refresh_core_partner_onboarding();');
 
 -- -----------------------------------------------------------------------------
 -- 6. ONE-TIME MIGRATION & RECONCILIATION SCRIPT
