@@ -261,6 +261,28 @@ efresh_core_partner_onboarding().
 
 ---
 
+### 20. [Rental Final Table](./Rental%20Final%20Table/)
+- **Description**: Standardized 5-tier unified rental architecture, dynamic reducing trip slab engine, and daily billing ledger for LetzRyd multi-city operations (Bangalore, Hyderabad, Mumbai). Completely replaces all legacy unnormalized rental tables with a strict 7-table canonical schema.
+- **Key Files**:
+  - [`schema.sql`](./Rental%20Final%20Table/schema.sql): PostgreSQL DDL for all 7 canonical tables (`core_rental_plans`, `rental_rate_slabs`, `rental_custom_partner_plans`, `rental_model_baselines`, `rental_fee_rules`, `rental_exceptions`, `daily_rent_log`) with auto-incrementing integer serial PKs, foreign key audit lineage, and `sp_calculate_daily_rent`.
+  - [`LetzRyd_Rental_Master_Architecture.xlsx`](./Rental%20Final%20Table/LetzRyd_Rental_Master_Architecture.xlsx): Authoritative multi-tab architecture workbook containing plans, slabs, baseline fallbacks, indemnity rules, and operator custom deal matrices.
+  - [`automation_script.py`](./Rental%20Final%20Table/automation_script.py): Production execution and audit CLI engine (`--audit`, `--calculate-rent`, `--sync-hisaab`).
+  - [`README.md`](./Rental%20Final%20Table/README.md): Exhaustive architectural documentation, 5-tier waterfall specifications, and verification commands.
+- **Target Tables**:
+  1. `public.core_rental_plans` (Master catalogue of standard & custom rental plans)
+  2. `public.rental_rate_slabs` (Dynamic reducing trip slabs with operator tier support)
+  3. `public.rental_custom_partner_plans` (Negotiated flat rate partner agreements)
+  4. `public.rental_model_baselines` (Vehicle model rate fallbacks)
+  5. `public.rental_fee_rules` (Indemnity fee policies & waiver rules)
+  6. `public.rental_exceptions` (Audit-grade temporary concessions)
+  7. `public.daily_rent_log` (Daily ledger recording applied rent, fees, and audit lineage)
+- **Primary Features**:
+  - Zero hardcoded rates or magic numbers in code; 100% database driven.
+  - Transparent audit lineage in `daily_rent_log` linking directly to matched plan, slab, and custom plan IDs.
+  - Deprecated tables (`rents`, `rental_plans`, `rent_ledger`, `core_rent`, etc.) have been safely archived to the standalone repository `LetzRyd_Discarded_Rental_Tables`.
+
+---
+
 ## Infrastructure Overview
 
 - **Primary Database Host**: `YOUR_DB_HOST_HERE:5432`
