@@ -158,8 +158,8 @@ CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week_partner ON public.daily_rent_
 -- Stored Procedure: sp_calculate_daily_rent (100% Data-Driven Waterfall)
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE public.sp_calculate_daily_rent(
-    IN p_start_date DATE DEFAULT NULL,
-    IN p_end_date DATE DEFAULT NULL
+    IN p_start_date DATE DEFAULT NULL::DATE,
+    IN p_end_date DATE DEFAULT NULL::DATE
 )
 LANGUAGE plpgsql
 AS $procedure$
@@ -188,6 +188,7 @@ BEGIN
                 COALESCE(s.car_model, 'Unknown') AS vehicle_model,
                 COALESCE(s.final_status, 'Active') AS attendance_status,
                 s.billable_rent_day,
+                s.allocation_id,
                 COALESCE(
                     hw.week_id,
                     'CY' || TO_CHAR(s.status_date, 'YY') || 'WK' || LPAD(TO_CHAR(s.status_date, 'IW'), 2, '0')
@@ -226,6 +227,7 @@ BEGIN
                     ELSE rs.attendance_status
                 END AS attendance_status,
                 CASE 
+                    WHEN rs.partner_id IS NULL OR rs.partner_id = '' OR rs.partner_id = 'SYSTEM_ONBOARDED' THEN FALSE
                     WHEN COALESCE(dt.week_trips, 0) > 0 THEN TRUE
                     WHEN rs.attendance_status IN ('Drop Off', 'Drop-off', 'RFD', 'Unassigned') THEN FALSE
                     WHEN rs.attendance_status IN ('Maintenance', 'Breakdown', 'Accident') AND NOT rs.billable_rent_day THEN FALSE
@@ -236,9 +238,24 @@ BEGIN
                 CASE 
                     WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 'Operator'
                     ELSE 'Individual'
-                END AS customer_type
+                END AS customer_type,
+                -- Deterministic Plan Assignment via core_vehicle_allocation
+                CASE 
+                    WHEN rs.city = 'Hyderabad' THEN
+                        CASE WHEN a.type_of_plan ILIKE '%EBS%' THEN 7 ELSE 6 END
+                    WHEN rs.city = 'Mumbai' THEN 10
+                    WHEN rs.city = 'Bangalore' THEN
+                        CASE 
+                            WHEN a.type_of_plan ILIKE '%Rapido%' OR a.rental_plan ILIKE '%Rapido%' THEN 4
+                            WHEN a.type_of_plan ILIKE '%TBS%' THEN 3
+                            WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 2
+                            ELSE 1
+                        END
+                    ELSE 9
+                END AS assigned_plan_id
             FROM raw_status rs
             LEFT JOIN daily_trips dt ON dt.vehicle_number = rs.vehicle_number
+            LEFT JOIN public.core_vehicle_allocation a ON a.id = rs.allocation_id
         ),
         waterfall AS (
             SELECT 
@@ -252,9 +269,9 @@ BEGIN
                 swb.is_billable_day,
                 swb.weekly_completed_trips,
 
-                -- Data-Driven Rent Selection (Zero hardcoded rates)
+                -- Data-Driven Rent Selection
                 CASE 
-                    WHEN NOT swb.is_billable_day OR swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 0.00
+                    WHEN NOT swb.is_billable_day THEN 0.00
                     WHEN ex.override_daily_rent IS NOT NULL THEN ex.override_daily_rent
                     WHEN cp.custom_daily_rent IS NOT NULL THEN cp.custom_daily_rent
                     WHEN slab.base_daily_rent IS NOT NULL THEN slab.base_daily_rent
@@ -263,9 +280,9 @@ BEGIN
                     ELSE 0.00
                 END AS applied_daily_rent,
 
-                -- Data-Driven Indemnity Selection (Zero hardcoded fees or waivers)
+                -- Data-Driven Indemnity Selection
                 CASE 
-                    WHEN NOT swb.is_billable_day OR swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 0.00
+                    WHEN NOT swb.is_billable_day THEN 0.00
                     WHEN ex.override_fee IS NOT NULL THEN ex.override_fee
                     WHEN cp.custom_daily_fee IS NOT NULL AND cp.custom_daily_rent IS NOT NULL THEN cp.custom_daily_fee
                     WHEN fee.is_waiver = TRUE THEN 0.00
@@ -273,21 +290,40 @@ BEGIN
                     WHEN slab.default_daily_fee IS NOT NULL THEN slab.default_daily_fee
                     WHEN mb.default_daily_indemnity IS NOT NULL THEN mb.default_daily_indemnity
                     WHEN p.default_daily_fee IS NOT NULL THEN p.default_daily_fee
-                    ELSE 0.00
+                    ELSE 30.00
                 END AS applied_daily_indemnity,
 
-                -- Lineage Identifiers linking back to table records
-                COALESCE(slab.plan_id, p.plan_id) AS matched_plan_id,
-                slab.slab_id AS matched_slab_id,
-                cp.custom_plan_id AS matched_custom_plan_id,
+                -- Clean Lineage Identifiers
+                CASE 
+                    WHEN NOT swb.is_billable_day THEN NULL
+                    WHEN ex.override_daily_rent IS NOT NULL THEN NULL
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN COALESCE(cp.plan_id, swb.assigned_plan_id)
+                    WHEN slab.base_daily_rent IS NOT NULL THEN slab.plan_id
+                    WHEN mb.default_base_rent IS NOT NULL THEN NULL
+                    ELSE swb.assigned_plan_id
+                END AS matched_plan_id,
+
+                CASE 
+                    WHEN NOT swb.is_billable_day THEN NULL
+                    WHEN ex.override_daily_rent IS NOT NULL THEN NULL
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN NULL
+                    WHEN slab.base_daily_rent IS NOT NULL THEN slab.slab_id
+                    ELSE NULL
+                END AS matched_slab_id,
+
+                CASE 
+                    WHEN NOT swb.is_billable_day THEN NULL
+                    WHEN ex.override_daily_rent IS NOT NULL THEN NULL
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN cp.custom_plan_id
+                    ELSE NULL
+                END AS matched_custom_plan_id,
 
                 -- Transparent Calculation Trace
                 CASE 
                     WHEN NOT swb.is_billable_day THEN 'Non-billable status: ' || swb.attendance_status
-                    WHEN swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 'Unallocated / Yard'
                     WHEN ex.override_daily_rent IS NOT NULL THEN 'Priority 1: Approved Exception (ID #' || ex.exception_id || ')'
                     WHEN cp.custom_daily_rent IS NOT NULL THEN 'Priority 2: Custom Partner Deal (Card #' || cp.custom_plan_id || ': ' || COALESCE(cp.plan_label, 'Flat') || ')'
-                    WHEN slab.base_daily_rent IS NOT NULL THEN 'Priority 3: Dynamic Slab (Plan #' || slab.plan_id || ': ' || slab.plan_code || ', Slab #' || slab.slab_id || ', Partner: ' || slab.partner_id || ')'
+                    WHEN slab.base_daily_rent IS NOT NULL THEN 'Priority 3: Dynamic Slab (Plan #' || slab.plan_id || ': ' || slab.plan_code || ', Slab #' || slab.slab_id || ')'
                     WHEN mb.default_base_rent IS NOT NULL THEN 'Priority 4: Model Baseline (Baseline #' || mb.baseline_id || ': ' || mb.vehicle_model || ')'
                     WHEN p.default_daily_rent IS NOT NULL THEN 'Priority 5: Master City Default (Plan #' || p.plan_id || ': ' || p.plan_code || ')'
                     ELSE 'Priority 5: Fallback Zero'
@@ -315,26 +351,27 @@ BEGIN
 
             -- Priority 2: rental_custom_partner_plans
             LEFT JOIN LATERAL (
-                SELECT custom_plan_id, custom_daily_rent, custom_daily_fee, plan_label
+                SELECT custom_plan_id, custom_daily_rent, custom_daily_fee, plan_label, plan_id
                 FROM public.rental_custom_partner_plans
                 WHERE partner_id = swb.partner_id 
                   AND is_active = TRUE
                   AND swb.log_date BETWEEN valid_from AND valid_to
                   AND (vehicle_number = swb.vehicle_number OR vehicle_number IS NULL)
-                  AND (vehicle_model IS NULL 
-                       OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
-                       OR REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%')
-                ORDER BY vehicle_number NULLS LAST, vehicle_model NULLS LAST
+                ORDER BY vehicle_number NULLS LAST
                 LIMIT 1
             ) cp ON TRUE
 
-            -- Priority 3: rental_rate_slabs (Custom Operator Slabs match first, then City Slabs)
+            -- Priority 3: rental_rate_slabs (Scoped to assigned plan or operator-specific partner_id)
             LEFT JOIN LATERAL (
                 SELECT s.slab_id, s.plan_id, s.base_daily_rent, s.default_daily_fee, s.partner_id, p.plan_code
                 FROM public.rental_rate_slabs s
                 JOIN public.core_rental_plans p ON p.plan_id = s.plan_id
                 WHERE s.city = swb.city
-                  AND (s.partner_id = swb.partner_id OR s.partner_id = 'ALL')
+                  AND (
+                      s.partner_id = swb.partner_id 
+                      OR 
+                      (s.partner_id = 'ALL' AND s.plan_id = swb.assigned_plan_id)
+                  )
                   AND (s.customer_type = 'ALL' OR s.customer_type = swb.customer_type)
                   AND (s.vehicle_model = 'ALL' 
                        OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(s.vehicle_model), '-', ''), ' ', '') || '%'
@@ -352,10 +389,10 @@ BEGIN
                   )
                   AND swb.log_date BETWEEN s.valid_from AND s.valid_to
                 ORDER BY 
-                    CASE WHEN s.partner_id <> 'ALL' THEN 1 ELSE 2 END,                     -- Operator custom slabs win first!
-                    CASE WHEN s.condition_rule IN ('OLA_GE_1', 'OLA_GE_1_UBER_ZERO') THEN 1 ELSE 2 END, -- Specific conditions
-                    CASE WHEN s.vehicle_model <> 'ALL' THEN 1 ELSE 2 END,                  -- Model specific
-                    CASE WHEN s.customer_type <> 'ALL' THEN 1 ELSE 2 END,                  -- Customer type
+                    CASE WHEN s.partner_id <> 'ALL' THEN 1 ELSE 2 END,
+                    CASE WHEN s.condition_rule IN ('OLA_GE_1', 'OLA_GE_1_UBER_ZERO') THEN 1 ELSE 2 END,
+                    CASE WHEN s.vehicle_model <> 'ALL' THEN 1 ELSE 2 END,
+                    CASE WHEN s.customer_type <> 'ALL' THEN 1 ELSE 2 END,
                     s.trip_min DESC
                 LIMIT 1
             ) slab ON TRUE
@@ -366,7 +403,8 @@ BEGIN
                 FROM public.rental_model_baselines
                 WHERE city = swb.city
                   AND is_active = TRUE
-                  AND (REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
+                  AND (vehicle_model = 'ALL' 
+                       OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
                        OR REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%')
                 ORDER BY CASE WHEN vehicle_model <> 'ALL' THEN 1 ELSE 2 END
                 LIMIT 1
@@ -376,7 +414,7 @@ BEGIN
             LEFT JOIN LATERAL (
                 SELECT plan_id, plan_code, default_daily_rent, default_daily_fee
                 FROM public.core_rental_plans
-                WHERE city = swb.city AND calculation_type = 'MODEL_FALLBACK' AND is_active = TRUE
+                WHERE plan_id = swb.assigned_plan_id AND is_active = TRUE
                 LIMIT 1
             ) p ON TRUE
 
@@ -436,7 +474,9 @@ BEGIN
             matched_plan_id = EXCLUDED.matched_plan_id,
             matched_slab_id = EXCLUDED.matched_slab_id,
             matched_custom_plan_id = EXCLUDED.matched_custom_plan_id,
-            calculation_rule = EXCLUDED.calculation_rule;
+            calculation_rule = EXCLUDED.calculation_rule,
+            created_at = CURRENT_TIMESTAMP;
+
     END LOOP;
 END;
 $procedure$;
