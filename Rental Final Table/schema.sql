@@ -1,10 +1,10 @@
 -- ============================================================================
--- LetzRyd Standardized Unified Rental Architecture - DDL Specification
+-- LetzRyd Production Rental Engine - Complete DDL & Stored Procedures
 -- ============================================================================
--- Single Whole-Block Multi-City Rental Engine (Bangalore, Hyderabad, Mumbai)
--- 100% Data-Driven & Table-Governed: Zero hardcoded magic numbers in SQL or code.
--- Primary Keys: Clean Integer SERIAL PRIMARY KEYs (1, 2, 3...) across all tables.
--- Trigger-Free: Batch execution managed by stored procedures & pg_cron.
+-- Target Database: PostgreSQL 16 (public schema)
+-- Fleet Scope: Bangalore (BLR), Hyderabad (HYD), Mumbai (MUM)
+-- Architecture: 100% Data-Driven, Trigger-Free, Batch Executed via pg_cron
+-- Lineage & Immutability: Full audit trail with historical settlement locks
 -- ============================================================================
 
 -- Table 1: core_rental_plans (Canonical Plan Catalogue)
@@ -102,60 +102,53 @@ CREATE TABLE IF NOT EXISTS public.rental_fee_rules (
 
 CREATE INDEX IF NOT EXISTS idx_rental_fee_rules_lookup ON public.rental_fee_rules(city, partner_id, vehicle_model, valid_from, valid_to);
 
--- Table 6: rental_exceptions (Audit-Grade Governance & Overrides Layer)
+-- Table 6: rental_exceptions (Temporary Concession & Audit Overrides)
 CREATE TABLE IF NOT EXISTS public.rental_exceptions (
     exception_id SERIAL PRIMARY KEY,                    -- 1, 2, 3...
-    override_type VARCHAR(64) NOT NULL,
-    city VARCHAR(32) NOT NULL,
-    partner_id VARCHAR(64),
     vehicle_number VARCHAR(32),
-    vehicle_model VARCHAR(64),
-    override_daily_rent NUMERIC(10,2) NOT NULL,
+    partner_id VARCHAR(64),
+    override_daily_rent NUMERIC(10,2),
     override_fee NUMERIC(10,2),
-    canonical_expected_rent NUMERIC(10,2),
-    variance NUMERIC(10,2),
-    reason TEXT NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'APPROVED',
-    approved_by VARCHAR(64) DEFAULT 'System Migration',
-    approval_date DATE DEFAULT CURRENT_DATE,
+    reason VARCHAR(255) NOT NULL,
+    authorized_by VARCHAR(64) NOT NULL,
     valid_from DATE NOT NULL,
     valid_to DATE NOT NULL,
-    source_file VARCHAR(255),
-    source_row INT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    status VARCHAR(32) NOT NULL DEFAULT 'APPROVED',     -- 'APPROVED', 'REJECTED', 'EXPIRED'
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_rental_exceptions_lookup ON public.rental_exceptions(partner_id, vehicle_number, valid_from, valid_to, status);
+CREATE INDEX IF NOT EXISTS idx_rental_exceptions_lookup ON public.rental_exceptions(vehicle_number, partner_id, valid_from, valid_to, status);
 
--- Table 7: daily_rent_log (Daily Output Rent Ledger with Full Lineage)
+-- Table 7: daily_rent_log (Forensic Audit & Lineage Ledger)
 CREATE TABLE IF NOT EXISTS public.daily_rent_log (
-    id SERIAL PRIMARY KEY,                              -- 1, 2, 3...
+    id BIGSERIAL PRIMARY KEY,
     log_date DATE NOT NULL,
     week_id VARCHAR(16) NOT NULL,
     vehicle_number VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64) NOT NULL,
     city VARCHAR(32) NOT NULL,
-    vehicle_model VARCHAR(64) NOT NULL,
+    vehicle_model VARCHAR(64),
     attendance_status VARCHAR(64) NOT NULL,
     is_billable_day BOOLEAN NOT NULL,
-    weekly_completed_trips INT NOT NULL,
+    weekly_completed_trips INT NOT NULL DEFAULT 0,
     applied_daily_rent NUMERIC(10,2) NOT NULL,
     applied_daily_indemnity NUMERIC(10,2) NOT NULL,
     net_daily_rent NUMERIC(10,2) NOT NULL,
-    matched_plan_id INT REFERENCES public.core_rental_plans(plan_id) ON DELETE SET NULL,
-    matched_slab_id INT REFERENCES public.rental_rate_slabs(slab_id) ON DELETE SET NULL,
-    matched_custom_plan_id INT REFERENCES public.rental_custom_partner_plans(custom_plan_id) ON DELETE SET NULL,
-    calculation_rule VARCHAR(255),
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_daily_rent_log_grain UNIQUE (log_date, vehicle_number, partner_id)
+    matched_plan_id INT REFERENCES public.core_rental_plans(plan_id),
+    matched_slab_id INT REFERENCES public.rental_rate_slabs(slab_id),
+    matched_custom_plan_id INT REFERENCES public.rental_custom_partner_plans(custom_plan_id),
+    calculation_rule VARCHAR(255) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_daily_rent_log UNIQUE (log_date, vehicle_number, partner_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_daily_rent_log_date_veh ON public.daily_rent_log(log_date, vehicle_number);
-CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week_partner ON public.daily_rent_log(week_id, partner_id);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_date ON public.daily_rent_log(log_date);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week ON public.daily_rent_log(week_id);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_veh ON public.daily_rent_log(vehicle_number, log_date);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_partner ON public.daily_rent_log(partner_id, log_date);
 
 -- ============================================================================
--- Stored Procedure: sp_calculate_daily_rent (100% Data-Driven Waterfall)
+-- Stored Procedure: sp_calculate_daily_rent
 -- ============================================================================
 CREATE OR REPLACE PROCEDURE public.sp_calculate_daily_rent(
     IN p_start_date date DEFAULT NULL::date,
@@ -189,10 +182,10 @@ BEGIN
                     WHEN s.city ILIKE 'blr%' OR s.city ILIKE 'bengalur%' OR s.city ILIKE 'bangal%' THEN 'Bangalore'
                     WHEN s.city ILIKE 'hyd%' THEN 'Hyderabad'
                     WHEN s.city ILIKE 'mum%' OR s.city ILIKE 'bombay%' THEN 'Mumbai'
-                    ELSE COALESCE(s.city, 'Hyderabad')
+                    ELSE NULL  -- Strict: Do NOT guess missing city!
                 END AS city,
                 COALESCE(s.car_model, 'Unknown') AS vehicle_model,
-                COALESCE(s.final_status, 'Active') AS attendance_status,
+                COALESCE(NULLIF(TRIM(s.final_status), ''), 'Unassigned') AS attendance_status,
                 s.billable_rent_day,
                 s.allocation_id,
                 COALESCE(
@@ -201,10 +194,8 @@ BEGIN
                 ) AS week_id,
                 COALESCE(hw.week_start, s.status_date - (EXTRACT(ISODOW FROM s.status_date)::INT - 1)) AS week_start,
                 COALESCE(hw.week_end, s.status_date + (7 - EXTRACT(ISODOW FROM s.status_date)::INT)) AS week_end,
-                -- Explicit partner classification and enrolled plan from core_partner_onboarding
-                COALESCE(po.onboarding_type, 
-                    CASE WHEN s.partner_id ILIKE '%OP%' OR s.partner_id ILIKE '%FLEET%' OR s.partner_id ILIKE '%IP%' THEN 'Operator' ELSE 'Individual' END
-                ) AS customer_type,
+                -- Explicit partner classification: do NOT guess from partner_id string patterns
+                COALESCE(po.onboarding_type, 'Individual') AS customer_type,
                 p_enrolled.plan_id AS enrolled_plan_id
             FROM public.core_daily_vehicle_status s
             LEFT JOIN public.hisaab_settlement_weeks hw 
@@ -215,23 +206,60 @@ BEGIN
                 ON p_enrolled.plan_code = po.driver_plan
             WHERE s.status_date = v_curr_date
         ),
-        daily_trips AS (
+        -- Week allocation boundaries per vehicle and partner to prevent trip/attendance leakage during operator switches
+        week_allocations AS (
+            SELECT DISTINCT
+                UPPER(REPLACE(s.vehicle_number, ' ', '')) AS vehicle_number,
+                COALESCE(NULLIF(TRIM(s.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                COALESCE(hw.week_start, s.status_date - (EXTRACT(ISODOW FROM s.status_date)::INT - 1)) AS week_start,
+                COALESCE(hw.week_end, s.status_date + (7 - EXTRACT(ISODOW FROM s.status_date)::INT)) AS week_end
+            FROM public.core_daily_vehicle_status s
+            LEFT JOIN public.hisaab_settlement_weeks hw 
+                ON s.status_date BETWEEN hw.week_start AND hw.week_end
+            WHERE s.status_date BETWEEN v_week_start AND v_week_end
+        ),
+        -- Independent Uber trip aggregation strictly attributed to custody partner
+        uber_trips_agg AS (
             SELECT 
-                u.vehicle_number,
-                -- Date-specific trips on v_curr_date to evaluate billability override
-                COALESCE(SUM(CASE WHEN ub.operational_date = v_curr_date THEN ub.completed_trips ELSE 0 END), 0) +
-                COALESCE(SUM(CASE WHEN ol.service_date = v_curr_date THEN ol.completed_trips ELSE 0 END), 0) AS day_trips,
-                -- Cumulative ISO week trips to evaluate reducing slab tier
-                COALESCE(SUM(ub.completed_trips), 0) + COALESCE(SUM(ol.completed_trips), 0) AS week_trips,
+                UPPER(REPLACE(s.vehicle_number, ' ', '')) AS vehicle_number,
+                COALESCE(NULLIF(TRIM(s.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                COALESCE(SUM(CASE WHEN ub.operational_date = v_curr_date THEN ub.completed_trips ELSE 0 END), 0) AS day_uber_trips,
+                COALESCE(SUM(ub.completed_trips), 0) AS week_uber_trips
+            FROM public.core_daily_vehicle_status s
+            JOIN public.core_uber_daily ub 
+                ON UPPER(REPLACE(ub.vehicle_number, ' ', '')) = UPPER(REPLACE(s.vehicle_number, ' ', ''))
+                AND ub.operational_date = s.status_date
+            WHERE s.status_date BETWEEN v_week_start AND v_week_end
+            GROUP BY UPPER(REPLACE(s.vehicle_number, ' ', '')), COALESCE(NULLIF(TRIM(s.partner_id), ''), 'SYSTEM_ONBOARDED')
+        ),
+        -- Independent Ola trip aggregation strictly attributed to custody partner
+        ola_trips_agg AS (
+            SELECT 
+                UPPER(REPLACE(s.vehicle_number, ' ', '')) AS vehicle_number,
+                COALESCE(NULLIF(TRIM(s.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                COALESCE(SUM(CASE WHEN ol.service_date = v_curr_date THEN ol.completed_trips ELSE 0 END), 0) AS day_ola_trips,
                 COALESCE(SUM(ol.completed_trips), 0) AS week_ola_trips
-            FROM (SELECT DISTINCT vehicle_number, week_start, week_end FROM raw_status) u
-            LEFT JOIN public.core_uber_daily ub 
-                ON UPPER(REPLACE(ub.vehicle_number, ' ', '')) = u.vehicle_number
-                AND ub.operational_date BETWEEN u.week_start AND u.week_end
-            LEFT JOIN public.core_ola_daily ol 
-                ON UPPER(REPLACE(ol.vehicle_number, ' ', '')) = u.vehicle_number
-                AND ol.service_date BETWEEN u.week_start AND u.week_end
-            GROUP BY u.vehicle_number
+            FROM public.core_daily_vehicle_status s
+            JOIN public.core_ola_daily ol 
+                ON UPPER(REPLACE(ol.vehicle_number, ' ', '')) = UPPER(REPLACE(s.vehicle_number, ' ', ''))
+                AND ol.service_date = s.status_date
+            WHERE s.status_date BETWEEN v_week_start AND v_week_end
+            GROUP BY UPPER(REPLACE(s.vehicle_number, ' ', '')), COALESCE(NULLIF(TRIM(s.partner_id), ''), 'SYSTEM_ONBOARDED')
+        ),
+        -- Zero-Cartesian product joined trips attributed to vehicle and partner
+        partner_trips AS (
+            SELECT 
+                wa.vehicle_number,
+                wa.partner_id,
+                COALESCE(u.day_uber_trips, 0) + COALESCE(o.day_ola_trips, 0) AS day_trips,
+                COALESCE(u.week_uber_trips, 0) AS week_uber_trips,
+                COALESCE(o.week_ola_trips, 0) AS week_ola_trips,
+                COALESCE(u.week_uber_trips, 0) + COALESCE(o.week_ola_trips, 0) AS week_completed_trips
+            FROM week_allocations wa
+            LEFT JOIN uber_trips_agg u 
+                ON u.vehicle_number = wa.vehicle_number AND u.partner_id = wa.partner_id
+            LEFT JOIN ola_trips_agg o 
+                ON o.vehicle_number = wa.vehicle_number AND o.partner_id = wa.partner_id
         ),
         status_with_billability AS (
             SELECT 
@@ -243,32 +271,37 @@ BEGIN
                 rs.vehicle_model,
                 rs.customer_type,
                 rs.enrolled_plan_id,
-                -- Date-specific activity overrides non-billable attendance ONLY if car drove trips on this date
+                -- Date-specific activity overrides non-billable attendance ONLY if car drove trips on this date under THIS partner
                 CASE 
-                    WHEN COALESCE(dt.day_trips, 0) > 0 AND rs.attendance_status IN ('Drop Off', 'Drop-off', 'RFD', 'Unassigned', 'Maintenance', 'Breakdown', 'Accident') THEN 'Active'
+                    WHEN COALESCE(pt.day_trips, 0) > 0 AND rs.attendance_status IN ('Drop Off', 'Drop-off', 'RFD', 'Unassigned', 'Maintenance', 'Breakdown', 'Accident', 'Yard') THEN 'Active'
                     ELSE rs.attendance_status
                 END AS attendance_status,
+                -- Strict billability handling: null maintenance flags evaluate to FALSE, unassigned/missing partner evaluates to FALSE
                 CASE 
+                    WHEN rs.city IS NULL THEN FALSE  -- Unresolved city cannot be billed automatically
                     WHEN rs.partner_id IS NULL OR rs.partner_id = '' OR rs.partner_id = 'SYSTEM_ONBOARDED' THEN FALSE
-                    WHEN COALESCE(dt.day_trips, 0) > 0 THEN TRUE
-                    WHEN rs.attendance_status IN ('Drop Off', 'Drop-off', 'RFD', 'Unassigned') THEN FALSE
-                    WHEN rs.attendance_status IN ('Maintenance', 'Breakdown', 'Accident') AND NOT rs.billable_rent_day THEN FALSE
-                    ELSE TRUE
+                    WHEN COALESCE(pt.day_trips, 0) > 0 THEN TRUE
+                    WHEN rs.attendance_status IN ('Drop Off', 'Drop-off', 'RFD', 'Unassigned', 'Yard') THEN FALSE
+                    WHEN rs.attendance_status IN ('Maintenance', 'Breakdown', 'Accident') THEN COALESCE(rs.billable_rent_day, FALSE)
+                    WHEN rs.attendance_status = 'Active' THEN TRUE
+                    ELSE FALSE
                 END AS is_billable_day,
-                COALESCE(dt.week_trips, 0)::INT AS weekly_completed_trips,
-                COALESCE(dt.week_ola_trips, 0)::INT AS weekly_ola_trips,
-                -- Default plan resolution directly from city, customer type, and enrolled plan
+                COALESCE(pt.week_uber_trips, 0)::INT AS weekly_uber_trips,
+                COALESCE(pt.week_ola_trips, 0)::INT AS weekly_ola_trips,
+                COALESCE(pt.week_completed_trips, 0)::INT AS weekly_completed_trips,
+                -- Default plan resolution directly from validated city and customer type
                 COALESCE(rs.enrolled_plan_id,
                     CASE 
                         WHEN rs.city = 'Hyderabad' THEN 6  -- HYD_UBER_TBS
                         WHEN rs.city = 'Mumbai' THEN 10     -- MUM_UBER_REDUCING
                         WHEN rs.city = 'Bangalore' THEN
                             CASE WHEN rs.customer_type = 'Operator' THEN 2 ELSE 1 END
-                        ELSE 9
+                        ELSE NULL
                     END
                 ) AS default_plan_id
             FROM raw_status rs
-            LEFT JOIN daily_trips dt ON dt.vehicle_number = rs.vehicle_number
+            LEFT JOIN partner_trips pt 
+                ON pt.vehicle_number = rs.vehicle_number AND pt.partner_id = rs.partner_id
         ),
         waterfall AS (
             SELECT 
@@ -281,8 +314,10 @@ BEGIN
                 swb.attendance_status,
                 swb.is_billable_day,
                 swb.weekly_completed_trips,
+                swb.weekly_uber_trips,
+                swb.weekly_ola_trips,
 
-                -- Data-Driven Rent Selection (Waterfall: Exceptions -> Custom Partner Card -> Slabs -> Baselines -> Default)
+                -- Data-Driven Rent Selection (Strict Waterfall: Exception -> Custom Card -> Slabs -> Baseline -> Plan Default)
                 CASE 
                     WHEN NOT swb.is_billable_day THEN 0.00
                     WHEN ex.override_daily_rent IS NOT NULL THEN ex.override_daily_rent
@@ -306,7 +341,7 @@ BEGIN
                     ELSE 30.00
                 END AS applied_daily_indemnity,
 
-                -- Clean Lineage Identifiers
+                -- Clean Lineage Identifiers: strictly populated ONLY when that specific entity wins
                 CASE 
                     WHEN NOT swb.is_billable_day THEN NULL
                     WHEN ex.override_daily_rent IS NOT NULL THEN NULL
@@ -316,8 +351,20 @@ BEGIN
                     ELSE swb.default_plan_id
                 END AS matched_plan_id,
 
-                slab.slab_id AS matched_slab_id,
-                cp.custom_plan_id AS matched_custom_plan_id,
+                CASE 
+                    WHEN NOT swb.is_billable_day THEN NULL
+                    WHEN ex.override_daily_rent IS NOT NULL THEN NULL
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN cp.custom_plan_id
+                    ELSE NULL
+                END AS matched_custom_plan_id,
+
+                CASE 
+                    WHEN NOT swb.is_billable_day THEN NULL
+                    WHEN ex.override_daily_rent IS NOT NULL THEN NULL
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN NULL
+                    WHEN slab.base_daily_rent IS NOT NULL THEN slab.slab_id
+                    ELSE NULL
+                END AS matched_slab_id,
 
                 CASE 
                     WHEN NOT swb.is_billable_day THEN 'Non-billable status: ' || swb.attendance_status
@@ -331,11 +378,11 @@ BEGIN
 
             FROM status_with_billability swb
 
-            -- Priority 1: rental_exceptions
+            -- Priority 1: rental_exceptions (Strictly APPROVED exceptions only; tie-broken deterministically)
             LEFT JOIN LATERAL (
                 SELECT exception_id, override_daily_rent, override_fee, reason
                 FROM public.rental_exceptions
-                WHERE status IN ('APPROVED', 'PENDING_CONFIRMATION')
+                WHERE status = 'APPROVED'
                   AND swb.log_date BETWEEN valid_from AND valid_to
                   AND (
                       (partner_id = swb.partner_id AND vehicle_number = swb.vehicle_number)
@@ -345,11 +392,13 @@ BEGIN
                 ORDER BY 
                     CASE WHEN partner_id IS NOT NULL AND vehicle_number IS NOT NULL THEN 1
                          WHEN vehicle_number IS NOT NULL THEN 2
-                         ELSE 3 END
+                         ELSE 3 END,
+                    valid_from DESC,
+                    exception_id DESC
                 LIMIT 1
             ) ex ON TRUE
 
-            -- Priority 2: rental_custom_partner_plans (Matched by Partner ID + Vehicle Model + Date Range)
+            -- Priority 2: rental_custom_partner_plans (Matched by Partner ID + Vehicle Model + Date Range; tie-broken deterministically)
             LEFT JOIN LATERAL (
                 SELECT custom_plan_id, custom_daily_rent, custom_daily_fee, plan_label, plan_id
                 FROM public.rental_custom_partner_plans
@@ -363,19 +412,25 @@ BEGIN
                   AND (vehicle_number = swb.vehicle_number OR vehicle_number IS NULL)
                 ORDER BY 
                     CASE WHEN vehicle_number IS NOT NULL THEN 1 ELSE 2 END,
-                    CASE WHEN vehicle_model IS NOT NULL AND vehicle_model <> 'ALL' THEN 1 ELSE 2 END
+                    CASE WHEN vehicle_model IS NOT NULL AND vehicle_model <> 'ALL' THEN 1 ELSE 2 END,
+                    valid_from DESC,
+                    custom_plan_id DESC
                 LIMIT 1
             ) cp ON TRUE
 
-            -- Priority 3: rental_rate_slabs (Scoped to enrolled plan or default plan)
+            -- Priority 3: rental_rate_slabs (Scoped strictly to resolved plan; plan-specific metric matching)
             LEFT JOIN LATERAL (
                 SELECT s.slab_id, s.plan_id, s.base_daily_rent, s.default_daily_fee, s.partner_id, p.plan_code
                 FROM public.rental_rate_slabs s
                 JOIN public.core_rental_plans p ON p.plan_id = s.plan_id
                 WHERE s.city = swb.city
                   AND (
-                      (s.partner_id = swb.partner_id AND (COALESCE(cp.plan_id, swb.enrolled_plan_id) IS NULL OR s.plan_id = COALESCE(cp.plan_id, swb.enrolled_plan_id)))
+                      -- Partner-specific slab: requires resolved plan match; NEVER matches arbitrary slabs if plan is NULL
+                      (s.partner_id = swb.partner_id 
+                       AND COALESCE(cp.plan_id, swb.enrolled_plan_id) IS NOT NULL 
+                       AND s.plan_id = COALESCE(cp.plan_id, swb.enrolled_plan_id))
                       OR 
+                      -- Retail standard slab: matches default_plan_id
                       (s.partner_id = 'ALL' AND s.plan_id = swb.default_plan_id)
                   )
                   AND (s.customer_type = 'ALL' OR s.customer_type = swb.customer_type)
@@ -391,14 +446,29 @@ BEGIN
                       OR
                       (s.condition_rule = 'NONE')
                   )
-                  AND swb.weekly_completed_trips >= s.trip_min
-                  AND (s.trip_max IS NULL OR swb.weekly_completed_trips <= s.trip_max)
+                  -- Plan-specific metric threshold evaluation
+                  AND (
+                      CASE s.metric_type
+                          WHEN 'UBER_TRIPS' THEN swb.weekly_uber_trips
+                          WHEN 'OLA_TRIPS'  THEN swb.weekly_ola_trips
+                          ELSE swb.weekly_completed_trips
+                      END >= s.trip_min
+                  )
+                  AND (
+                      s.trip_max IS NULL OR
+                      CASE s.metric_type
+                          WHEN 'UBER_TRIPS' THEN swb.weekly_uber_trips
+                          WHEN 'OLA_TRIPS'  THEN swb.weekly_ola_trips
+                          ELSE swb.weekly_completed_trips
+                      END <= s.trip_max
+                  )
                   AND swb.log_date BETWEEN s.valid_from AND s.valid_to
                 ORDER BY 
                     CASE WHEN s.partner_id <> 'ALL' THEN 1 ELSE 2 END,
                     CASE WHEN s.condition_rule <> 'NONE' THEN 1 ELSE 2 END,
                     CASE WHEN s.vehicle_model <> 'ALL' THEN 1 ELSE 2 END,
-                    s.trip_min DESC
+                    s.trip_min DESC,
+                    s.slab_id DESC
                 LIMIT 1
             ) slab ON TRUE
 
@@ -413,7 +483,7 @@ BEGIN
                       OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
                       OR REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%'
                   )
-                ORDER BY CASE WHEN vehicle_model = swb.vehicle_model THEN 1 ELSE 2 END
+                ORDER BY CASE WHEN vehicle_model = swb.vehicle_model THEN 1 ELSE 2 END, baseline_id DESC
                 LIMIT 1
             ) mb ON TRUE
 
@@ -437,7 +507,8 @@ BEGIN
                 ORDER BY 
                     CASE WHEN partner_id <> 'ALL' THEN 1 ELSE 2 END,
                     CASE WHEN vehicle_model <> 'ALL' THEN 1 ELSE 2 END,
-                    CASE WHEN city <> 'ALL' THEN 1 ELSE 2 END
+                    CASE WHEN city <> 'ALL' THEN 1 ELSE 2 END,
+                    fee_rule_id DESC
                 LIMIT 1
             ) fee ON TRUE
         )
@@ -518,6 +589,7 @@ BEGIN
         LIMIT 1;
     END IF;
 
+    -- Strict Guard Clause: Protect locked historical settlement cycles
     IF v_is_locked = TRUE THEN
         RAISE NOTICE 'Week % is locked. Skipping sync.', v_week_id;
         RETURN;
