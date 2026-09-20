@@ -87,12 +87,13 @@ WHERE is_deleted = FALSE;
 -- 3. HELPER FUNCTIONS: Canonical Partner ID & Safe Date Casting
 -- -----------------------------------------------------------------------------
 
-CREATE OR REPLACE FUNCTION public.fn_canonical_partner_id(p_city VARCHAR, p_phone VARCHAR)
+CREATE OR REPLACE FUNCTION public.fn_canonical_partner_id(p_city VARCHAR, p_phone VARCHAR, p_onboarding_type VARCHAR DEFAULT 'Individual')
 RETURNS VARCHAR AS $$
 DECLARE
     v_clean_phone VARCHAR(10);
     v_prefix VARCHAR(10);
     v_clean_city VARCHAR(100);
+    v_ip_infix VARCHAR(2);
 BEGIN
     v_clean_phone := RIGHT(REGEXP_REPLACE(COALESCE(p_phone, ''), '[^0-9]', '', 'g'), 10);
     IF LENGTH(v_clean_phone) < 10 THEN
@@ -114,7 +115,16 @@ BEGIN
         ELSE UPPER(LEFT(v_clean_city, 3))
     END;
 
-    RETURN 'LETZ' || v_prefix || v_clean_phone;
+    v_ip_infix := CASE WHEN UPPER(TRIM(COALESCE(p_onboarding_type, ''))) = 'OPERATOR' THEN 'IP' ELSE '' END;
+
+    RETURN 'LETZ' || v_prefix || v_ip_infix || v_clean_phone;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
+CREATE OR REPLACE FUNCTION public.fn_canonical_partner_id(p_city VARCHAR, p_phone VARCHAR)
+RETURNS VARCHAR AS $$
+BEGIN
+    RETURN public.fn_canonical_partner_id(p_city, p_phone, 'Individual');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
@@ -161,7 +171,12 @@ BEGIN
             IF LENGTH(v_clean_phone) = 10 THEN
                 PERFORM pg_advisory_xact_lock(777111222);
 
-                v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
+                -- Determine canonical partner ID with IP for Operators
+                IF NEW.partner_id IS NOT NULL AND NEW.partner_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
+                    v_partner_id := NEW.partner_id;
+                ELSE
+                    v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone, NEW.onboarding_type);
+                END IF;
 
                 SELECT id, source_origin INTO v_existing_id, v_existing_origin
                 FROM public.core_partner_onboarding
@@ -170,7 +185,7 @@ BEGIN
                 IF v_existing_id IS NOT NULL THEN
                     UPDATE public.core_partner_onboarding
                     SET
-                        partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
+                        partner_id = v_partner_id,
                         driver_name = COALESCE(UPPER(TRIM(NEW.driver_name)), core_partner_onboarding.driver_name),
                         whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(NEW.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone, core_partner_onboarding.whatsapp_number),
                         dob = COALESCE(NEW.dob, core_partner_onboarding.dob),
@@ -315,7 +330,13 @@ BEGIN
             IF LENGTH(v_clean_phone) = 10 THEN
                 PERFORM pg_advisory_xact_lock(777111222);
 
-                v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone);
+                -- Determine canonical partner ID with IP for Operators
+                IF NEW.driver_id IS NOT NULL AND NEW.driver_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
+                    v_partner_id := NEW.driver_id;
+                ELSE
+                    v_partner_id := public.fn_canonical_partner_id(NEW.city, v_clean_phone, NEW.candidate_role);
+                END IF;
+
                 v_parsed_dob := public.fn_safe_cast_date(NEW.dob);
                 v_parsed_dl_exp := public.fn_safe_cast_date(NEW.dl_expiry_date);
                 
@@ -335,7 +356,7 @@ BEGIN
                 IF v_existing_id IS NOT NULL THEN
                     UPDATE public.core_partner_onboarding
                     SET
-                        partner_id = COALESCE(core_partner_onboarding.partner_id, v_partner_id),
+                        partner_id = v_partner_id,
                         driver_name = COALESCE(UPPER(TRIM(NEW.driver_name)), core_partner_onboarding.driver_name),
                         whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(NEW.whatsapp_number, NEW.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
                         dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
@@ -492,7 +513,11 @@ BEGIN
         ORDER BY RIGHT(REGEXP_REPLACE(driver_phone, '[^0-9]', '', 'g'), 10), s.submission_timestamp DESC NULLS LAST, s.id DESC
     ) LOOP
         v_clean_phone := r.clean_phone;
-        v_partner_id := COALESCE(r.partner_id, public.fn_canonical_partner_id(r.city, v_clean_phone));
+        IF r.partner_id IS NOT NULL AND r.partner_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
+            v_partner_id := r.partner_id;
+        ELSE
+            v_partner_id := public.fn_canonical_partner_id(r.city, v_clean_phone, r.onboarding_type);
+        END IF;
 
         SELECT id, source_origin INTO v_existing_id, v_existing_origin
         FROM public.core_partner_onboarding
@@ -501,6 +526,7 @@ BEGIN
         IF v_existing_id IS NOT NULL THEN
             UPDATE public.core_partner_onboarding
             SET
+                partner_id = v_partner_id,
                 driver_name = COALESCE(UPPER(TRIM(r.driver_name)), core_partner_onboarding.driver_name),
                 whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(r.whatsapp_phone, '[^0-9]', '', 'g'), 10), v_clean_phone, core_partner_onboarding.whatsapp_number),
                 dob = COALESCE(r.dob, core_partner_onboarding.dob),
@@ -610,7 +636,12 @@ BEGIN
             ORDER BY RIGHT(REGEXP_REPLACE(phone_number, '[^0-9]', '', 'g'), 10), p.created_at DESC NULLS LAST, p.id DESC
         ) LOOP
             v_clean_phone := r.clean_phone;
-            v_partner_id := COALESCE(r.driver_id, public.fn_canonical_partner_id(r.city, v_clean_phone));
+            IF r.driver_id IS NOT NULL AND r.driver_id ~ '^LETZ[A-Z]{3}IP[0-9]{10}$' THEN
+                v_partner_id := r.driver_id;
+            ELSE
+                v_partner_id := public.fn_canonical_partner_id(r.city, v_clean_phone, r.candidate_role);
+            END IF;
+
             v_parsed_dob := public.fn_safe_cast_date(r.dob);
             v_parsed_dl_exp := public.fn_safe_cast_date(r.dl_expiry_date);
             
@@ -629,6 +660,7 @@ BEGIN
             IF v_existing_id IS NOT NULL THEN
                 UPDATE public.core_partner_onboarding
                 SET
+                    partner_id = v_partner_id,
                     driver_name = COALESCE(UPPER(TRIM(r.driver_name)), core_partner_onboarding.driver_name),
                     whatsapp_number = COALESCE(RIGHT(REGEXP_REPLACE(COALESCE(r.whatsapp_number, r.phone_number), '[^0-9]', '', 'g'), 10), core_partner_onboarding.whatsapp_number),
                     dob = COALESCE(v_parsed_dob, core_partner_onboarding.dob),
@@ -853,6 +885,12 @@ SET
     updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
 FROM public.july_form_onboarding j
 WHERE c.source_portal_form_id = j.id;
+
+-- Fix 6.9: Restore 'IP' in partner_id for all Operators to match Google Sheet ID s Creations and dispatch ledgers
+UPDATE public.core_partner_onboarding
+SET partner_id = REGEXP_REPLACE(partner_id, '^(LETZ[A-Z]{3})([0-9]{10})$', '\1IP\2'),
+    updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+WHERE onboarding_type = 'Operator' AND partner_id !~ 'IP';
 
 -- -----------------------------------------------------------------------------
 -- 7. SAMPLE OPERATIONAL & VERIFICATION QUERIES
