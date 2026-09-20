@@ -76,20 +76,59 @@ The **Ola Final Table** pipeline is the definitive operational authority for Ola
 
 ---
 
-## 4. Key Financial Rules
+## 4. Key Financial & Operational Rules
 
 1. **`operator_bill_raw` is the Real Revenue:**
-   - Hisaab's `OLA Net Revenue` maps strictly to `operator_bill_raw` (net after Ola platform commission), not `customer_bill_raw`.
-2. **Cash is an Asset Offset:**
-   - Cash collected by driver is stored as positive magnitude in summary and subtracted from company payout to driver.
+   - Hisaab's `OLA Net Revenue` maps strictly to `operator_bill_raw` + cancellation compensation fees (net after Ola platform commission), not `customer_bill_raw`.
+2. **Cash is an Asset Offset (Positive Magnitude):**
+   - Cash collected by driver is stored as a strictly positive magnitude (`ABS(cash_collected_by_driver_raw)`) in summaries and subtracted from company payout to driver (`Cash - Net Revenue - Online Payouts`).
 3. **Transaction Ledger Signs:**
    - In `ola_raw_transactions`, amounts are unsigned decimals. The financial direction is governed by `payment_type`: `credit` (+ money to driver) vs `debit` (- money from driver).
+4. **12:00 AM Midnight Service Day Partitioning:**
+   - Ola trip accounting operates strictly on calendar midnight boundaries (`00:00:00` to `23:59:59`).
+   - Any trip completed before 12:00 AM midnight belongs to the previous day; any trip completed after 12:00 AM belongs to the current/next day.
+   - `ola_raw_crns.stmt_date` directly reflects this midnight partitioning.
+5. **Anti-Truncation Weekly Aggregation:**
+   - Rolling sync procedures dynamically snap to calendar Monday (`DATE_TRUNC('week', start_date)`) through Sunday (`+ INTERVAL '6 days'`). Partial rolling windows are never allowed to overwrite full-week aggregates.
+6. **Vendor Attribution Resilience:**
+   - Vendor code is resolved by finding the dominant partner ID across the entire 7-day billing week from `core_daily_vehicle_status`, falling back to `core_rent.partner_id`.
 
 ---
 
 ## 5. Deployment & Execution Runbook
 
-Run the pipeline manually or via scheduled Cloud Scheduler / Cron:
-```bash
-python "Ola Final Table/automation_script.py"
+### 5.1 Zero-Trigger Raw Table Isolation
+To guarantee uninterrupted raw ingestion performance and avoid lock contention, **no triggers exist on `ola_raw_crns` or `ola_raw_transactions`**. Raw ingestion pipelines run completely isolated.
+
+### 5.2 Automated pg_cron Schedule (Every 30 Minutes)
+The core aggregation runs automatically inside PostgreSQL via `pg_cron`:
+```sql
+-- Scheduled as job 'sync_core_ola_30m' (Runs every 30 minutes)
+SELECT cron.schedule(
+    'sync_core_ola_30m',
+    '*/30 * * * *',
+    'CALL public.sp_sync_core_ola(CURRENT_DATE - INTERVAL ''14 days'', CURRENT_DATE);'
+);
 ```
+
+### 5.3 Manual Ad-Hoc Execution & Historical Backfill
+You can trigger ad-hoc backfills or procedure runs via SQL or Python:
+
+**SQL Stored Procedure:**
+```sql
+-- Sync default rolling 14-day window:
+CALL public.sp_sync_core_ola();
+
+-- Sync specific historical date range:
+CALL public.sp_sync_core_ola('2026-08-17'::date, '2026-09-19'::date);
+```
+
+**Python Automation Script:**
+```bash
+# Run default 14-day sync:
+python "Ola Final Table/automation_script.py"
+
+# Run custom backfill window:
+python "Ola Final Table/automation_script.py" --start 2026-08-17 --end 2026-09-19
+```
+

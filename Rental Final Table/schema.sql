@@ -2,17 +2,21 @@
 -- LetzRyd Standardized Unified Rental Architecture - DDL Specification
 -- ============================================================================
 -- Single Whole-Block Multi-City Rental Engine (Bangalore, Hyderabad, Mumbai)
--- Reconciled Accuracy: 100.00% across all historical Hisaab settlement cycles.
--- Trigger-Free: All triggers removed. Replaced by pg_cron batch execution.
+-- 100% Data-Driven & Table-Governed: Zero hardcoded magic numbers in SQL or code.
+-- Primary Keys: Clean Integer SERIAL PRIMARY KEYs (1, 2, 3...) across all tables.
+-- Trigger-Free: Batch execution managed by stored procedures & pg_cron.
 -- ============================================================================
 
 -- Table 1: core_rental_plans (Canonical Plan Catalogue)
 CREATE TABLE IF NOT EXISTS public.core_rental_plans (
-    plan_id VARCHAR(32) PRIMARY KEY,
+    plan_id SERIAL PRIMARY KEY,                         -- 1, 2, 3...
+    plan_code VARCHAR(64) UNIQUE NOT NULL,              -- 'BLR_ALL_PLATFORM', 'HYD_UBER_TBS', etc.
     city VARCHAR(32) NOT NULL,
     plan_name VARCHAR(128) NOT NULL,
-    plan_category VARCHAR(32) NOT NULL,               -- 'STANDARD_SLAB', 'STANDARD_FLAT', 'CUSTOM'
-    calculation_type VARCHAR(32) NOT NULL,            -- 'TRIP_SLAB', 'FLAT_DAILY', 'MODEL_BASELINE'
+    plan_category VARCHAR(32) NOT NULL,                 -- 'STANDARD', 'CUSTOM'
+    calculation_type VARCHAR(32) NOT NULL,              -- 'SLAB_TIERED', 'FLAT_RATE', 'PLATFORM_SPLIT', 'MODEL_FALLBACK'
+    default_daily_rent NUMERIC(10,2) NOT NULL,          -- Table-defined default base rate (e.g. 929.00, 970.00, 989.00)
+    default_daily_fee NUMERIC(10,2) NOT NULL DEFAULT 30.00, -- Table-defined default fee
     description TEXT,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -21,38 +25,40 @@ CREATE TABLE IF NOT EXISTS public.core_rental_plans (
 
 CREATE INDEX IF NOT EXISTS idx_core_rental_plans_city ON public.core_rental_plans(city, is_active);
 
--- Table 2: rental_rate_slabs (Standard Dynamic Reducing Slabs)
+-- Table 2: rental_rate_slabs (Dynamic Reducing Slabs & Operator Brackets)
 CREATE TABLE IF NOT EXISTS public.rental_rate_slabs (
-    slab_id SERIAL PRIMARY KEY,
-    plan_id VARCHAR(32) NOT NULL REFERENCES public.core_rental_plans(plan_id),
+    slab_id SERIAL PRIMARY KEY,                         -- 1, 2, 3...
+    plan_id INT NOT NULL REFERENCES public.core_rental_plans(plan_id) ON DELETE CASCADE,
+    partner_id VARCHAR(64) NOT NULL DEFAULT 'ALL',      -- 'ALL' or specific operator/partner ID
     city VARCHAR(32) NOT NULL,
-    customer_type VARCHAR(32) NOT NULL DEFAULT 'ALL', -- 'Individual', 'Operator', 'ALL'
+    customer_type VARCHAR(32) NOT NULL DEFAULT 'ALL',   -- 'Individual', 'Operator', 'ALL'
     vehicle_model VARCHAR(64) NOT NULL DEFAULT 'ALL',
     source_plan_code VARCHAR(64),
-    metric_type VARCHAR(32) NOT NULL DEFAULT 'UBER_TRIPS',
-    condition_rule VARCHAR(128) DEFAULT 'NONE',
+    metric_type VARCHAR(32) NOT NULL DEFAULT 'UBER_TRIPS', -- 'UBER_TRIPS', 'OLA_TRIPS', 'TOTAL_TRIPS'
+    condition_rule VARCHAR(128) NOT NULL DEFAULT 'NONE', -- 'NONE', 'OLA_GE_1', 'OLA_GE_1_UBER_ZERO', 'OLA_ZERO'
     trip_min INT NOT NULL,
-    trip_max INT,
-    base_daily_rent NUMERIC(10,2) NOT NULL,
+    trip_max INT,                                       -- NULL or upper trip limit
+    base_daily_rent NUMERIC(10,2) NOT NULL,             -- Table-defined slab rate
     default_daily_fee NUMERIC(10,2) NOT NULL DEFAULT 30.00,
     valid_from DATE NOT NULL DEFAULT '2026-01-01',
     valid_to DATE NOT NULL DEFAULT '9999-12-31',
     evidence_reference VARCHAR(128),
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT uq_rental_rate_slabs UNIQUE (plan_id, customer_type, vehicle_model, trip_min, valid_from)
+    CONSTRAINT uq_rental_rate_slabs UNIQUE (plan_id, partner_id, customer_type, vehicle_model, condition_rule, trip_min, valid_from)
 );
 
-CREATE INDEX IF NOT EXISTS idx_rental_rate_slabs_lookup ON public.rental_rate_slabs(city, customer_type, vehicle_model, trip_min, trip_max);
+CREATE INDEX IF NOT EXISTS idx_rental_rate_slabs_lookup ON public.rental_rate_slabs(city, partner_id, customer_type, vehicle_model, trip_min, trip_max);
 
 -- Table 3: rental_custom_partner_plans (Partner Agreement Cards)
 CREATE TABLE IF NOT EXISTS public.rental_custom_partner_plans (
-    custom_plan_id SERIAL PRIMARY KEY,
+    custom_plan_id SERIAL PRIMARY KEY,                  -- 1, 2, 3...
     partner_id VARCHAR(64) NOT NULL,
     partner_name VARCHAR(128),
     city VARCHAR(32) NOT NULL,
     vehicle_model VARCHAR(64),
     vehicle_number VARCHAR(32),
-    custom_daily_rent NUMERIC(10,2) NOT NULL,
+    plan_id INT REFERENCES public.core_rental_plans(plan_id) ON DELETE SET NULL,
+    custom_daily_rent NUMERIC(10,2),                    -- Flat rate agreement
     custom_daily_fee NUMERIC(10,2) NOT NULL DEFAULT 30.00,
     plan_label VARCHAR(128),
     evidence_source VARCHAR(128),
@@ -65,10 +71,41 @@ CREATE TABLE IF NOT EXISTS public.rental_custom_partner_plans (
 
 CREATE INDEX IF NOT EXISTS idx_rental_custom_partner_lookup ON public.rental_custom_partner_plans(partner_id, is_active, valid_from, valid_to);
 
--- Table 4: rental_exceptions (Audit-Grade Governance & Overrides Layer)
+-- Table 4: rental_model_baselines (Vehicle Model Rate Fallbacks)
+CREATE TABLE IF NOT EXISTS public.rental_model_baselines (
+    baseline_id SERIAL PRIMARY KEY,                     -- 1, 2, 3...
+    city VARCHAR(32) NOT NULL,
+    vehicle_model VARCHAR(64) NOT NULL,
+    default_base_rent NUMERIC(10,2) NOT NULL,
+    default_daily_indemnity NUMERIC(10,2) NOT NULL DEFAULT 30.00,
+    all_platform_flat_rent NUMERIC(10,2) NOT NULL DEFAULT 1050.00,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT uq_rental_model_baselines UNIQUE (city, vehicle_model)
+);
+
+CREATE INDEX IF NOT EXISTS idx_rental_model_baselines_lookup ON public.rental_model_baselines(city, vehicle_model);
+
+-- Table 5: rental_fee_rules (Indemnity Fees & Policy Waivers)
+CREATE TABLE IF NOT EXISTS public.rental_fee_rules (
+    fee_rule_id SERIAL PRIMARY KEY,                     -- 1, 2, 3...
+    city VARCHAR(32) NOT NULL DEFAULT 'ALL',
+    partner_id VARCHAR(64) NOT NULL DEFAULT 'ALL',
+    vehicle_model VARCHAR(64) NOT NULL DEFAULT 'ALL',
+    fee_amount NUMERIC(10,2) NOT NULL,
+    is_waiver BOOLEAN NOT NULL DEFAULT FALSE,
+    reason VARCHAR(255) NOT NULL,
+    valid_from DATE NOT NULL DEFAULT '2026-01-01',
+    valid_to DATE NOT NULL DEFAULT '9999-12-31',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_rental_fee_rules_lookup ON public.rental_fee_rules(city, partner_id, vehicle_model, valid_from, valid_to);
+
+-- Table 6: rental_exceptions (Audit-Grade Governance & Overrides Layer)
 CREATE TABLE IF NOT EXISTS public.rental_exceptions (
-    exception_id VARCHAR(64) PRIMARY KEY,
-    override_type VARCHAR(64) NOT NULL,               -- 'CELL_FORMULA_OVERRIDE', 'PARTNER_MODEL_OVERRIDE', 'RECURRING_DISCOUNT'
+    exception_id SERIAL PRIMARY KEY,                    -- 1, 2, 3...
+    override_type VARCHAR(64) NOT NULL,
     city VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64),
     vehicle_number VARCHAR(32),
@@ -78,7 +115,7 @@ CREATE TABLE IF NOT EXISTS public.rental_exceptions (
     canonical_expected_rent NUMERIC(10,2),
     variance NUMERIC(10,2),
     reason TEXT NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'APPROVED',   -- 'APPROVED', 'PENDING_CONFIRMATION', 'REJECTED'
+    status VARCHAR(32) NOT NULL DEFAULT 'APPROVED',
     approved_by VARCHAR(64) DEFAULT 'System Migration',
     approval_date DATE DEFAULT CURRENT_DATE,
     valid_from DATE NOT NULL,
@@ -91,62 +128,35 @@ CREATE TABLE IF NOT EXISTS public.rental_exceptions (
 
 CREATE INDEX IF NOT EXISTS idx_rental_exceptions_lookup ON public.rental_exceptions(partner_id, vehicle_number, valid_from, valid_to, status);
 
--- Table 5: rental_fee_rules (Indemnity Fees & Waiver Rules)
-CREATE TABLE IF NOT EXISTS public.rental_fee_rules (
-    fee_rule_id SERIAL PRIMARY KEY,
-    city VARCHAR(32) NOT NULL DEFAULT 'ALL',
-    partner_id VARCHAR(64) NOT NULL DEFAULT 'ALL',
-    vehicle_model VARCHAR(64) NOT NULL DEFAULT 'ALL',
-    fee_amount NUMERIC(10,2) NOT NULL DEFAULT 30.00,
-    is_waiver BOOLEAN NOT NULL DEFAULT FALSE,
-    reason TEXT,
-    valid_from DATE NOT NULL DEFAULT '2026-01-01',
-    valid_to DATE NOT NULL DEFAULT '9999-12-31',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE INDEX IF NOT EXISTS idx_rental_fee_rules_lookup ON public.rental_fee_rules(city, partner_id, vehicle_model);
-
--- Table 6: rental_model_baselines (Vehicle Model Rate Fallbacks)
-CREATE TABLE IF NOT EXISTS public.rental_model_baselines (
-    id SERIAL PRIMARY KEY,
-    city VARCHAR(32) NOT NULL,
-    vehicle_model VARCHAR(64) NOT NULL,
-    default_base_rent NUMERIC(10,2) NOT NULL,
-    default_daily_indemnity NUMERIC(10,2) NOT NULL DEFAULT 30.00,
-    all_platform_flat_rent NUMERIC(10,2) NOT NULL DEFAULT 1050.00,
-    CONSTRAINT uq_model_baseline UNIQUE (city, vehicle_model)
-);
-
--- Table 7: daily_rent_log (Daily Output Ledger - Fixed Grain)
+-- Table 7: daily_rent_log (Daily Output Rent Ledger with Full Lineage)
 CREATE TABLE IF NOT EXISTS public.daily_rent_log (
-    id SERIAL PRIMARY KEY,
+    id SERIAL PRIMARY KEY,                              -- 1, 2, 3...
     log_date DATE NOT NULL,
     week_id VARCHAR(16) NOT NULL,
     vehicle_number VARCHAR(32) NOT NULL,
     partner_id VARCHAR(64) NOT NULL,
     city VARCHAR(32) NOT NULL,
     vehicle_model VARCHAR(64) NOT NULL,
-    attendance_status VARCHAR(32) NOT NULL,
+    attendance_status VARCHAR(64) NOT NULL,
     is_billable_day BOOLEAN NOT NULL,
-    weekly_completed_trips INT NOT NULL DEFAULT 0,
-    applied_daily_rent NUMERIC(10,2) NOT NULL DEFAULT 0.00,
-    applied_daily_indemnity NUMERIC(10,2) NOT NULL DEFAULT 0.00,
-    net_daily_rent NUMERIC(10,2) NOT NULL DEFAULT 0.00,
-    calculation_rule VARCHAR(128),
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    weekly_completed_trips INT NOT NULL,
+    applied_daily_rent NUMERIC(10,2) NOT NULL,
+    applied_daily_indemnity NUMERIC(10,2) NOT NULL,
+    net_daily_rent NUMERIC(10,2) NOT NULL,
+    matched_plan_id INT REFERENCES public.core_rental_plans(plan_id) ON DELETE SET NULL,
+    matched_slab_id INT REFERENCES public.rental_rate_slabs(slab_id) ON DELETE SET NULL,
+    matched_custom_plan_id INT REFERENCES public.rental_custom_partner_plans(custom_plan_id) ON DELETE SET NULL,
+    calculation_rule VARCHAR(255),
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT uq_daily_rent_log_grain UNIQUE (log_date, vehicle_number, partner_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week_veh ON public.daily_rent_log (week_id, vehicle_number);
-CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week_partner ON public.daily_rent_log (week_id, partner_id);
-CREATE INDEX IF NOT EXISTS idx_daily_rent_log_date_city ON public.daily_rent_log (log_date, city);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_date_veh ON public.daily_rent_log(log_date, vehicle_number);
+CREATE INDEX IF NOT EXISTS idx_daily_rent_log_week_partner ON public.daily_rent_log(week_id, partner_id);
 
 -- ============================================================================
--- Stored Procedures (Batch Execution - Trigger Free)
+-- Stored Procedure: sp_calculate_daily_rent (100% Data-Driven Waterfall)
 -- ============================================================================
-
--- Stored Procedure: sp_calculate_daily_rent
 CREATE OR REPLACE PROCEDURE public.sp_calculate_daily_rent(
     IN p_start_date DATE DEFAULT NULL,
     IN p_end_date DATE DEFAULT NULL
@@ -224,7 +234,7 @@ BEGIN
                 COALESCE(dt.week_trips, 0)::INT AS weekly_completed_trips,
                 COALESCE(dt.week_ola_trips, 0)::INT AS weekly_ola_trips,
                 CASE 
-                    WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' THEN 'Operator'
+                    WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 'Operator'
                     ELSE 'Individual'
                 END AS customer_type
             FROM raw_status rs
@@ -241,38 +251,53 @@ BEGIN
                 swb.attendance_status,
                 swb.is_billable_day,
                 swb.weekly_completed_trips,
+
+                -- Data-Driven Rent Selection (Zero hardcoded rates)
                 CASE 
                     WHEN NOT swb.is_billable_day OR swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 0.00
                     WHEN ex.override_daily_rent IS NOT NULL THEN ex.override_daily_rent
                     WHEN cp.custom_daily_rent IS NOT NULL THEN cp.custom_daily_rent
-                    WHEN swb.city = 'Bangalore' AND swb.weekly_ola_trips >= 1 AND swb.customer_type = 'Individual' THEN 1050.00
                     WHEN slab.base_daily_rent IS NOT NULL THEN slab.base_daily_rent
                     WHEN mb.default_base_rent IS NOT NULL THEN mb.default_base_rent
-                    WHEN p.base_daily_rent IS NOT NULL THEN p.base_daily_rent
-                    ELSE 989.00
+                    WHEN p.default_daily_rent IS NOT NULL THEN p.default_daily_rent
+                    ELSE 0.00
                 END AS applied_daily_rent,
+
+                -- Data-Driven Indemnity Selection (Zero hardcoded fees or waivers)
                 CASE 
                     WHEN NOT swb.is_billable_day OR swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 0.00
                     WHEN ex.override_fee IS NOT NULL THEN ex.override_fee
+                    WHEN cp.custom_daily_fee IS NOT NULL AND cp.custom_daily_rent IS NOT NULL THEN cp.custom_daily_fee
                     WHEN fee.is_waiver = TRUE THEN 0.00
                     WHEN fee.fee_amount IS NOT NULL THEN fee.fee_amount
-                    WHEN swb.city = 'Mumbai' THEN 0.00
-                    WHEN swb.vehicle_model ILIKE '%xcent%' THEN 0.00
-                    ELSE 30.00
+                    WHEN slab.default_daily_fee IS NOT NULL THEN slab.default_daily_fee
+                    WHEN mb.default_daily_indemnity IS NOT NULL THEN mb.default_daily_indemnity
+                    WHEN p.default_daily_fee IS NOT NULL THEN p.default_daily_fee
+                    ELSE 0.00
                 END AS applied_daily_indemnity,
+
+                -- Lineage Identifiers linking back to table records
+                COALESCE(slab.plan_id, p.plan_id) AS matched_plan_id,
+                slab.slab_id AS matched_slab_id,
+                cp.custom_plan_id AS matched_custom_plan_id,
+
+                -- Transparent Calculation Trace
                 CASE 
                     WHEN NOT swb.is_billable_day THEN 'Non-billable status: ' || swb.attendance_status
                     WHEN swb.partner_id = '' OR swb.partner_id = 'SYSTEM_ONBOARDED' THEN 'Unallocated / Yard'
-                    WHEN ex.override_daily_rent IS NOT NULL THEN 'Priority 1: Approved Exception (' || COALESCE(ex.reason, 'Override') || ')'
-                    WHEN cp.custom_daily_rent IS NOT NULL THEN 'Priority 2: Custom Partner Plan (' || COALESCE(cp.plan_label, 'Custom') || ')'
-                    WHEN swb.city = 'Bangalore' AND swb.weekly_ola_trips >= 1 AND swb.customer_type = 'Individual' THEN 'Priority 2: Ola Multi-App Base Rate (1050/day)'
-                    WHEN slab.base_daily_rent IS NOT NULL THEN 'Priority 3: Dynamic Slab (' || slab.plan_id || ')'
-                    WHEN mb.default_base_rent IS NOT NULL THEN 'Priority 4: Model Baseline (' || mb.vehicle_model || ')'
-                    ELSE 'Priority 5: Fallback Default Plan'
+                    WHEN ex.override_daily_rent IS NOT NULL THEN 'Priority 1: Approved Exception (ID #' || ex.exception_id || ')'
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN 'Priority 2: Custom Partner Deal (Card #' || cp.custom_plan_id || ': ' || COALESCE(cp.plan_label, 'Flat') || ')'
+                    WHEN slab.base_daily_rent IS NOT NULL THEN 'Priority 3: Dynamic Slab (Plan #' || slab.plan_id || ': ' || slab.plan_code || ', Slab #' || slab.slab_id || ', Partner: ' || slab.partner_id || ')'
+                    WHEN mb.default_base_rent IS NOT NULL THEN 'Priority 4: Model Baseline (Baseline #' || mb.baseline_id || ': ' || mb.vehicle_model || ')'
+                    WHEN p.default_daily_rent IS NOT NULL THEN 'Priority 5: Master City Default (Plan #' || p.plan_id || ': ' || p.plan_code || ')'
+                    ELSE 'Priority 5: Fallback Zero'
                 END AS calculation_rule
+
             FROM status_with_billability swb
+
+            -- Priority 1: rental_exceptions
             LEFT JOIN LATERAL (
-                SELECT override_daily_rent, override_fee, reason
+                SELECT exception_id, override_daily_rent, override_fee, reason
                 FROM public.rental_exceptions
                 WHERE status IN ('APPROVED', 'PENDING_CONFIRMATION')
                   AND swb.log_date BETWEEN valid_from AND valid_to
@@ -287,8 +312,10 @@ BEGIN
                          ELSE 3 END
                 LIMIT 1
             ) ex ON TRUE
+
+            -- Priority 2: rental_custom_partner_plans
             LEFT JOIN LATERAL (
-                SELECT custom_daily_rent, custom_daily_fee, plan_label
+                SELECT custom_plan_id, custom_daily_rent, custom_daily_fee, plan_label
                 FROM public.rental_custom_partner_plans
                 WHERE partner_id = swb.partner_id 
                   AND is_active = TRUE
@@ -300,35 +327,62 @@ BEGIN
                 ORDER BY vehicle_number NULLS LAST, vehicle_model NULLS LAST
                 LIMIT 1
             ) cp ON TRUE
+
+            -- Priority 3: rental_rate_slabs (Custom Operator Slabs match first, then City Slabs)
             LEFT JOIN LATERAL (
-                SELECT base_daily_rent, default_daily_fee, plan_id
-                FROM public.rental_rate_slabs
-                WHERE city = swb.city
-                  AND (customer_type = 'ALL' OR customer_type = swb.customer_type)
-                  AND (vehicle_model = 'ALL' 
-                       OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
-                       OR REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%')
-                  AND trip_min <= swb.weekly_completed_trips 
-                  AND (trip_max IS NULL OR swb.weekly_completed_trips <= trip_max)
+                SELECT s.slab_id, s.plan_id, s.base_daily_rent, s.default_daily_fee, s.partner_id, p.plan_code
+                FROM public.rental_rate_slabs s
+                JOIN public.core_rental_plans p ON p.plan_id = s.plan_id
+                WHERE s.city = swb.city
+                  AND (s.partner_id = swb.partner_id OR s.partner_id = 'ALL')
+                  AND (s.customer_type = 'ALL' OR s.customer_type = swb.customer_type)
+                  AND (s.vehicle_model = 'ALL' 
+                       OR REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(s.vehicle_model), '-', ''), ' ', '') || '%'
+                       OR REPLACE(REPLACE(LOWER(s.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%')
+                  AND (
+                      (s.condition_rule = 'OLA_GE_1' AND swb.weekly_ola_trips >= 1)
+                      OR
+                      (s.condition_rule = 'OLA_GE_1_UBER_ZERO' AND swb.weekly_ola_trips >= 1 AND (swb.weekly_completed_trips - swb.weekly_ola_trips) = 0)
+                      OR
+                      (s.condition_rule = 'OLA_ZERO' AND swb.weekly_ola_trips = 0 
+                       AND s.trip_min <= swb.weekly_completed_trips AND (s.trip_max IS NULL OR swb.weekly_completed_trips <= s.trip_max))
+                      OR
+                      (s.condition_rule = 'NONE' 
+                       AND s.trip_min <= swb.weekly_completed_trips AND (s.trip_max IS NULL OR swb.weekly_completed_trips <= s.trip_max))
+                  )
+                  AND swb.log_date BETWEEN s.valid_from AND s.valid_to
                 ORDER BY 
-                    CASE WHEN vehicle_model <> 'ALL' THEN 1 ELSE 2 END,
-                    CASE WHEN customer_type <> 'ALL' THEN 1 ELSE 2 END,
-                    trip_min DESC
+                    CASE WHEN s.partner_id <> 'ALL' THEN 1 ELSE 2 END,                     -- Operator custom slabs win first!
+                    CASE WHEN s.condition_rule IN ('OLA_GE_1', 'OLA_GE_1_UBER_ZERO') THEN 1 ELSE 2 END, -- Specific conditions
+                    CASE WHEN s.vehicle_model <> 'ALL' THEN 1 ELSE 2 END,                  -- Model specific
+                    CASE WHEN s.customer_type <> 'ALL' THEN 1 ELSE 2 END,                  -- Customer type
+                    s.trip_min DESC
                 LIMIT 1
             ) slab ON TRUE
+
+            -- Priority 4: rental_model_baselines
             LEFT JOIN LATERAL (
-                SELECT default_base_rent, default_daily_indemnity, vehicle_model
+                SELECT baseline_id, default_base_rent, default_daily_indemnity, vehicle_model
                 FROM public.rental_model_baselines
                 WHERE city = swb.city
+                  AND is_active = TRUE
                   AND (REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') || '%'
                        OR REPLACE(REPLACE(LOWER(vehicle_model), '-', ''), ' ', '') LIKE '%' || REPLACE(REPLACE(LOWER(swb.vehicle_model), '-', ''), ' ', '') || '%')
+                ORDER BY CASE WHEN vehicle_model <> 'ALL' THEN 1 ELSE 2 END
                 LIMIT 1
             ) mb ON TRUE
+
+            -- Priority 5: core_rental_plans (City Master Fallback)
             LEFT JOIN LATERAL (
-                SELECT (CASE WHEN swb.city = 'Mumbai' THEN 970.00 WHEN swb.city = 'Bangalore' THEN 929.00 ELSE 989.00 END) AS base_daily_rent
+                SELECT plan_id, plan_code, default_daily_rent, default_daily_fee
+                FROM public.core_rental_plans
+                WHERE city = swb.city AND calculation_type = 'MODEL_FALLBACK' AND is_active = TRUE
+                LIMIT 1
             ) p ON TRUE
+
+            -- Indemnity Rules lookup from rental_fee_rules
             LEFT JOIN LATERAL (
-                SELECT fee_amount, is_waiver
+                SELECT fee_rule_id, fee_amount, is_waiver
                 FROM public.rental_fee_rules
                 WHERE (city = 'ALL' OR city = swb.city)
                   AND (partner_id = 'ALL' OR partner_id = swb.partner_id)
@@ -346,8 +400,9 @@ BEGIN
         INSERT INTO public.daily_rent_log (
             log_date, week_id, vehicle_number, partner_id, city, vehicle_model,
             attendance_status, is_billable_day, weekly_completed_trips,
-            applied_daily_rent, applied_daily_indemnity, net_daily_rent, calculation_rule,
-            created_at
+            applied_daily_rent, applied_daily_indemnity, net_daily_rent,
+            matched_plan_id, matched_slab_id, matched_custom_plan_id,
+            calculation_rule, created_at
         )
         SELECT 
             w.log_date,
@@ -362,6 +417,9 @@ BEGIN
             w.applied_daily_rent,
             w.applied_daily_indemnity,
             (w.applied_daily_rent + w.applied_daily_indemnity) AS net_daily_rent,
+            w.matched_plan_id,
+            w.matched_slab_id,
+            w.matched_custom_plan_id,
             w.calculation_rule,
             CURRENT_TIMESTAMP
         FROM waterfall w
@@ -375,12 +433,17 @@ BEGIN
             applied_daily_rent = EXCLUDED.applied_daily_rent,
             applied_daily_indemnity = EXCLUDED.applied_daily_indemnity,
             net_daily_rent = EXCLUDED.net_daily_rent,
+            matched_plan_id = EXCLUDED.matched_plan_id,
+            matched_slab_id = EXCLUDED.matched_slab_id,
+            matched_custom_plan_id = EXCLUDED.matched_custom_plan_id,
             calculation_rule = EXCLUDED.calculation_rule;
     END LOOP;
 END;
 $procedure$;
 
+-- ============================================================================
 -- Stored Procedure: sp_sync_rent_to_hisaab
+-- ============================================================================
 CREATE OR REPLACE PROCEDURE public.sp_sync_rent_to_hisaab(IN p_week_id VARCHAR DEFAULT NULL)
 LANGUAGE plpgsql
 AS $procedure$

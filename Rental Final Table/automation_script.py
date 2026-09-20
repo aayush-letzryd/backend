@@ -6,13 +6,14 @@ high-performance set-based PostgreSQL stored procedures.
 
 Key Procedures:
   1. public.sp_calculate_daily_rent(start_date, end_date)
-     - Implements the 5-Tier Precedence Waterfall natively in PostgreSQL:
+     - Implements the 100% data-driven 5-Tier Precedence Waterfall natively in PostgreSQL:
        Tier 1: Exceptions / Overrides (rental_exceptions)
        Tier 2: Partner Custom Plan Cards (rental_custom_partner_plans)
-       Tier 3: Dynamic Reducing Trip Slabs (rental_rate_slabs)
+       Tier 3: Dynamic Reducing Trip Slabs & Operator Brackets (rental_rate_slabs)
        Tier 4: Model Specific Fallback Baselines (rental_model_baselines)
        Tier 5: Master City Default Base Plans (core_rental_plans)
      - Writes to public.daily_rent_log at the grain: UNIQUE(log_date, vehicle_number, partner_id)
+     - Records full lineage tracking: matched_plan_id, matched_slab_id, matched_custom_plan_id
 
   2. public.sp_sync_rent_to_hisaab(week_id)
      - Set-based batch synchronization of daily rent into public.hisaab_daily_ledger
@@ -62,13 +63,13 @@ def audit_rental_system():
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     tables = [
-        ('core_rental_plans', 'Master Plan Catalogue'),
-        ('rental_rate_slabs', 'Standard Dynamic Rate Slabs'),
+        ('core_rental_plans', 'Master Plan Catalogue (Integer PK)'),
+        ('rental_rate_slabs', 'Dynamic Rate Slabs & Operator Brackets'),
         ('rental_custom_partner_plans', 'Partner Custom Agreements'),
-        ('rental_exceptions', 'Historical & Approved Overrides'),
-        ('rental_fee_rules', 'Indemnity Fees & Waiver Rules'),
+        ('rental_exceptions', 'Approved Governance Overrides'),
+        ('rental_fee_rules', 'Indemnity Fees & Policy Waivers'),
         ('rental_model_baselines', 'Vehicle Model Fallbacks'),
-        ('daily_rent_log', 'Daily Output Rent Ledger'),
+        ('daily_rent_log', 'Daily Output Rent Ledger (with Lineage)'),
         ('hisaab_daily_ledger', 'Hisaab Daily Settlement Ledger'),
         ('hisaab_vehicle_weekly', 'Hisaab Weekly Vehicle Summary')
     ]
@@ -78,6 +79,41 @@ def audit_rental_system():
         cur.execute(f"SELECT count(*) as cnt FROM public.{tbl};")
         cnt = cur.fetchone()['cnt']
         print(f"  {tbl:<30} : {cnt:>8} rows  ({desc})")
+
+    print("\n--- Primary Key Check (Integer Serial IDs: 1, 2, 3...) ---")
+    pks = [
+        ('core_rental_plans', 'plan_id'),
+        ('rental_rate_slabs', 'slab_id'),
+        ('rental_custom_partner_plans', 'custom_plan_id'),
+        ('rental_model_baselines', 'baseline_id'),
+        ('rental_fee_rules', 'fee_rule_id'),
+        ('rental_exceptions', 'exception_id'),
+        ('daily_rent_log', 'id')
+    ]
+    for tbl, col in pks:
+        cur.execute(f"""
+            SELECT data_type 
+            FROM information_schema.columns 
+            WHERE table_name = '{tbl}' AND column_name = '{col}';
+        """)
+        row = cur.fetchone()
+        dtype = row['data_type'] if row else 'UNKNOWN'
+        print(f"  {tbl:<30} PK: {col:<16} Type: {dtype}")
+
+    print("\n--- Operator Custom Slabs in rental_rate_slabs ---")
+    cur.execute("SELECT count(*) as cnt FROM public.rental_rate_slabs WHERE partner_id <> 'ALL';")
+    custom_op_slabs = cur.fetchone()['cnt']
+    print(f"  Custom Operator Slab Records: {custom_op_slabs} rows")
+
+    print("\n--- Lineage Columns in daily_rent_log ---")
+    cur.execute("""
+        SELECT column_name, data_type 
+        FROM information_schema.columns 
+        WHERE table_name = 'daily_rent_log' 
+          AND column_name IN ('matched_plan_id', 'matched_slab_id', 'matched_custom_plan_id');
+    """)
+    for r in cur.fetchall():
+        print(f"  Column: {r['column_name']:<25} Type: {r['data_type']}")
 
     print("\n--- Trigger Safety Audit ---")
     cur.execute("""
@@ -148,22 +184,21 @@ def main():
     parser = argparse.ArgumentParser(description="LetzRyd Unified Rental Automation Engine")
     parser.add_argument("--audit", action="store_true", help="Audit database tables, triggers, and cron schedules")
     parser.add_argument("--calculate-rent", action="store_true", help="Run daily rent calculation stored procedure")
-    parser.add_argument("--start-date", type=str, help="Start date (YYYY-MM-DD) for calculation")
-    parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD) for calculation")
-    parser.add_argument("--sync-hisaab", action="store_true", help="Synchronize daily rent to Hisaab ledger")
-    parser.add_argument("--week-id", type=str, help="Settlement week ID (e.g. CY26WK37)")
+    parser.add_argument("--sync-hisaab", action="store_true", help="Run Hisaab rent sync stored procedure")
+    parser.add_argument("--start-date", type=str, help="Start date (YYYY-MM-DD) for rent calculation")
+    parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD) for rent calculation")
+    parser.add_argument("--week-id", type=str, help="Settlement week ID (e.g., CY26WK37) for Hisaab sync")
 
     args = parser.parse_args()
 
     if args.audit:
         audit_rental_system()
-    elif args.calculate-rent if hasattr(args, 'calculate_rent') and args.calculate_rent else False:
+    elif args.calculate_rent:
         run_daily_calculation(args.start_date, args.end_date)
     elif args.sync_hisaab:
         run_hisaab_sync(args.week_id)
     else:
-        # Default behavior: run audit
-        audit_rental_system()
+        parser.print_help()
 
 if __name__ == "__main__":
     main()

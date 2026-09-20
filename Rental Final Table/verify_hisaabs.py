@@ -17,9 +17,20 @@ import sys
 
 sys.stdout.reconfigure(encoding='utf-8')
 
-BLR_PATH = r"C:\Users\anura\Downloads\26. BLR Hisaab - June 22nd to June 28th CY26WK26.xlsx"
-MUM_PATH = r"C:\Users\anura\Downloads\26. MUM Hisaab - June 22nd to June 28th CY26WK26.xlsx"
-HYD_PATH = r"C:\Users\anura\Downloads\26. HYD Hisaab - Jun 22nd to Jun 28th CY26WK26.xlsx"
+def get_path(filename):
+    for base in [
+        r"C:\Users\anura\Downloads\Hisaab Copy",
+        r"C:\Users\anura\Downloads\18 Sept",
+        r"C:\Users\anura\Downloads"
+    ]:
+        p = os.path.join(base, filename)
+        if os.path.exists(p):
+            return p
+    return os.path.join(r"C:\Users\anura\Downloads\Hisaab Copy", filename)
+
+BLR_PATH = get_path("26. BLR Hisaab - June 22nd to June 28th CY26WK26.xlsx")
+MUM_PATH = get_path("26. MUM Hisaab - June 22nd to June 28th CY26WK26.xlsx")
+HYD_PATH = get_path("26. HYD Hisaab - Jun 22nd to Jun 28th CY26WK26.xlsx")
 
 def run_verification():
     print("=================================================================")
