@@ -239,23 +239,19 @@ BEGIN
                     WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 'Operator'
                     ELSE 'Individual'
                 END AS customer_type,
-                -- Deterministic Plan Assignment via core_vehicle_allocation
+                -- Default plan resolution directly from city, customer type, and model
                 CASE 
-                    WHEN rs.city = 'Hyderabad' THEN
-                        CASE WHEN a.type_of_plan ILIKE '%EBS%' THEN 7 ELSE 6 END
-                    WHEN rs.city = 'Mumbai' THEN 10
+                    WHEN rs.city = 'Hyderabad' THEN 6  -- HYD_UBER_TBS
+                    WHEN rs.city = 'Mumbai' THEN 10     -- MUM_UBER_REDUCING
                     WHEN rs.city = 'Bangalore' THEN
                         CASE 
-                            WHEN a.type_of_plan ILIKE '%Rapido%' OR a.rental_plan ILIKE '%Rapido%' THEN 4
-                            WHEN a.type_of_plan ILIKE '%TBS%' THEN 3
-                            WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 2
-                            ELSE 1
+                            WHEN rs.partner_id ILIKE '%OP%' OR rs.partner_id ILIKE '%FLEET%' OR rs.partner_id ILIKE '%IP%' THEN 2 -- BLR_MASTER_OP
+                            ELSE 1 -- BLR_MASTER_IND
                         END
                     ELSE 9
-                END AS assigned_plan_id
+                END AS default_plan_id
             FROM raw_status rs
             LEFT JOIN daily_trips dt ON dt.vehicle_number = rs.vehicle_number
-            LEFT JOIN public.core_vehicle_allocation a ON a.id = rs.allocation_id
         ),
         waterfall AS (
             SELECT 
@@ -297,10 +293,10 @@ BEGIN
                 CASE 
                     WHEN NOT swb.is_billable_day THEN NULL
                     WHEN ex.override_daily_rent IS NOT NULL THEN NULL
-                    WHEN cp.custom_daily_rent IS NOT NULL THEN COALESCE(cp.plan_id, swb.assigned_plan_id)
+                    WHEN cp.custom_daily_rent IS NOT NULL THEN COALESCE(cp.plan_id, swb.default_plan_id)
                     WHEN slab.base_daily_rent IS NOT NULL THEN slab.plan_id
                     WHEN mb.default_base_rent IS NOT NULL THEN NULL
-                    ELSE swb.assigned_plan_id
+                    ELSE swb.default_plan_id
                 END AS matched_plan_id,
 
                 CASE 
@@ -370,7 +366,7 @@ BEGIN
                   AND (
                       s.partner_id = swb.partner_id 
                       OR 
-                      (s.partner_id = 'ALL' AND s.plan_id = swb.assigned_plan_id)
+                      (s.partner_id = 'ALL' AND s.plan_id = swb.default_plan_id)
                   )
                   AND (s.customer_type = 'ALL' OR s.customer_type = swb.customer_type)
                   AND (s.vehicle_model = 'ALL' 
@@ -414,7 +410,7 @@ BEGIN
             LEFT JOIN LATERAL (
                 SELECT plan_id, plan_code, default_daily_rent, default_daily_fee
                 FROM public.core_rental_plans
-                WHERE plan_id = swb.assigned_plan_id AND is_active = TRUE
+                WHERE plan_id = swb.default_plan_id AND is_active = TRUE
                 LIMIT 1
             ) p ON TRUE
 
