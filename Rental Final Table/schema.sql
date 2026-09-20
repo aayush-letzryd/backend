@@ -374,7 +374,7 @@ BEGIN
                 JOIN public.core_rental_plans p ON p.plan_id = s.plan_id
                 WHERE s.city = swb.city
                   AND (
-                      (s.partner_id = swb.partner_id AND (swb.enrolled_plan_id IS NULL OR s.plan_id = swb.enrolled_plan_id))
+                      (s.partner_id = swb.partner_id AND (COALESCE(cp.plan_id, swb.enrolled_plan_id) IS NULL OR s.plan_id = COALESCE(cp.plan_id, swb.enrolled_plan_id)))
                       OR 
                       (s.partner_id = 'ALL' AND s.plan_id = swb.default_plan_id)
                   )
