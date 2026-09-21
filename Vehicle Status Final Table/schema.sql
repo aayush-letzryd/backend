@@ -903,3 +903,279 @@ BEGIN
         );
 END;
 $procedure$;
+
+
+CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(IN p_target_date date)
+LANGUAGE plpgsql
+AS $$
+
+BEGIN
+    -- Temporary working dataset for target_date
+    CREATE TEMP TABLE tmp_daily_calc ON COMMIT DROP AS
+    WITH ranked_allocs AS (
+        SELECT 
+            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date,
+            ROW_NUMBER() OVER (PARTITION BY a.vehicle_number ORDER BY a.allocation_date DESC, a.id DESC) as rn
+        FROM public.core_vehicle_allocation a
+        WHERE a.is_deleted = FALSE
+          AND a.allocation_date <= p_target_date
+    ),
+    active_alloc AS (
+        SELECT * FROM ranked_allocs WHERE rn = 1
+    ),
+    active_drop AS (
+        SELECT 
+            d.id, d.vehicle_number, d.return_date, d.return_type, d.driver_id, d.driver_name,
+            ROW_NUMBER() OVER (PARTITION BY d.vehicle_number ORDER BY d.return_date ASC, d.id ASC) as rn
+        FROM public.core_dropoffs d
+        JOIN active_alloc a ON d.vehicle_number = a.vehicle_number AND d.return_date >= a.allocation_date
+        WHERE d.is_deleted = FALSE
+    ),
+    first_drop_after_alloc AS (
+        SELECT * FROM active_drop WHERE rn = 1
+    ),
+    next_allocs AS (
+        SELECT 
+            a2.vehicle_number, a2.allocation_date,
+            ROW_NUMBER() OVER (PARTITION BY a2.vehicle_number ORDER BY a2.allocation_date ASC, a2.id ASC) as rn
+        FROM public.core_vehicle_allocation a2
+        JOIN active_alloc a ON a2.vehicle_number = a.vehicle_number 
+          AND (a2.allocation_date > a.allocation_date OR (a2.allocation_date = a.allocation_date AND a2.id > a.id))
+        WHERE a2.is_deleted = FALSE
+    ),
+    first_next_alloc AS (
+        SELECT * FROM next_allocs WHERE rn = 1
+    ),
+    alloc_today AS (
+        SELECT 
+            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date,
+            ROW_NUMBER() OVER (PARTITION BY a.vehicle_number ORDER BY a.id DESC) as rn
+        FROM public.core_vehicle_allocation a
+        WHERE a.is_deleted = FALSE
+          AND a.allocation_date = p_target_date
+    ),
+    alloc_today_latest AS (
+        SELECT * FROM alloc_today WHERE rn = 1
+    ),
+    drop_today AS (
+        SELECT 
+            d.id, d.vehicle_number, d.return_type, d.return_date, d.driver_id, d.driver_name,
+            ROW_NUMBER() OVER (PARTITION BY d.vehicle_number ORDER BY d.id DESC) as rn
+        FROM public.core_dropoffs d
+        WHERE d.is_deleted = FALSE
+          AND d.return_date = p_target_date
+    ),
+    drop_today_latest AS (
+        SELECT * FROM drop_today WHERE rn = 1
+    ),
+    active_maint AS (
+        SELECT 
+            m.id, m.vehicle_number, m.workshop_name, m.start_date, m.end_date,
+            ROW_NUMBER() OVER (PARTITION BY m.vehicle_number ORDER BY m.start_date DESC, m.id DESC) as rn
+        FROM public.core_maintenance m
+        WHERE m.is_deleted = FALSE
+          AND m.start_date <= p_target_date
+          AND (
+              m.end_date >= p_target_date
+              OR (
+                  m.end_date IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM public.core_vehicle_allocation a
+                      WHERE a.vehicle_number = m.vehicle_number
+                        AND a.is_deleted = FALSE
+                        AND a.allocation_date > m.start_date
+                        AND a.allocation_date <= p_target_date
+                  )
+              )
+          )
+    ),
+    active_maint_latest AS (
+        SELECT * FROM active_maint WHERE rn = 1
+    ),
+    svs_today AS (
+        SELECT 
+            s.vehicle_number, s.final_status, s.cohort, s.partner_id, s.partner_name, s.new_partner_name, s.vehicle_model, s.city,
+            ROW_NUMBER() OVER (PARTITION BY s.vehicle_number ORDER BY s.id DESC) as rn
+        FROM public.sheet_vehicle_status s
+        WHERE s.status_date = p_target_date
+    ),
+    svs_today_latest AS (
+        SELECT * FROM svs_today WHERE rn = 1
+    )
+    SELECT 
+        vo.registration_no AS vehicle_number,
+        p_target_date AS status_date,
+        COALESCE(svs.city, at.city, aa.city, vo.city, 'UNKNOWN') AS city,
+        COALESCE(svs.vehicle_model, at.car_model, aa.car_model, vo.model, 'UNKNOWN') AS car_model,
+        COALESCE(at.hub_name, aa.hub_name, 'UNKNOWN') AS hub_name,
+        
+        -- Final Status Determination
+        CASE 
+            -- 1. Primary Authority: Operational Sheet Ground Truth (When sheet row exists)
+            WHEN svs.final_status IS NOT NULL THEN svs.final_status
+            
+            -- 2. Fallback: Handover Events Today in Portal
+            WHEN at.id IS NOT NULL AND dt.id IS NOT NULL THEN 'Same Day D&A'
+            WHEN at.id IS NOT NULL THEN 'Allocation'
+            WHEN dt.id IS NOT NULL AND dt.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+            WHEN dt.id IS NOT NULL THEN 'Drop Off'
+            
+            -- 3. Fallback: Workshop Maintenance Ticket
+            WHEN am.id IS NOT NULL THEN 'Maintenance'
+            
+            -- 4. Fallback: Open Allocation Interval
+            WHEN aa.id IS NOT NULL AND (
+                (fda.id IS NULL AND fna.allocation_date IS NULL) OR
+                (fda.id IS NOT NULL AND (fna.allocation_date IS NULL OR fda.return_date <= fna.allocation_date) AND fda.return_date > p_target_date) OR
+                (fna.allocation_date IS NOT NULL AND fna.allocation_date > p_target_date)
+            ) THEN 'Active'
+            
+            -- 5. Master Default
+            ELSE 'RFD'
+        END AS final_status,
+        
+        -- Cohort Determination (Strictly Binary)
+        CASE 
+            WHEN (
+                CASE 
+                    WHEN svs.final_status IS NOT NULL THEN 
+                        svs.final_status
+                    WHEN at.id IS NOT NULL AND dt.id IS NOT NULL THEN 'Same Day D&A'
+                    WHEN at.id IS NOT NULL THEN 'Allocation'
+                    WHEN dt.id IS NOT NULL AND dt.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+                    WHEN dt.id IS NOT NULL THEN 'Drop Off'
+                    WHEN am.id IS NOT NULL THEN 'Maintenance'
+                    WHEN aa.id IS NOT NULL AND (
+                        (fda.id IS NULL AND fna.allocation_date IS NULL) OR
+                        (fda.id IS NOT NULL AND (fna.allocation_date IS NULL OR fda.return_date <= fna.allocation_date) AND fda.return_date > p_target_date) OR
+                        (fna.allocation_date IS NOT NULL AND fna.allocation_date > p_target_date)
+                    ) THEN 'Active'
+                    ELSE 'RFD'
+                END
+            ) IN ('Active', 'Allocation', 'Allocated', 'Rental', 'Same Day D&A') AND (CASE WHEN svs.final_status IS NOT NULL THEN svs.cohort ELSE 'On Road' END) NOT IN ('Off Road', 'Off-Road') THEN 'On Road'
+            ELSE 'Off Road'
+        END AS cohort,
+        
+        -- Partner ID (Strictly NULL if Off Road / RFD / Maintenance)
+        CASE 
+            WHEN (
+                CASE 
+                    WHEN svs.final_status IS NOT NULL THEN 
+                        svs.final_status
+                    WHEN at.id IS NOT NULL AND dt.id IS NOT NULL THEN 'Same Day D&A'
+                    WHEN at.id IS NOT NULL THEN 'Allocation'
+                    WHEN dt.id IS NOT NULL AND dt.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+                    WHEN dt.id IS NOT NULL THEN 'Drop Off'
+                    WHEN am.id IS NOT NULL THEN 'Maintenance'
+                    WHEN aa.id IS NOT NULL AND (
+                        (fda.id IS NULL AND fna.allocation_date IS NULL) OR
+                        (fda.id IS NOT NULL AND (fna.allocation_date IS NULL OR fda.return_date <= fna.allocation_date) AND fda.return_date > p_target_date) OR
+                        (fna.allocation_date IS NOT NULL AND fna.allocation_date > p_target_date)
+                    ) THEN 'Active'
+                    ELSE 'RFD'
+                END
+            ) IN ('RFD', 'Maintenance', 'New Deployment') THEN NULL
+            ELSE COALESCE(svs.partner_id, at.partner_id, aa.partner_id)
+        END AS partner_id,
+        
+        -- Partner Name (Strictly NULL if Off Road / RFD / Maintenance)
+        CASE 
+            WHEN (
+                CASE 
+                    WHEN svs.final_status IS NOT NULL THEN 
+                        svs.final_status
+                    WHEN at.id IS NOT NULL AND dt.id IS NOT NULL THEN 'Same Day D&A'
+                    WHEN at.id IS NOT NULL THEN 'Allocation'
+                    WHEN dt.id IS NOT NULL AND dt.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+                    WHEN dt.id IS NOT NULL THEN 'Drop Off'
+                    WHEN am.id IS NOT NULL THEN 'Maintenance'
+                    WHEN aa.id IS NOT NULL AND (
+                        (fda.id IS NULL AND fna.allocation_date IS NULL) OR
+                        (fda.id IS NOT NULL AND (fna.allocation_date IS NULL OR fda.return_date <= fna.allocation_date) AND fda.return_date > p_target_date) OR
+                        (fna.allocation_date IS NOT NULL AND fna.allocation_date > p_target_date)
+                    ) THEN 'Active'
+                    ELSE 'RFD'
+                END
+            ) IN ('RFD', 'Maintenance', 'New Deployment') THEN NULL
+            ELSE COALESCE(svs.partner_name, svs.new_partner_name, at.driver_name, aa.driver_name)
+        END AS partner_name,
+        
+        -- Partner Phone
+        CASE 
+            WHEN (
+                CASE 
+                    WHEN svs.final_status IS NOT NULL THEN 
+                        svs.final_status
+                    WHEN at.id IS NOT NULL AND dt.id IS NOT NULL THEN 'Same Day D&A'
+                    WHEN at.id IS NOT NULL THEN 'Allocation'
+                    WHEN dt.id IS NOT NULL AND dt.return_type IN ('Repair and Maintenance', 'Vehicle Breakdown / Maintenance') THEN 'Maintenance'
+                    WHEN dt.id IS NOT NULL THEN 'Drop Off'
+                    WHEN am.id IS NOT NULL THEN 'Maintenance'
+                    WHEN aa.id IS NOT NULL AND (
+                        (fda.id IS NULL AND fna.allocation_date IS NULL) OR
+                        (fda.id IS NOT NULL AND (fna.allocation_date IS NULL OR fda.return_date <= fna.allocation_date) AND fda.return_date > p_target_date) OR
+                        (fna.allocation_date IS NOT NULL AND fna.allocation_date > p_target_date)
+                    ) THEN 'Active'
+                    ELSE 'RFD'
+                END
+            ) IN ('RFD', 'Maintenance', 'New Deployment') THEN NULL
+            ELSE COALESCE(at.driver_phone, aa.driver_phone)
+        END AS partner_phone,
+        
+        -- Tracking IDs
+        aa.id AS allocation_id,
+        aa.allocation_date AS allocation_date,
+        fda.id AS dropoff_id,
+        fda.return_date AS dropoff_date,
+        am.id AS maintenance_id,
+        
+        CASE WHEN svs.final_status IS NOT NULL THEN 'SHEET_GROUND_TRUTH' ELSE 'PORTAL_FALLBACK' END AS source_origin
+        
+    FROM public.core_vehicle_onboarding vo
+    LEFT JOIN active_alloc aa ON vo.registration_no = aa.vehicle_number
+    LEFT JOIN first_drop_after_alloc fda ON vo.registration_no = fda.vehicle_number
+    LEFT JOIN first_next_alloc fna ON vo.registration_no = fna.vehicle_number
+    LEFT JOIN alloc_today_latest at ON vo.registration_no = at.vehicle_number
+    LEFT JOIN drop_today_latest dt ON vo.registration_no = dt.vehicle_number
+    LEFT JOIN active_maint_latest am ON vo.registration_no = am.vehicle_number
+    LEFT JOIN svs_today_latest svs ON vo.registration_no = svs.vehicle_number
+    WHERE vo.is_deleted = FALSE;
+
+    -- Bulk MERGE into physical table core_daily_vehicle_status
+    MERGE INTO public.core_daily_vehicle_status AS target
+    USING tmp_daily_calc AS src
+    ON (target.status_date = src.status_date AND target.vehicle_number = src.vehicle_number)
+    WHEN MATCHED THEN
+        UPDATE SET
+            city = src.city,
+            car_model = src.car_model,
+            hub_name = src.hub_name,
+            final_status = src.final_status,
+            cohort = src.cohort,
+            partner_id = src.partner_id,
+            partner_name = src.partner_name,
+            partner_phone = src.partner_phone,
+            allocation_id = src.allocation_id,
+            allocation_date = src.allocation_date,
+            dropoff_id = src.dropoff_id,
+            dropoff_date = src.dropoff_date,
+            maintenance_id = src.maintenance_id,
+            source_origin = src.source_origin,
+            updated_at = NOW()
+    WHEN NOT MATCHED THEN
+        INSERT (
+            status_date, vehicle_number, city, car_model, hub_name,
+            final_status, cohort, partner_id, partner_name, partner_phone,
+            allocation_id, allocation_date, dropoff_id, dropoff_date, maintenance_id,
+            source_origin, created_at, updated_at
+        )
+        VALUES (
+            src.status_date, src.vehicle_number, src.city, src.car_model, src.hub_name,
+            src.final_status, src.cohort, src.partner_id, src.partner_name, src.partner_phone,
+            src.allocation_id, src.allocation_date, src.dropoff_id, src.dropoff_date, src.maintenance_id,
+            src.source_origin, NOW(), NOW()
+        );
+
+END;
+
+$$;
