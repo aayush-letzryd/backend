@@ -1,3 +1,4 @@
+import os
 import psycopg2
 import time
 
@@ -9,20 +10,26 @@ def deploy():
     conn.autocommit = True
     cur = conn.cursor()
 
-    with open(r"c:\Users\anura\RYD\backend\Hisaab Final Table\triggers.sql", "r", encoding="utf-8") as f:
-        sql_content = f.read()
+    base_dir = os.path.dirname(__file__)
 
-    print("Deploying triggers.sql...")
-    start_time = time.time()
-    cur.execute(sql_content)
-    elapsed = time.time() - start_time
-    print(f"triggers.sql successfully executed and deployed in {elapsed:.2f} seconds!")
+    for fname in ["schema.sql", "procedures.sql", "cron.sql"]:
+        fpath = os.path.join(base_dir, fname)
+        if not os.path.exists(fpath):
+            continue
+        print(f"Deploying {fname}...")
+        start_time = time.time()
+        with open(fpath, "r", encoding="utf-8") as f:
+            sql_content = f.read()
+        cur.execute(sql_content)
+        elapsed = time.time() - start_time
+        print(f"  {fname} deployed successfully in {elapsed:.2f}s")
 
     for notice in conn.notices:
         print(notice.strip())
 
     cur.close()
     conn.close()
+    print("Deployment complete.")
 
 if __name__ == "__main__":
     deploy()

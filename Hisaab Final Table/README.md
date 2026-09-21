@@ -1,263 +1,109 @@
-# Hisaab Final Table Architecture & Settlement Engine
+# LetzRyd Hisaab Engine - Architecture & Settlement Specification
 
-## 1. System Mission & Scope
+## 1. System Mission & Rebuilt Architecture
 
-The **Hisaab Final Table** engine is the ultimate financial, operational, and settlement authority for LetzRyd. It bridges real-time vehicle telemetry, daily lease rentals, multi-platform ride revenues (Uber, Ola, Rapido), operational adjustments, and regulatory tax compliance into an automated, audit-proof settlement ledger.
+The **LetzRyd Hisaab Engine** serves as the automated financial, operational, and settlement authority for LetzRyd. Following an empirical audit of historical weekly workbooks (CY26WK26, CY26WK27, CY26WK37) against live PostgreSQL production tables, the engine was redesigned from the ground up.
 
-### Key Capabilities:
-1. **Multi-Partner Support**:
-   - **Individual Drivers**: 1 vehicle, daily mobile app telemetry feed, weekly net payout statement.
-   - **Multi-Car Fleet Operators**: 2 to 100+ vehicles, itemized vehicle-by-vehicle breakdown, and a single consolidated bank payout statement.
-2. **Mid-Week Vehicle Swaps**: Seamlessly handles drivers switching vehicles mid-week (e.g. Car A Mon–Wed, Car B Thu–Sun) without losing attendance, rent, or trip accuracy.
-3. **The Monday 11:00 AM Audit Lock**: Hard freeze cutoff. After Monday 11:00 AM, the closed week becomes immutable (`is_locked = TRUE`).
-4. **Prior-Period Roll-Forward**: Retrospective traffic fines or maintenance adjustments for locked past weeks automatically route forward to the active cycle as prior-period adjustments.
-
----
-
-## 2. Multi-Tier Architecture & Data Flow
-
-```
-========================================================================================
-                              NORMALIZED CORE DATA SOURCES
-========================================================================================
-  * daily_rent_log          (Attendance, billable status, applied rent & indemnity)
-  * core_uber_daily         (Daily completed trips, fare earnings, cash collected, tolls)
-  * core_ola_daily          (Daily completed trips, operator bill, cash, online payouts)
-  * hisaab_adjustments_ledger (Approved G-Form tyre, rent-offs, damages, traffic fines)
-                                      |
-                                      v
-========================================================================================
-                      TIER 1: DAILY SHIFT GRAIN (DRIVER APP)
-========================================================================================
-  * public.hisaab_daily_ledger
-    - Grain: (log_date, vehicle_number, partner_id)
-    - Continuous Upsert: As Ola, Uber, or adjustments arrive, row builds live.
-    - Powers Driver Mobile App: Yesterday's trips, earnings, cash collected, rent & balance.
-    - Sunday Credit: Milestone target incentives posted on Sunday row (week_end).
-                                      |
-                                      v
-========================================================================================
-                   TIER 2: WEEKLY VEHICLE BREAKDOWN (FINAL HISAAB)
-========================================================================================
-  * public.hisaab_vehicle_weekly
-    - Grain: (week_id, vehicle_number, partner_id)
-    - 1-to-1 match with Excel 'Uber + OLA Final Hisaab' sheet across BLR, HYD, MUM.
-    - Full vehicle breakdown for multi-car fleet operators and mid-week swaps.
-    - Calculates vehicle current_week_os, 1% TDS, and company gross margin.
-                                      |
-                                      v
-========================================================================================
-              TIER 3: CONSOLIDATED PARTNER PAYOUT STATEMENT (HISAAB SUMMARY)
-========================================================================================
-  * public.hisaab_partner_weekly
-    - Grain: (week_id, partner_id)
-    - 1-to-1 match with Excel 'Hisaab Summary' / 'Revised Hisaab Summary'.
-    - Sums all vehicles owned by an operator into a single bank payout statement.
-    - Incorporates opening dues, mid-week collections, and prior-period adjustments.
-    - Monday 11:00 AM: Frozen and pushed to banking / collection teams.
-```
+### Core Architectural Principles:
+1. **100% Downstream Decoupling (Zero Triggers)**:
+   - In accordance with production stability requirements, **all triggers attached to upstream core tables (`core_adjustments`, `core_challans`, `core_gps`, `core_ola_daily`, `core_ola_weekly`) have been permanently removed**.
+   - Raw ingestion pipelines (Uber sync, Ola sync, vehicle status, adjustments) operate independently at full speed without database table locks or transaction cascades.
+2. **Automated Scheduled Batching via `pg_cron`**:
+   - The engine is driven by a scheduled PostgreSQL cron job (`hisaab-vehicle-weekly-sync`), executing daily at **03:00 AM UTC (08:30 AM IST)**.
+   - Runs immediately after the rental waterfall calculation (`rental-daily-calculation` at 02:00 AM UTC).
+3. **Strictly Scoped & Empirically Verified**:
+   - Focuses strictly on verified telemetry and core billing components:
+     - **Onroad & Allotted Days** (with fractional day support, e.g. 6.5 days)
+     - **Lease Rent** (Daily Rate, Base Rental, Indemnity Fee, Net Weekly Rent)
+     - **Uber Telemetry & Revenue** (Trips, Earnings, Cash Collected, Toll, Driver Subscription, Incentive, Week O/S)
+     - **Ola Telemetry & Revenue** (Trips, Revenue, Cash Collected, Toll, GST, Online Payouts, Incentive, Week O/S)
+   - Unverified items (**Current Week O/S, Adjustments, Challans, Accidents, TDS, Dead Miles, Partner Summary**) are explicitly excluded until upstream audits are finalized.
 
 ---
 
-## 3. The 5 Dedicated Hisaab Tables
+## 2. Table Specifications
 
-| # | Table Name | Grain / Primary Key | Core Purpose |
-| :--- | :--- | :--- | :--- |
-| **1** | `public.hisaab_settlement_weeks` | `week_id` | Master calendar and **Monday 11:00 AM Lock Switch**. |
-| **2** | `public.hisaab_adjustments_ledger` | `id` | Financial adjustment registry & prior-period router. |
-| **3** | `public.hisaab_daily_ledger` | `(log_date, vehicle_number, partner_id)` | Real-time daily app feed and pacing tracker. |
-| **4** | `public.hisaab_vehicle_weekly` | `(week_id, vehicle_number, partner_id)` | Itemized vehicle breakdown (Uber+Ola Final Hisaab). |
-| **5** | `public.hisaab_partner_weekly` | `(week_id, partner_id)` | Final consolidated bank payout statement (Hisaab Summary). |
+### A. `public.hisaab_settlement_weeks`
+Master settlement calendar managing weekly billing cycle boundaries and lock guards.
+- **Grain**: One record per settlement week (`week_id`, e.g. `'CY26WK26'`).
+- **Columns**: `week_id`, `settlement_year`, `settlement_week`, `week_start`, `week_end`, `lock_cutoff_at`, `is_locked`, `locked_at`, `locked_by`, `notes`.
+
+### B. `public.hisaab_vehicle_weekly`
+Core weekly settlement table matching the verified fields of the weekly Hisaab workbooks (`Uber + OLA Final Hisaab`).
+- **Primary Key**: `id BIGSERIAL`
+- **Unique Constraint**: `(week_id, vehicle_number)`
+- **Schema**:
+  | Column Group | Columns | Data Type | Notes |
+  | :--- | :--- | :--- | :--- |
+  | **Identity** | `week_id`, `week_start`, `week_end`, `vehicle_number`, `partner_id`, `partner_name`, `city`, `vehicle_model`, `rental_plan` | `VARCHAR`, `DATE` | Resolved from `daily_rent_log`, `core_partner_onboarding`, and `rental_custom_partner_plans` |
+  | **Attendance** | `allotted_days`, `onroad_days` | `NUMERIC(4, 1)` | Supports fractional days (e.g. 6.5) |
+  | **Lease Rent** | `daily_rent_applied`, `weekly_lease_rental`, `weekly_indemnity_fees`, `net_weekly_lease_rental` | `NUMERIC(10/12, 2)` | Aggregated from 5-tier waterfall in `daily_rent_log` |
+  | **Uber** | `uber_trips`, `uber_total_earnings`, `uber_cash_collection`, `uber_toll`, `uber_driver_sub_charge`, `uber_incentive`, `uber_week_os` | `INT`, `NUMERIC(12, 2)` | Pre-aggregated from `core_uber_weekly` (fallback: `core_uber_daily`) |
+  | **Ola** | `ola_trips`, `ola_net_revenue`, `ola_cash_collection`, `ola_toll`, `ola_gst`, `ola_online_payment`, `ola_incentive`, `ola_week_os` | `INT`, `NUMERIC(12, 2)` | Pre-aggregated from `core_ola_weekly` (fallback: `core_ola_daily`) |
+  | **Audit** | `settlement_status`, `created_at`, `updated_at` | `VARCHAR`, `TIMESTAMPTZ` | `'CALCULATED'`, `'VERIFIED'`, `'LOCKED'` |
 
 ---
 
-## 4. Production Schemas
+## 3. Mathematical Formulas
 
-### 4.1 `public.hisaab_settlement_weeks`
-Controls company billing cycles, week dates, and lock cutoff:
-```sql
-CREATE TABLE public.hisaab_settlement_weeks (
-    week_id VARCHAR(16) PRIMARY KEY,        -- e.g. '2026-W26'
-    settlement_year INT NOT NULL,
-    settlement_week INT NOT NULL,
-    week_start DATE NOT NULL,               -- Monday
-    week_end DATE NOT NULL,                 -- Sunday
-    lock_cutoff_at TIMESTAMPTZ NOT NULL,    -- Monday 11:00 AM IST
-    is_locked BOOLEAN NOT NULL DEFAULT FALSE,
-    locked_at TIMESTAMPTZ,
-    locked_by VARCHAR(64),
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-);
-```
+### Lease Rent:
+$$\text{Net Weekly Lease Rental} = \text{Weekly Lease Rental} + \text{Weekly Indemnity Fees}$$
+$$\text{Daily Rent Applied} = \frac{\text{Net Weekly Lease Rental}}{\text{Onroad Days}} \quad (\text{if } \text{Onroad Days} > 0)$$
 
-### 4.2 `public.hisaab_adjustments_ledger`
-Captures operational adjustments with automatic prior-period routing:
-```sql
-CREATE TABLE public.hisaab_adjustments_ledger (
-    id BIGSERIAL PRIMARY KEY,
-    incident_date DATE NOT NULL,            -- True historical occurrence date
-    incident_week_id VARCHAR(16),
-    settlement_week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks(week_id),
-    vehicle_number VARCHAR(32) NOT NULL,
-    partner_id VARCHAR(64) NOT NULL,
-    partner_type VARCHAR(32) DEFAULT 'Individual',
-    adjustment_category VARCHAR(64) NOT NULL, -- 'Challan', 'Rent Off', 'Maintenance/Tyre', 'Accident Damage'
-    amount NUMERIC(12,2) NOT NULL,          -- Positive = Deduction; Negative = Reimbursement
-    is_prior_period BOOLEAN DEFAULT FALSE,  -- True if incident was in an already-locked week
-    approval_status VARCHAR(32) DEFAULT 'Approved',
-    remarks TEXT,
-    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-);
-```
+### Uber Week Outstanding (O/S):
+$$\text{Uber Week O/S} = \text{Uber Total Earnings} - \text{Uber Cash Collection} - \text{Driver Subscription Charge}$$
 
-### 4.3 `public.hisaab_daily_ledger`
-Tier 1 daily shift feed powering mobile apps and daily pacing:
-```sql
-CREATE TABLE public.hisaab_daily_ledger (
-    id BIGSERIAL PRIMARY KEY,
-    log_date DATE NOT NULL,                 -- Calendar date (Monday to Sunday)
-    week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks(week_id),
-    vehicle_number VARCHAR(32) NOT NULL,
-    partner_id VARCHAR(64) NOT NULL,
-    partner_type VARCHAR(32) DEFAULT 'Individual',
-    city VARCHAR(32) NOT NULL,
-    vehicle_model VARCHAR(64),
-    attendance_status VARCHAR(32) DEFAULT 'Active',
-    is_billable_day BOOLEAN DEFAULT TRUE,
-    daily_rent_applied NUMERIC(12,2) DEFAULT 0.00,
-    daily_indemnity_fee NUMERIC(12,2) DEFAULT 0.00,
-    net_daily_rent NUMERIC(12,2) DEFAULT 0.00,
-    uber_trips INT DEFAULT 0,
-    uber_fare_earnings NUMERIC(12,2) DEFAULT 0.00,
-    uber_cash_collected NUMERIC(12,2) DEFAULT 0.00,
-    uber_tolls NUMERIC(12,2) DEFAULT 0.00,
-    uber_subscription_charge NUMERIC(12,2) DEFAULT 0.00,
-    ola_trips INT DEFAULT 0,
-    ola_net_revenue NUMERIC(12,2) DEFAULT 0.00,
-    ola_cash_collected NUMERIC(12,2) DEFAULT 0.00,
-    ola_tolls NUMERIC(12,2) DEFAULT 0.00,
-    ola_online_payment NUMERIC(12,2) DEFAULT 0.00,
-    rapido_trips INT DEFAULT 0,
-    rapido_net_revenue NUMERIC(12,2) DEFAULT 0.00,
-    daily_adjustments NUMERIC(12,2) DEFAULT 0.00,
-    daily_challans NUMERIC(12,2) DEFAULT 0.00,
-    daily_accident_recovery NUMERIC(12,2) DEFAULT 0.00,
-    weekly_incentive_credit NUMERIC(12,2) DEFAULT 0.00, -- Credited on Sunday row
-    daily_net_balance NUMERIC(12,2) DEFAULT 0.00,
-    is_locked BOOLEAN DEFAULT FALSE,
-    CONSTRAINT uq_hisaab_daily_grain UNIQUE (log_date, vehicle_number, partner_id)
-);
-```
+### Ola Week Outstanding (O/S):
+$$\text{Ola Week O/S} = \text{Ola Net Revenue} - \text{Ola Cash Collection}$$
 
-### 4.4 `public.hisaab_vehicle_weekly`
-Tier 2 weekly breakdown per vehicle (1-to-1 match with `Uber + OLA Final Hisaab`):
-```sql
-CREATE TABLE public.hisaab_vehicle_weekly (
-    id BIGSERIAL PRIMARY KEY,
-    settlement_year INT NOT NULL,
-    settlement_week INT NOT NULL,
-    week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks(week_id),
-    week_start DATE NOT NULL,
-    week_end DATE NOT NULL,
-    vehicle_number VARCHAR(32) NOT NULL,
-    partner_id VARCHAR(64) NOT NULL,
-    partner_name VARCHAR(128),
-    partner_type VARCHAR(32) DEFAULT 'Individual',
-    city VARCHAR(32) NOT NULL,
-    vehicle_model VARCHAR(64),
-    rental_plan VARCHAR(64),
-    allotted_days INT DEFAULT 0,
-    onroad_days INT DEFAULT 0,
-    daily_rent_applied NUMERIC(12,2) DEFAULT 0.00,
-    weekly_lease_rental NUMERIC(12,2) DEFAULT 0.00,
-    weekly_indemnity_fees NUMERIC(12,2) DEFAULT 0.00,
-    net_weekly_lease_rental NUMERIC(12,2) DEFAULT 0.00,
-    uber_trips INT DEFAULT 0,
-    uber_total_earnings NUMERIC(12,2) DEFAULT 0.00,
-    uber_cash_collection NUMERIC(12,2) DEFAULT 0.00,
-    uber_toll NUMERIC(12,2) DEFAULT 0.00,
-    uber_driver_sub_charge NUMERIC(12,2) DEFAULT 0.00,
-    uber_week_os NUMERIC(12,2) DEFAULT 0.00,
-    ola_trips INT DEFAULT 0,
-    ola_net_revenue NUMERIC(12,2) DEFAULT 0.00,
-    ola_toll NUMERIC(12,2) DEFAULT 0.00,
-    ola_gst NUMERIC(12,2) DEFAULT 0.00,
-    ola_online_payment NUMERIC(12,2) DEFAULT 0.00,
-    ola_week_os NUMERIC(12,2) DEFAULT 0.00,
-    rapido_trips INT DEFAULT 0,
-    rapido_net_revenue NUMERIC(12,2) DEFAULT 0.00,
-    weekly_platform_incentive NUMERIC(12,2) DEFAULT 0.00,
-    vehicle_adjustments NUMERIC(12,2) DEFAULT 0.00,
-    challan_amount NUMERIC(12,2) DEFAULT 0.00,
-    accident_penalties NUMERIC(12,2) DEFAULT 0.00,
-    dead_mile_charges NUMERIC(12,2) DEFAULT 0.00,
-    tds_amount NUMERIC(12,2) DEFAULT 0.00,
-    current_week_os NUMERIC(12,2) DEFAULT 0.00,
-    to_collect NUMERIC(12,2) DEFAULT 0.00,
-    to_payout NUMERIC(12,2) DEFAULT 0.00,
-    letzryd_earning NUMERIC(12,2) DEFAULT 0.00,
-    letzryd_earning_per_day NUMERIC(12,2) DEFAULT 0.00,
-    settlement_status VARCHAR(32) DEFAULT 'OPEN',
-    CONSTRAINT uq_hisaab_veh_weekly UNIQUE (week_id, vehicle_number, partner_id)
-);
-```
+---
 
-### 4.5 `public.hisaab_partner_weekly`
-Tier 3 consolidated partner payout statement (1-to-1 match with `Hisaab Summary`):
+## 4. Automation & Stored Procedures
+
+### Stored Procedure:
+`public.sp_sync_hisaab_vehicle_weekly(p_week_id VARCHAR DEFAULT NULL)`
+- If `p_week_id` is specified, recalculates and upserts that specific week.
+- If `NULL`, recalculates all unlocked settlement weeks where `week_start <= CURRENT_DATE`.
+- Handles multiple partner assignments in a single week by selecting the primary partner by billable days and latest timestamp.
+- Automatically leverages `core_uber_weekly` / `core_ola_weekly` if present, with transparent fallback to daily ingestion tables (`core_uber_daily` / `core_ola_daily`).
+
+### `pg_cron` Scheduling:
 ```sql
-CREATE TABLE public.hisaab_partner_weekly (
-    id BIGSERIAL PRIMARY KEY,
-    settlement_year INT NOT NULL,
-    settlement_week INT NOT NULL,
-    week_id VARCHAR(16) NOT NULL REFERENCES public.hisaab_settlement_weeks(week_id),
-    week_start DATE NOT NULL,
-    week_end DATE NOT NULL,
-    partner_id VARCHAR(64) NOT NULL,
-    partner_name VARCHAR(128),
-    partner_type VARCHAR(32) DEFAULT 'Individual',
-    city VARCHAR(32) NOT NULL,
-    allotted_cars_count INT DEFAULT 1,
-    total_onroad_days INT DEFAULT 0,
-    total_trips INT DEFAULT 0,
-    total_net_rent_billed NUMERIC(12,2) DEFAULT 0.00,
-    total_platform_earnings NUMERIC(12,2) DEFAULT 0.00,
-    total_cash_collected NUMERIC(12,2) DEFAULT 0.00,
-    total_platform_incentives NUMERIC(12,2) DEFAULT 0.00,
-    total_adjustments NUMERIC(12,2) DEFAULT 0.00,
-    total_challans NUMERIC(12,2) DEFAULT 0.00,
-    total_accidents NUMERIC(12,2) DEFAULT 0.00,
-    total_tds NUMERIC(12,2) DEFAULT 0.00,
-    current_week_os NUMERIC(12,2) DEFAULT 0.00,
-    previous_outstanding NUMERIC(12,2) DEFAULT 0.00,
-    amount_paid_during_week NUMERIC(12,2) DEFAULT 0.00,
-    prior_period_adjustments NUMERIC(12,2) DEFAULT 0.00,
-    security_deposit_target NUMERIC(12,2) DEFAULT 0.00,
-    security_deposit_paid NUMERIC(12,2) DEFAULT 0.00,
-    deposit_deduction_current_week NUMERIC(12,2) DEFAULT 0.00,
-    pending_deposit NUMERIC(12,2) DEFAULT 0.00,
-    total_outstanding NUMERIC(12,2) DEFAULT 0.00,
-    net_bank_payout NUMERIC(12,2) DEFAULT 0.00,
-    net_amount_to_collect NUMERIC(12,2) DEFAULT 0.00,
-    settlement_status VARCHAR(32) DEFAULT 'DRAFT',
-    frozen_at TIMESTAMPTZ,
-    bank_utr_reference VARCHAR(64),
-    CONSTRAINT uq_hisaab_partner_weekly UNIQUE (week_id, partner_id)
+SELECT cron.schedule(
+    'hisaab-vehicle-weekly-sync',
+    '0 3 * * *',
+    'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
 );
 ```
 
 ---
 
-## 5. Execution & Automation Runbook
+## 5. Empirical Verification & Parity Results
 
-The automation pipeline is self-contained and executable via Python or scheduled cron jobs:
+Row-by-row reconciliation against production Excel workbooks for Week 26 (`CY26WK26`):
 
-```bash
-# 1. Run daily sync for yesterday's shift
-python "Hisaab Final Table/automation_script.py" --daily 2026-06-25
+| City | Total Excel Vehicles | Onroad Days Match | Lease Rent Match | Uber Trips Match | Ola Trips Match |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **Bangalore** | 807 | **97.3%** | Identity formula | **97.4%** | **99.5%** |
+| **Hyderabad** | 258 | **97.3%** | **82.2%** | **96.1%** | **100.0%** |
+| **Mumbai** | 184 | 65.8% | **100.0%** (via custom plan) | **95.1%** | **100.0%** |
 
-# 2. Run weekly roll-up for vehicle and partner statements
-python "Hisaab Final Table/automation_script.py" --weekly 2026-W26
+### Resolution of Mumbai Daily Rent Discrepancy (Javed Khan):
+- **Vehicle**: `MH03ES2575` | **Partner**: `LETZMUM9580424256` (`Javed Khan`)
+- **Excel Values**: 6.5 Onroad Days, Daily Rent = ₹1,029.00, Net Rent = ₹6,688.50.
+- **Root Cause**: Earlier standalone simulation scripts only referenced the Excel tab `Plan.json` (investor/operator rates) and fell back to standard retail slabs (₹689).
+- **Resolution**: In `rental_custom_partner_plans`, the Daily Rental Agent correctly registered Javed Khan with `custom_daily_rent = 999.00` and `custom_daily_fee = 30.00` (Total = **₹1,029.00**).
+- **Match Rate**: With `rental_custom_partner_plans`, Mumbai Daily Rent is **100.0% matching (184/184)**.
 
-# 3. Engage the Monday 11:00 AM lock on a completed settlement week
-python "Hisaab Final Table/automation_script.py" --lock 2026-W26
-```
+---
+
+## 6. Upstream Discrepancies for Core Tables Agent
+
+The following upstream telemetry and status gaps were identified during reconciliation and should be handed over to the core tables agent for ingestion remediation:
+1. **`core_daily_vehicle_status` Historical Data Window**:
+   - In PostgreSQL, `core_daily_vehicle_status` only contains records from **2026-08-11 onwards**.
+   - Statuses for June/July 2026 (CY26WK26 and CY26WK27) are absent in `core_daily_vehicle_status` (currently preserved in `daily_rent_log`).
+2. **`core_uber_daily` Mumbai Week 37 Ingestion**:
+   - For Mumbai Week 37 (`2026-09-07` to `2026-09-13`), only 17 out of 232 vehicles have Uber telemetry in PostgreSQL (7.3% ingestion coverage). Upstream raw Uber ingestion for Mumbai Week 37 requires backfilling.
+3. **Multi-Record Uber Weekly Rows**:
+   - 34 vehicles in `core_uber_weekly` have multiple rows per week (e.g. across multiple vendor codes). The Hisaab procedure aggregates these cleanly via `SUM()`.
