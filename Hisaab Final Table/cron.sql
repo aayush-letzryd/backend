@@ -24,6 +24,17 @@ EXCEPTION WHEN OTHERS THEN
 END $$;
 
 -- ----------------------------------------------------------------------------
+-- Schedule: hisaab-rent-sync
+-- Runs every day at 02:30 AM UTC (08:00 AM IST).
+-- Synchronizes daily rent calculations into Hisaab daily ledger.
+-- ----------------------------------------------------------------------------
+SELECT cron.schedule(
+    'hisaab-rent-sync',
+    '30 2 * * *',
+    'CALL public.sp_sync_rent_to_hisaab(NULL);'
+);
+
+-- ----------------------------------------------------------------------------
 -- Schedule: hisaab-vehicle-weekly-sync
 -- Runs every day at 03:00 AM UTC (08:30 AM IST).
 -- This runs after rental-daily-calculation (02:00 AM UTC) and telemetry syncs.
@@ -35,7 +46,8 @@ SELECT cron.schedule(
     'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
 );
 
--- Verification query to inspect scheduled job
+-- Verification query to inspect scheduled jobs
 SELECT jobid, schedule, command, nodename, active, jobname 
 FROM cron.job 
-WHERE jobname = 'hisaab-vehicle-weekly-sync';
+WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync');
+
