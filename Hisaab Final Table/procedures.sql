@@ -138,6 +138,48 @@ BEGIN
               AND v_ola_count = 0
             GROUP BY UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
         ),
+        uber_daily_partner_agg AS (
+            SELECT 
+                d.vehicle_number,
+                d.partner_id,
+                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
+                COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
+                COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
+                COALESCE(SUM(ABS(u.tolls_refunded)), 0.00) AS uber_toll,
+                COALESCE(SUM(ABS(u.driver_subscription_charge)), 0.00) AS uber_driver_sub_charge,
+                COALESCE(SUM(
+                    ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
+                    - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
+                ), 0.00) AS uber_week_os
+            FROM public.daily_rent_log d
+            JOIN public.core_uber_daily u
+              ON u.operational_date = d.log_date
+             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.vehicle_number, d.partner_id
+        ),
+        ola_daily_partner_agg AS (
+            SELECT 
+                d.vehicle_number,
+                d.partner_id,
+                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
+                COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
+                COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.toll_and_parking)), 0.00) AS ola_toll,
+                0.00 AS ola_gst,
+                COALESCE(SUM(ABS(o.online_payouts)), 0.00) AS ola_online_payment,
+                COALESCE(SUM(ABS(o.portal_incentive)), 0.00) AS ola_incentive,
+                COALESCE(SUM(
+                    ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
+                    - ABS(o.cash_collected)
+                ), 0.00) AS ola_week_os
+            FROM public.daily_rent_log d
+            JOIN public.core_ola_daily o
+              ON o.service_date = d.log_date
+             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.vehicle_number, d.partner_id
+        ),
         partner_names AS (
             SELECT partner_id, driver_name FROM (
                 SELECT partner_id, driver_name, ROW_NUMBER() OVER(PARTITION BY partner_id ORDER BY created_at DESC NULLS LAST) rn
@@ -175,27 +217,29 @@ BEGIN
             r.weekly_lease_rental,
             r.weekly_indemnity_fees,
             r.net_weekly_lease_rental,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_trips, 0) ELSE 0 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_total_earnings, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_cash_collection, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_toll, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_driver_sub_charge, 0.00) ELSE 0.00 END,
+            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 THEN u.uber_trips ELSE 0 END, 0),
+            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
             CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_week_os, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_trips, 0) ELSE 0 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_net_revenue, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_cash_collection, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_toll, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_gst, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_online_payment, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_incentive, 0.00) ELSE 0.00 END,
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(o.ola_week_os, 0.00) ELSE 0.00 END,
+            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 THEN o.ola_trips ELSE 0 END, 0),
+            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00),
+            0.00,
+            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 THEN o.ola_online_payment ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
             'CALCULATED',
             CURRENT_TIMESTAMP,
             CURRENT_TIMESTAMP
         FROM rent_ranked r
         LEFT JOIN partner_names pn ON r.partner_id = pn.partner_id
         LEFT JOIN custom_names cn ON r.partner_id = cn.partner_id
+        LEFT JOIN uber_daily_partner_agg udpa ON r.vehicle_number = udpa.vehicle_number AND r.partner_id = udpa.partner_id
+        LEFT JOIN ola_daily_partner_agg odpa ON r.vehicle_number = odpa.vehicle_number AND r.partner_id = odpa.partner_id
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
         ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
