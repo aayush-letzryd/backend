@@ -2,7 +2,7 @@
 -- LetzRyd Uber Final Table Architecture: Production DDL
 -- Tables: public.core_uber_daily, public.core_uber_weekly
 -- Procedure: public.sp_sync_core_uber(p_start_date, p_end_date, p_lookback_days)
--- Automation Engine: Native PostgreSQL pg_cron (Every 30 Mins: */30 * * * *)
+-- Automation Engine: Native PostgreSQL pg_cron (Staggered: 5,35 * * * *)
 -- Architecture Standard: 100% Decoupled, Zero-Trigger Fault Isolation
 -- ============================================================================
 
@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS public.core_uber_daily (
     total_trip_distance_km      NUMERIC(10,2) DEFAULT 0.00,
     
     -- Daily Financials
-    net_fare_earnings           NUMERIC(12,2) DEFAULT 0.00,     -- Gross rider fare earnings
+    net_fare_earnings           NUMERIC(12,2) DEFAULT 0.00,     -- Gross rider fare earnings (excluding promotions & sub fees)
     cash_collected              NUMERIC(12,2) DEFAULT 0.00,     -- Rider cash collected by driver (positive display)
     tolls_refunded              NUMERIC(12,2) DEFAULT 0.00,     -- Toll reimbursements
     driver_subscription_charge  NUMERIC(12,2) DEFAULT 0.00,     -- Platform / subscription debits
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS public.core_uber_weekly (
     uber_cash_collection        NUMERIC(12,2) DEFAULT 0.00,     -- Total cash collected by driver -> Hisaab
     uber_toll                   NUMERIC(12,2) DEFAULT 0.00,     -- Toll reimbursement -> Hisaab
     uber_driver_sub_charge      NUMERIC(12,2) DEFAULT 0.00,     -- Driver subscription charge -> Hisaab
-    uber_vehicle_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Total incentive from uber_vehicle_incentives_raw
+    uber_vehicle_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Vehicle milestone incentive (deduplicated MAX payout)
     uber_pass_on_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Driver share based on target slab
     uber_letzryd_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Retained company incentive
     
@@ -80,8 +80,24 @@ CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_week_id ON public.core_uber_week
 CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_veh ON public.core_uber_weekly (vehicle_number);
 CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_vendor ON public.core_uber_weekly (vendor_code);
 
+-- 3. Required Performance Indexes on Raw Pipeline Tables (Created CONCURRENTLY)
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uber_trips_req_time 
+    ON public.uber_pipeline_trips (trip_request_time);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uber_trips_op_date 
+    ON public.uber_pipeline_trips (((trip_request_time - INTERVAL '4 hours')::date), driver_uuid, car_no);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uber_txns_rep_time 
+    ON public.uber_pipeline_order_transactions (reporting_time);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uber_txns_op_date 
+    ON public.uber_pipeline_order_transactions (((reporting_time + INTERVAL '1 hour 30 minutes')::date), driver_uuid);
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_uber_txns_coalesce_op_date 
+    ON public.uber_pipeline_order_transactions (COALESCE(((reporting_time + INTERVAL '1 hour 30 minutes')::date), trx_date), driver_uuid);
+
 -- ============================================================================
--- 3. Asynchronous Stored Procedure (Scheduled via pg_cron, Zero Triggers on Raw)
+-- 4. Asynchronous Stored Procedure (Scheduled via pg_cron, Zero Triggers on Raw)
 -- ============================================================================
 
 CREATE OR REPLACE PROCEDURE public.sp_sync_core_uber(
@@ -144,30 +160,66 @@ BEGIN
           AND t.car_no IS NOT NULL AND TRIM(t.car_no) <> ''
         GROUP BY 1, 2, 3
     ),
-    txns_agg AS (
+    txns_raw AS (
         SELECT 
-            COALESCE(((ot.reporting_time - INTERVAL '4 hours')::date), ot.trx_date) AS op_date,
+            ot.id,
+            -- Fixed operational date: trip operational date for trip-linked transactions;
+            -- UTC reporting_time converted to IST (+5h30m - 4h = +1h30m) for non-trip transactions.
+            COALESCE(
+                ((t.trip_request_time - INTERVAL '4 hours')::date),
+                ((ot.reporting_time + INTERVAL '1 hour 30 minutes')::date),
+                ot.trx_date
+            ) AS op_date,
             COALESCE(
                 NULLIF(UPPER(REPLACE(ot.vehicle_number, ' ', '')), ''),
                 NULLIF(UPPER(REPLACE(t.car_no, ' ', '')), ''),
-                (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1],
+                (regexp_match(ot.description, '([A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4})'))[1]
+            ) AS raw_veh_no,
+            COALESCE(ot.driver_uuid, t.driver_uuid) AS driver_uuid,
+            ot.description,
+            COALESCE(ot.actual_earnings, 0.0) AS actual_earnings,
+            COALESCE(ot.paid_to_you, 0.0) AS paid_to_you,
+            COALESCE(ot.cash_collected, 0.0) AS cash_collected,
+            COALESCE(ot.refunds_toll, 0.0) AS refunds_toll
+        FROM public.uber_pipeline_order_transactions ot
+        LEFT JOIN public.uber_pipeline_trips t ON ot.trip_uuid = t.trip_uuid
+        WHERE COALESCE(
+            ((t.trip_request_time - INTERVAL '4 hours')::date),
+            ((ot.reporting_time + INTERVAL '1 hour 30 minutes')::date),
+            ot.trx_date
+        ) BETWEEN v_start_date AND v_end_date
+    ),
+    txns_agg AS (
+        SELECT 
+            r.op_date,
+            COALESCE(
+                r.raw_veh_no,
                 ddv.veh_no,
                 dwv.veh_no
             ) AS veh_no,
-            COALESCE(ot.driver_uuid, t.driver_uuid) AS driver_uuid,
-            SUM(CASE WHEN ot.description NOT ILIKE '%promotion%' AND ot.description NOT ILIKE '%incentive%' THEN COALESCE(ot.actual_earnings, 0.0) ELSE 0.0 END) AS earnings,
-            SUM(ABS(COALESCE(ot.cash_collected, 0.0))) AS cash,
-            SUM(COALESCE(ot.refunds_toll, 0.0)) AS toll,
-            SUM(CASE WHEN ot.paid_to_you < 0 AND (ot.description ILIKE '%subscription%' OR ot.description ILIKE '%platform fee%' OR ot.description ILIKE '%Drive Pass%' OR ot.description ILIKE '%ड्राइव%') THEN ABS(ot.paid_to_you) ELSE 0.0 END) AS sub_fee
-        FROM public.uber_pipeline_order_transactions ot
-        LEFT JOIN public.uber_pipeline_trips t ON ot.trip_uuid = t.trip_uuid
+            r.driver_uuid,
+            -- Net Fare Earnings: exclude promotions, milestone incentives, and platform fees (which are accounted in sub_fee)
+            SUM(CASE 
+                WHEN r.description NOT ILIKE '%promotion%' 
+                 AND r.description NOT ILIKE '%incentive%'
+                 AND NOT (r.paid_to_you < 0 AND (r.description ILIKE '%subscription%' OR r.description ILIKE '%platform fee%' OR r.description ILIKE '%Drive Pass%' OR r.description ILIKE '%ड्राइव%'))
+                THEN r.actual_earnings 
+                ELSE 0.0 
+            END) AS earnings,
+            SUM(ABS(r.cash_collected)) AS cash,
+            SUM(r.refunds_toll) AS toll,
+            SUM(CASE 
+                WHEN r.paid_to_you < 0 AND (r.description ILIKE '%subscription%' OR r.description ILIKE '%platform fee%' OR r.description ILIKE '%Drive Pass%' OR r.description ILIKE '%ड्राइव%') 
+                THEN ABS(r.paid_to_you) 
+                ELSE 0.0 
+            END) AS sub_fee
+        FROM txns_raw r
         LEFT JOIN driver_daily_veh ddv 
-          ON ot.driver_uuid = ddv.driver_uuid 
-         AND COALESCE(((ot.reporting_time - INTERVAL '4 hours')::date), ot.trx_date) = ddv.op_date
+          ON r.driver_uuid = ddv.driver_uuid 
+         AND r.op_date = ddv.op_date
         LEFT JOIN driver_week_veh dwv 
-          ON ot.driver_uuid = dwv.driver_uuid 
-         AND DATE_TRUNC('week', COALESCE(((ot.reporting_time - INTERVAL '4 hours')::date), ot.trx_date))::date = dwv.week_start
-        WHERE COALESCE(((ot.reporting_time - INTERVAL '4 hours')::date), ot.trx_date) BETWEEN v_start_date AND v_end_date
+          ON r.driver_uuid = dwv.driver_uuid 
+         AND DATE_TRUNC('week', r.op_date)::date = dwv.week_start
         GROUP BY 1, 2, 3
     ),
     combined AS (
@@ -228,6 +280,7 @@ BEGIN
 
     -- ========================================================================
     -- 2. SYNC CORE_UBER_WEEKLY
+    -- Always processes FULL ISO weeks touched by [v_start_date, v_end_date]
     -- ========================================================================
     WITH weekly_cal AS (
         SELECT 
@@ -240,7 +293,8 @@ BEGIN
             EXTRACT(WEEK FROM d.operational_date)::int AS settlement_week,
             'CY' || SUBSTRING(EXTRACT(ISOYEAR FROM d.operational_date)::text FROM 3 FOR 2) || 'WK' || LPAD(EXTRACT(WEEK FROM d.operational_date)::text, 2, '0') AS week_id
         FROM public.core_uber_daily d
-        WHERE d.operational_date BETWEEN (v_start_date - INTERVAL '6 days') AND v_end_date
+        WHERE d.operational_date >= DATE_TRUNC('week', v_start_date)::date
+          AND d.operational_date <= (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date
     ),
     weekly_agg AS (
         SELECT 
@@ -264,10 +318,11 @@ BEGIN
         SELECT 
             UPPER(REPLACE(number_plate, ' ', '')) AS veh_no,
             start_date::date AS week_start,
-            SUM(total_payout) AS total_payout
+            MAX(total_payout) AS total_payout
         FROM public.uber_vehicle_incentives_raw
         WHERE number_plate IS NOT NULL AND TRIM(number_plate) <> '' AND number_plate <> 'nan'
-          AND start_date::date BETWEEN (v_start_date - INTERVAL '7 days') AND (v_end_date + INTERVAL '7 days')
+          AND start_date::date >= DATE_TRUNC('week', v_start_date)::date
+          AND start_date::date <= (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date
         GROUP BY 1, 2
     )
     INSERT INTO public.core_uber_weekly (
@@ -308,11 +363,11 @@ END;
 $$;
 
 -- ============================================================================
--- 4. Native pg_cron Job Registration
+-- 5. Native pg_cron Job Registration
 -- ============================================================================
--- Scheduled to run every 30 minutes in the background:
+-- Staggered at minute 5 and 35 to prevent lock and pool contention:
 -- SELECT cron.schedule(
 --     'sync-core-uber',
---     '*/30 * * * *',
+--     '5,35 * * * *',
 --     'CALL public.sp_sync_core_uber(NULL, NULL, 7);'
 -- );
