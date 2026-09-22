@@ -22,10 +22,10 @@ CREATE TABLE IF NOT EXISTS public.core_uber_daily (
     
     -- Daily Financials
     net_fare_earnings           NUMERIC(12,2) DEFAULT 0.00,     -- Gross rider fare earnings (excluding promotions & sub fees)
-    cash_collected              NUMERIC(12,2) DEFAULT 0.00,     -- Rider cash collected by driver (positive display)
+    cash_collected              NUMERIC(12,2) DEFAULT 0.00,     -- Rider cash collected by driver (strictly positive ABS magnitude)
     tolls_refunded              NUMERIC(12,2) DEFAULT 0.00,     -- Toll reimbursements
     driver_subscription_charge  NUMERIC(12,2) DEFAULT 0.00,     -- Platform / subscription debits
-    net_driver_day_balance      NUMERIC(12,2) DEFAULT 0.00,     -- Daily net (earnings - cash + toll - sub_charge)
+    net_driver_day_balance      NUMERIC(12,2) DEFAULT 0.00,     -- Daily net (earnings - cash_collected + toll - sub_charge)
     
     -- Metadata
     source_origin               VARCHAR(64) DEFAULT 'uber_pipeline',
@@ -35,12 +35,15 @@ CREATE TABLE IF NOT EXISTS public.core_uber_daily (
     CONSTRAINT uq_core_uber_daily UNIQUE (operational_date, vehicle_number, driver_uuid)
 );
 
+COMMENT ON COLUMN public.core_uber_daily.cash_collected IS 'Rider cash collected by driver (strictly stored as positive magnitude ABS).';
+COMMENT ON COLUMN public.core_uber_daily.net_driver_day_balance IS 'Daily net balance: (net_fare_earnings - cash_collected + tolls_refunded - driver_subscription_charge).';
+
 CREATE INDEX IF NOT EXISTS idx_core_uber_daily_date ON public.core_uber_daily (operational_date);
 CREATE INDEX IF NOT EXISTS idx_core_uber_daily_veh ON public.core_uber_daily (vehicle_number);
 CREATE INDEX IF NOT EXISTS idx_core_uber_daily_vendor ON public.core_uber_daily (vendor_code);
 CREATE INDEX IF NOT EXISTS idx_core_uber_daily_date_veh ON public.core_uber_daily (operational_date, vehicle_number);
 
--- 2. core_uber_weekly (Grain: settlement_year + settlement_week + vehicle_number + vendor_code)
+-- 2. core_uber_weekly (Grain: settlement_year + settlement_week + vehicle_number)
 CREATE TABLE IF NOT EXISTS public.core_uber_weekly (
     id                          BIGSERIAL PRIMARY KEY,
     settlement_year             INT NOT NULL,                   -- ISO Year (e.g. 2026)
@@ -49,7 +52,7 @@ CREATE TABLE IF NOT EXISTS public.core_uber_weekly (
     week_start                  DATE NOT NULL,                  -- Monday of settlement week
     week_end                    DATE NOT NULL,                  -- Sunday of settlement week
     vehicle_number              VARCHAR(32) NOT NULL,
-    vendor_code                 VARCHAR(64),                    -- Assigned partner ID
+    vendor_code                 VARCHAR(64),                    -- Primary assigned partner ID (dominant in week)
     city                        VARCHAR(32) DEFAULT 'Hyderabad',
     
     -- Aggregated Weekly Trip Metrics
@@ -59,21 +62,24 @@ CREATE TABLE IF NOT EXISTS public.core_uber_weekly (
     
     -- Weekly Financials for Hisaab Settlement
     uber_total_earnings         NUMERIC(12,2) DEFAULT 0.00,     -- Net Fare + Promotions -> Hisaab
-    uber_cash_collection        NUMERIC(12,2) DEFAULT 0.00,     -- Total cash collected by driver -> Hisaab
+    uber_cash_collection        NUMERIC(12,2) DEFAULT 0.00,     -- Total cash collected by driver (strictly positive ABS magnitude)
     uber_toll                   NUMERIC(12,2) DEFAULT 0.00,     -- Toll reimbursement -> Hisaab
     uber_driver_sub_charge      NUMERIC(12,2) DEFAULT 0.00,     -- Driver subscription charge -> Hisaab
-    uber_vehicle_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Vehicle milestone incentive (deduplicated MAX payout)
+    uber_vehicle_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Vehicle milestone incentive
     uber_pass_on_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Driver share based on target slab
     uber_letzryd_incentive      NUMERIC(12,2) DEFAULT 0.00,     -- Retained company incentive
     
     -- Net Weekly Balance
-    uber_week_balance           NUMERIC(12,2) DEFAULT 0.00,     -- (earnings - cash + toll - sub_charge + incentive)
+    uber_week_balance           NUMERIC(12,2) DEFAULT 0.00,     -- (earnings - cash_collected + toll - sub_charge + incentive)
     
     created_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at                  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     
-    CONSTRAINT uq_core_uber_weekly UNIQUE (settlement_year, settlement_week, vehicle_number, vendor_code)
+    CONSTRAINT uq_core_uber_weekly UNIQUE (settlement_year, settlement_week, vehicle_number)
 );
+
+COMMENT ON COLUMN public.core_uber_weekly.uber_cash_collection IS 'Total rider cash collected by driver (strictly stored as positive magnitude ABS).';
+COMMENT ON COLUMN public.core_uber_weekly.uber_week_balance IS 'Weekly net balance: (uber_total_earnings - uber_cash_collection + uber_toll - uber_driver_sub_charge + uber_vehicle_incentive).';
 
 CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_week ON public.core_uber_weekly (settlement_year, settlement_week);
 CREATE INDEX IF NOT EXISTS idx_core_uber_weekly_week_id ON public.core_uber_weekly (week_id);
@@ -110,20 +116,36 @@ AS $$
 DECLARE
     v_start_date DATE;
     v_end_date DATE;
+    v_weekly_start DATE;
+    v_weekly_end DATE;
     v_daily_count INT := 0;
     v_weekly_count INT := 0;
 BEGIN
-    -- Determine target processing date range
+    -- Determine target processing date range for core_uber_daily and core_uber_weekly
     IF p_start_date IS NOT NULL AND p_end_date IS NOT NULL THEN
         v_start_date := p_start_date;
         v_end_date := p_end_date;
+        -- Explicit date range: weekly window aggregates full ISO weeks covering the entire range
+        v_weekly_start := DATE_TRUNC('week', v_start_date)::date;
+        v_weekly_end := (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date;
     ELSIF p_lookback_days IS NOT NULL THEN
         v_start_date := CURRENT_DATE - (p_lookback_days || ' days')::INTERVAL;
         v_end_date := CURRENT_DATE;
+        -- Lookback window: weekly aggregates full ISO weeks covering at least current week and previous 2 complete ISO weeks
+        v_weekly_start := LEAST(
+            DATE_TRUNC('week', v_start_date)::date,
+            (DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '14 days')::date
+        );
+        v_weekly_end := (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date;
     ELSE
         v_start_date := CURRENT_DATE - INTERVAL '7 days';
         v_end_date := CURRENT_DATE;
+        v_weekly_start := (DATE_TRUNC('week', CURRENT_DATE) - INTERVAL '14 days')::date;
+        v_weekly_end := (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date;
     END IF;
+
+    RAISE NOTICE '[sp_sync_core_uber] Daily window: [% to %], Weekly ISO window: [% to %]',
+        v_start_date, v_end_date, v_weekly_start, v_weekly_end;
 
     -- ========================================================================
     -- 1. SYNC CORE_UBER_DAILY
@@ -230,10 +252,10 @@ BEGIN
             COALESCE(t.trips, 0) AS completed_trips,
             COALESCE(t.dist_km, 0.0) AS total_trip_distance_km,
             COALESCE(x.earnings, 0.0) AS net_fare_earnings,
-            COALESCE(x.cash, 0.0) AS cash_collected,
+            ABS(COALESCE(x.cash, 0.0)) AS cash_collected,
             COALESCE(x.toll, 0.0) AS tolls_refunded,
             COALESCE(x.sub_fee, 0.0) AS driver_subscription_charge,
-            (COALESCE(x.earnings, 0.0) - COALESCE(x.cash, 0.0) + COALESCE(x.toll, 0.0) - COALESCE(x.sub_fee, 0.0)) AS net_driver_day_balance
+            (COALESCE(x.earnings, 0.0) - ABS(COALESCE(x.cash, 0.0)) + COALESCE(x.toll, 0.0) - COALESCE(x.sub_fee, 0.0)) AS net_driver_day_balance
         FROM trips_agg t
         FULL OUTER JOIN txns_agg x 
           ON t.op_date = x.op_date 
@@ -280,49 +302,92 @@ BEGIN
 
     -- ========================================================================
     -- 2. SYNC CORE_UBER_WEEKLY
-    -- Always processes FULL ISO weeks touched by [v_start_date, v_end_date]
+    -- Aggregates full ISO weeks by vehicle to represent full activity,
+    -- then resolves primary vendor without discarding any vehicle telemetry.
     -- ========================================================================
     WITH weekly_cal AS (
         SELECT 
-            d.operational_date, d.vehicle_number, d.vendor_code, d.city,
-            d.completed_trips, d.total_trip_distance_km, d.net_fare_earnings,
-            d.cash_collected, d.tolls_refunded, d.driver_subscription_charge,
+            d.operational_date,
+            d.vehicle_number,
+            d.vendor_code,
+            d.city,
+            d.completed_trips,
+            d.total_trip_distance_km,
+            d.net_fare_earnings,
+            ABS(d.cash_collected) AS cash_collected,
+            d.tolls_refunded,
+            d.driver_subscription_charge,
             DATE_TRUNC('week', d.operational_date)::date AS week_start,
             (DATE_TRUNC('week', d.operational_date) + INTERVAL '6 days')::date AS week_end,
             EXTRACT(ISOYEAR FROM d.operational_date)::int AS settlement_year,
             EXTRACT(WEEK FROM d.operational_date)::int AS settlement_week,
             'CY' || SUBSTRING(EXTRACT(ISOYEAR FROM d.operational_date)::text FROM 3 FOR 2) || 'WK' || LPAD(EXTRACT(WEEK FROM d.operational_date)::text, 2, '0') AS week_id
         FROM public.core_uber_daily d
-        WHERE d.operational_date >= DATE_TRUNC('week', v_start_date)::date
-          AND d.operational_date <= (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date
+        WHERE d.operational_date BETWEEN v_weekly_start AND v_weekly_end
     ),
-    weekly_agg AS (
+    veh_weekly_agg AS (
         SELECT 
-            settlement_year, settlement_week, week_id, week_start, week_end, vehicle_number,
-            COALESCE(vendor_code, 'UNASSIGNED') AS vendor_code, MAX(city) AS city,
+            settlement_year,
+            settlement_week,
+            week_id,
+            week_start,
+            week_end,
+            vehicle_number,
             COUNT(DISTINCT operational_date) FILTER (WHERE completed_trips > 0) AS active_days,
             SUM(completed_trips) AS completed_trips,
             SUM(total_trip_distance_km) AS total_trip_km,
             SUM(net_fare_earnings) AS uber_total_earnings,
             SUM(cash_collected) AS uber_cash_collection,
             SUM(tolls_refunded) AS uber_toll,
-            SUM(driver_subscription_charge) AS uber_driver_sub_charge,
-            ROW_NUMBER() OVER (
-                PARTITION BY settlement_year, settlement_week, vehicle_number 
-                ORDER BY SUM(completed_trips) DESC, COUNT(DISTINCT operational_date) DESC, COALESCE(vendor_code, 'UNASSIGNED') DESC
-            ) AS vendor_rank
+            SUM(driver_subscription_charge) AS uber_driver_sub_charge
         FROM weekly_cal
-        GROUP BY settlement_year, settlement_week, week_id, week_start, week_end, vehicle_number, COALESCE(vendor_code, 'UNASSIGNED')
+        GROUP BY settlement_year, settlement_week, week_id, week_start, week_end, vehicle_number
+    ),
+    primary_vendor AS (
+        SELECT DISTINCT ON (settlement_year, settlement_week, vehicle_number)
+            settlement_year,
+            settlement_week,
+            vehicle_number,
+            vendor_code,
+            city
+        FROM (
+            SELECT 
+                settlement_year,
+                settlement_week,
+                vehicle_number,
+                vendor_code,
+                city,
+                SUM(completed_trips) AS vendor_trips,
+                COUNT(DISTINCT operational_date) AS vendor_days,
+                MAX(operational_date) AS max_op_date
+            FROM weekly_cal
+            WHERE vendor_code IS NOT NULL AND TRIM(vendor_code) <> '' AND vendor_code <> 'UNASSIGNED'
+            GROUP BY settlement_year, settlement_week, vehicle_number, vendor_code, city
+            
+            UNION ALL
+            
+            SELECT 
+                settlement_year,
+                settlement_week,
+                vehicle_number,
+                'UNASSIGNED' AS vendor_code,
+                MAX(city) AS city,
+                -1 AS vendor_trips,
+                -1 AS vendor_days,
+                '1970-01-01'::date AS max_op_date
+            FROM weekly_cal
+            GROUP BY settlement_year, settlement_week, vehicle_number
+        ) sub
+        ORDER BY settlement_year, settlement_week, vehicle_number, vendor_trips DESC, vendor_days DESC, max_op_date DESC
     ),
     raw_inc_agg AS (
         SELECT 
             UPPER(REPLACE(number_plate, ' ', '')) AS veh_no,
             start_date::date AS week_start,
-            MAX(total_payout) AS total_payout
+            SUM(total_payout) AS total_payout
         FROM public.uber_vehicle_incentives_raw
         WHERE number_plate IS NOT NULL AND TRIM(number_plate) <> '' AND number_plate <> 'nan'
-          AND start_date::date >= DATE_TRUNC('week', v_start_date)::date
-          AND start_date::date <= (DATE_TRUNC('week', v_end_date) + INTERVAL '6 days')::date
+          AND start_date::date BETWEEN v_weekly_start AND v_weekly_end
         GROUP BY 1, 2
     )
     INSERT INTO public.core_uber_weekly (
@@ -332,19 +397,56 @@ BEGIN
         uber_pass_on_incentive, uber_letzryd_incentive, uber_week_balance, updated_at
     )
     SELECT 
-        w.settlement_year, w.settlement_week, w.week_id, w.week_start, w.week_end, w.vehicle_number,
-        w.vendor_code, w.city, w.active_days, w.completed_trips, w.total_trip_km,
-        w.uber_total_earnings, w.uber_cash_collection, w.uber_toll, w.uber_driver_sub_charge,
-        -- Attribute vehicle incentive ONLY to the primary vendor row to avoid duplication
-        CASE WHEN w.vendor_rank = 1 THEN COALESCE(inc.total_payout, 0.00) ELSE 0.00 END AS uber_vehicle_incentive,
+        v.settlement_year,
+        v.settlement_week,
+        v.week_id,
+        v.week_start,
+        v.week_end,
+        v.vehicle_number,
+        COALESCE(
+            NULLIF(pv.vendor_code, 'UNASSIGNED'),
+            (SELECT partner_id 
+             FROM public.core_daily_vehicle_status dvs 
+             WHERE dvs.vehicle_number = v.vehicle_number 
+               AND dvs.status_date BETWEEN v.week_start AND v.week_end
+               AND dvs.partner_id IS NOT NULL AND TRIM(dvs.partner_id) <> ''
+             GROUP BY partner_id 
+             ORDER BY COUNT(*) DESC, MAX(status_date) DESC LIMIT 1),
+            (SELECT partner_id
+             FROM public.daily_rent_log drl
+             WHERE drl.vehicle_number = v.vehicle_number
+               AND drl.log_date BETWEEN v.week_start AND v.week_end
+               AND drl.partner_id IS NOT NULL AND TRIM(drl.partner_id) <> ''
+             GROUP BY partner_id
+             ORDER BY COUNT(*) DESC, MAX(log_date) DESC LIMIT 1),
+            'UNASSIGNED'
+        ) AS vendor_code,
+        COALESCE(pv.city, 'Hyderabad') AS city,
+        v.active_days,
+        v.completed_trips,
+        v.total_trip_km,
+        v.uber_total_earnings,
+        v.uber_cash_collection,
+        v.uber_toll,
+        v.uber_driver_sub_charge,
+        COALESCE(inc.total_payout, 0.00) AS uber_vehicle_incentive,
         0.00 AS uber_pass_on_incentive,
-        CASE WHEN w.vendor_rank = 1 THEN COALESCE(inc.total_payout, 0.00) ELSE 0.00 END AS uber_letzryd_incentive,
-        (w.uber_total_earnings - w.uber_cash_collection + w.uber_toll - w.uber_driver_sub_charge + (CASE WHEN w.vendor_rank = 1 THEN COALESCE(inc.total_payout, 0.00) ELSE 0.00 END)) AS uber_week_balance,
+        COALESCE(inc.total_payout, 0.00) AS uber_letzryd_incentive,
+        (v.uber_total_earnings - v.uber_cash_collection + v.uber_toll - v.uber_driver_sub_charge + COALESCE(inc.total_payout, 0.00)) AS uber_week_balance,
         NOW()
-    FROM weekly_agg w
+    FROM veh_weekly_agg v
+    LEFT JOIN primary_vendor pv 
+      ON v.settlement_year = pv.settlement_year 
+     AND v.settlement_week = pv.settlement_week 
+     AND v.vehicle_number = pv.vehicle_number
     LEFT JOIN raw_inc_agg inc 
-      ON w.vehicle_number = inc.veh_no AND inc.week_start = w.week_start
-    ON CONFLICT (settlement_year, settlement_week, vehicle_number, vendor_code) DO UPDATE SET
+      ON v.vehicle_number = inc.veh_no AND inc.week_start = v.week_start
+    ON CONFLICT (settlement_year, settlement_week, vehicle_number) DO UPDATE SET
+        week_id = EXCLUDED.week_id,
+        week_start = EXCLUDED.week_start,
+        week_end = EXCLUDED.week_end,
+        vendor_code = EXCLUDED.vendor_code,
+        city = EXCLUDED.city,
         active_days = EXCLUDED.active_days,
         completed_trips = EXCLUDED.completed_trips,
         total_trip_km = EXCLUDED.total_trip_km,
@@ -359,6 +461,7 @@ BEGIN
         updated_at = NOW();
 
     GET DIAGNOSTICS v_weekly_count = ROW_COUNT;
+    RAISE NOTICE '[sp_sync_core_uber] Completed: % daily rows, % weekly rows synced.', v_daily_count, v_weekly_count;
 END;
 $$;
 
