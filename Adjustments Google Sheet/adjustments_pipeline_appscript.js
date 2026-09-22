@@ -3,19 +3,18 @@
  * LETZRYD - ADJUSTMENT FORM LIVE PIPELINE (sheet_adjustments)
  * ==============================================================================
  * 
- * Source Sheet : 'Adjustment-Form' (Raw Form Responses)
- * Target Sheet : 'sheet_adjustments' (Standardized Tab in Spreadsheet)
- * Target Table : public.sheet_adjustments & public.core_adjustments
+ * Source Sheet : 'Adjustment-Form' (Raw Form Responses in Source Spreadsheet)
+ * Target Table : public.sheet_adjustments & public.core_adjustments (Direct DB Ingestion)
+ * Architecture : Direct Source linkage -> In-Memory Transform -> PostgreSQL Database.
+ *                No middleman sheet tab. High-speed, 100% database-focused pipeline.
  * 
  * Key Features & Audit Fixes:
- *  - Fix 1: Parameterized JDBC PreparedStatement CTE Upsert (Zero Sequence Burning)
- *  - Fix 2: Elimination of SQL Injection & raw string concatenation
- *  - Fix 3: Concurrency script locking with 3-attempt exponential backoff
- *  - Fix 4: Strict IST timezone date/timestamp extraction (+05:30) preventing 1-day backward shift
- *  - Fix 5: Empty-row validator in transformAdjustmentRow preventing ghost records
- *  - Fix 6: API optimization avoiding openByUrl cross-service RPC overhead
- *  - Fix 7: PropertiesService credential management with automated self-healing
- *  - Fix 8: Comprehensive testDbConnection and custom spreadsheet UI menu
+ *  - Fix 1: Direct High-Speed PostgreSQL CTE Upsert (Zero Sheet Write-Back Overhead)
+ *  - Fix 2: Dynamic Header Mapping (Header-based column resolution)
+ *  - Fix 3: Expanded Catch-Up Window (WINDOW_SIZE = 1000, 1-min interval)
+ *  - Fix 4: Concurrency script locking with 3-attempt exponential backoff
+ *  - Fix 5: Strict IST timezone date/timestamp extraction (+05:30)
+ *  - Fix 6: Empty-row validator preventing ghost records
  * ==============================================================================
  */
 
@@ -26,18 +25,18 @@ function getDbConfig() {
     props = PropertiesService.getScriptProperties();
   } catch(e){}
   
-  var host = (props && props.getProperty("DB_HOST")) || "YOUR_DB_HOST";
+  var host = (props && props.getProperty("DB_HOST")) || "35.200.196.113";
   var port = (props && props.getProperty("DB_PORT")) || "5432";
   var database = (props && props.getProperty("DB_NAME")) || "postgres";
   var user = (props && props.getProperty("DB_USER")) || "postgres";
-  var password = (props && props.getProperty("DB_PASSWORD")) || "YOUR_DB_PASSWORD";
+  var password = (props && props.getProperty("DB_PASSWORD")) || "8S5]U3@L^Xz)\\FH}";
 
-  // Self-heal corrupted or unescaped password in Script Properties
-  if (!password || password.indexOf("YOUR_") !== -1 || password === "8S5]U3@L^Xz)FH}") {
-    password = "YOUR_DB_PASSWORD";
-  }
+  // Self-heal placeholders or corrupted password in Script Properties
   if (!host || host.indexOf("YOUR_") !== -1) {
-    host = "YOUR_DB_HOST";
+    host = "35.200.196.113";
+  }
+  if (!password || password.indexOf("YOUR_") !== -1 || password.indexOf("8S5]U3@L") === -1) {
+    password = "8S5]U3@L^Xz)\\FH}";
   }
 
   return {
@@ -48,6 +47,7 @@ function getDbConfig() {
     password: password,
     sourceSpreadsheetUrl: (props && props.getProperty("SOURCE_SPREADSHEET_URL")) || "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
     sourceSheetName: (props && props.getProperty("SOURCE_SHEET_NAME")) || "Adjustment-Form",
+    sourceSheetGid: (props && props.getProperty("SOURCE_SHEET_GID")) || "1975174993",
     targetSheetName: (props && props.getProperty("TARGET_SHEET_NAME")) || "sheet_adjustments"
   };
 }
@@ -58,13 +58,14 @@ function getDbConfig() {
 function setupScriptProperties() {
   var props = PropertiesService.getScriptProperties();
   props.setProperties({
-    "DB_HOST": "YOUR_DB_HOST",
+    "DB_HOST": "35.200.196.113",
     "DB_PORT": "5432",
     "DB_NAME": "postgres",
     "DB_USER": "postgres",
-    "DB_PASSWORD": "YOUR_DB_PASSWORD",
+    "DB_PASSWORD": "8S5]U3@L^Xz)\\FH}",
     "SOURCE_SPREADSHEET_URL": "https://docs.google.com/spreadsheets/d/1Lww1a0MaYtjhn1qG5w7luzrqOidDzdTyPDK7bGk4ULM/edit",
     "SOURCE_SHEET_NAME": "Adjustment-Form",
+    "SOURCE_SHEET_GID": "1975174993",
     "TARGET_SHEET_NAME": "sheet_adjustments"
   });
   Logger.log("Script properties configured successfully.");
@@ -171,54 +172,29 @@ function getSourceSheet() {
   var ss = getSourceSpreadsheet();
   if (!ss) throw new Error("Could not access spreadsheet.");
 
-  var sheet = ss.getSheetByName(cfg.sourceSheetName);
-  if (sheet) return sheet;
-
+  // Primary Resolution: Permanent GID lookup (immune to tab renaming)
+  var targetGid = Number(cfg.sourceSheetGid || "1975174993");
   var sheets = ss.getSheets();
-  var targetKey = cfg.sourceSheetName.trim().toLowerCase();
   for (var i = 0; i < sheets.length; i++) {
-    var sName = sheets[i].getName().trim().toLowerCase();
-    if (sName === targetKey || sName.indexOf("adjustment") !== -1) {
+    if (sheets[i].getSheetId() === targetGid) {
       return sheets[i];
     }
   }
 
-  var activeSS = null;
-  try { activeSS = SpreadsheetApp.getActiveSpreadsheet(); } catch(e){}
-  if (activeSS && ss && activeSS.getId() !== ss.getId()) {
-    var aSheets = activeSS.getSheets();
-    for (var j = 0; j < aSheets.length; j++) {
-      var aName = aSheets[j].getName().trim().toLowerCase();
-      if (aName === targetKey || aName.indexOf("adjustment") !== -1) {
-        return aSheets[j];
-      }
+  // Fallback 1: Exact Name lookup
+  var sheet = ss.getSheetByName(cfg.sourceSheetName);
+  if (sheet) return sheet;
+
+  // Fallback 2: Case-insensitive / substring lookup
+  var targetKey = cfg.sourceSheetName.trim().toLowerCase();
+  for (var j = 0; j < sheets.length; j++) {
+    var sName = sheets[j].getName().trim().toLowerCase();
+    if (sName === targetKey || sName.indexOf("adjustment") !== -1) {
+      return sheets[j];
     }
   }
 
-  throw new Error("Source tab '" + cfg.sourceSheetName + "' not found in spreadsheet.");
-}
-
-function getTargetSheet() {
-  var cfg = getDbConfig();
-  var ss = SpreadsheetApp.getActiveSpreadsheet() || getSourceSpreadsheet();
-  var targetSheet = ss.getSheetByName(cfg.targetSheetName);
-  
-  if (!targetSheet) {
-    Logger.log("Creating target sheet tab '" + cfg.targetSheetName + "'...");
-    targetSheet = ss.insertSheet(cfg.targetSheetName);
-    var headers = [
-      "Submission Timestamp", "Submitter Email", "City Name", "Partner Type", "Adjustment Type",
-      "Partner Name", "Partner Phone", "Partner Code", "Vehicle Number", "Remittance Towards",
-      "Rent Deduction", "Adjustment Date", "Amount", "Photo URL", "Remarks", "Adjustment Related To",
-      "GPS Data", "First Level Approver", "First Level Status", "First Level Timestamp",
-      "Finance Team Status", "Finance Team Remarks", "Final Level Approver", "Final Status",
-      "Final Timestamp", "Hisaab Week Str", "Hisaab Week Number", "Source Row", "Last Synced At"
-    ];
-    targetSheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    targetSheet.getRange(1, 1, 1, headers.length).setFontWeight("bold").setBackground("#1F4E78").setFontColor("#FFFFFF");
-    targetSheet.setFrozenRows(1);
-  }
-  return targetSheet;
+  throw new Error("Source tab with GID " + targetGid + " or Name '" + cfg.sourceSheetName + "' not found.");
 }
 
 // =============================================================================
@@ -362,42 +338,49 @@ function parseHisaabWeek(weekStr, weekNumVal) {
   return null;
 }
 
-function transformAdjustmentRow(row, rowIndex) {
+function transformAdjustmentRow(row, rowIndex, headerMap) {
   if (!row || row.length === 0) return null;
   
   // Empty-row guard to prevent phantom ghost records
   var hasContent = row.some(function(cell) { return cell !== "" && cell !== null && cell !== undefined; });
   if (!hasContent) return null;
 
-  var rawPhone = row[6];
-  var rawVeh = row[8];
-  var rawPName = row[5];
-  var rawAmt = row[12];
+  function getVal(colIdx, headerKey) {
+    if (headerMap && headerKey && headerMap[headerKey] !== undefined) {
+      return row[headerMap[headerKey]];
+    }
+    return (colIdx < row.length) ? row[colIdx] : null;
+  }
+
+  var rawPhone = getVal(6, "partner number");
+  var rawVeh = getVal(8, "vehicle number");
+  var rawPName = getVal(5, "partner name");
+  var rawAmt = getVal(12, "enter amount");
   if (!rawPhone && !rawVeh && !rawPName && !rawAmt) return null;
 
-  var rawTimestamp = row[0];  // Col A: Timestamp
-  var submitterEmail = row[1];// Col B: Email address
-  var rawCity = row[2];       // Col C: City Name
-  var rawPType = row[3];      // Col D: Partner Type
-  var rawAType = row[4];      // Col E: Adjustment Type
-  var rawPCode = row[7];      // Col H: Partner Code
-  var rawRemit = row[9];      // Col J: Remittance Towards
-  var rawRentDed = row[10];   // Col K: Rent Deduction
-  var rawAdjDate = row[11];   // Col L: Adjustment Date
-  var photoUrl = row[13];     // Col N: Photo
-  var remarks = row[14];      // Col O: Remarks
-  var adjRelated = row[15];   // Col P: Adjustment Related to
-  var gpsData = row[17];      // Col R: GPS Data
-  var firstApprover = row[18];// Col S: First Level Approval by
-  var firstStatus = row[19];  // Col T: Status
-  var firstTs = row[20];      // Col U: Timestamp
-  var finStatus = row[21];    // Col V: Finance Team Status
-  var finRemarks = row[22];   // Col W: Finance Team Remarks
-  var finalApprover = row[23];// Col X: Final Level Approval by
-  var finalStatus = row[24];  // Col Y: Status
-  var finalTs = row[25];      // Col Z: Timestamp
-  var hisaabDoneWk = row[28]; // Col AC: Adjustment Done Week
-  var hisaabWkNum = row[29];  // Col AD: Hisaab Week Number
+  var rawTimestamp = getVal(0, "timestamp");
+  var submitterEmail = getVal(1, "email address");
+  var rawCity = getVal(2, "city name");
+  var rawPType = getVal(3, "partner type");
+  var rawAType = getVal(4, "adjustment type");
+  var rawPCode = getVal(7, "partner code");
+  var rawRemit = getVal(9, "remittance towards");
+  var rawRentDed = getVal(10, "rent deduction");
+  var rawAdjDate = getVal(11, "adjustment date");
+  var photoUrl = getVal(13, "photo");
+  var remarks = getVal(14, "remark's") || getVal(14, "remarks");
+  var adjRelated = getVal(15, "adjustment related to");
+  var gpsData = getVal(17, "gps data");
+  var firstApprover = getVal(18, "first level approval by");
+  var firstStatus = getVal(19, "status");
+  var firstTs = getVal(20, "timestamp_l1");
+  var finStatus = getVal(21, "finance team status");
+  var finRemarks = getVal(22, "finance team remark's") || getVal(22, "finance team remarks");
+  var finalApprover = getVal(23, "final level approval by");
+  var finalStatus = getVal(24, "final_status") || getVal(24, "status");
+  var finalTs = getVal(25, "timestamp_l2");
+  var hisaabDoneWk = getVal(28, "adjustment done week");
+  var hisaabWkNum = getVal(29, "hisaab week number");
 
   var city = standardizeCityName(rawCity);
   var phone = sanitizePhoneNumber(rawPhone);
@@ -412,7 +395,7 @@ function transformAdjustmentRow(row, rowIndex) {
     : generatePartnerId(city, phone);
   
   var subTimestamp = parseDateOrTimestamp(rawTimestamp, false) || formatTimestamp(new Date());
-  var adjDate = parseDateOrTimestamp(rawAdjDate, true) || formatDateOnly(new Date());
+  var adjDate = parseDateOrTimestamp(rawAdjDate, true); // Stored as NULL if missing in form
   
   var cleanVeh = rawVeh ? String(rawVeh).trim().toUpperCase().replace(/[^A-Z0-9]/g, "") : null;
   if (cleanVeh && cleanVeh.length < 6) cleanVeh = null;
@@ -452,40 +435,6 @@ function transformAdjustmentRow(row, rowIndex) {
     hisaab_week_number: parseHisaabWeek(hisaabDoneWk, hisaabWkNum),
     source_row: rowIndex || 0
   };
-}
-
-function formatRecordForSheet(r, nowStr) {
-  return [
-    r.submission_timestamp,
-    r.submitter_email,
-    r.city_name,
-    r.partner_type,
-    r.adjustment_type,
-    r.partner_name,
-    r.partner_phone,
-    r.partner_code,
-    r.vehicle_number,
-    r.remittance_towards,
-    r.rent_deduction,
-    r.adjustment_date,
-    r.amount,
-    r.photo_url,
-    r.remarks,
-    r.adjustment_related_to,
-    r.gps_data,
-    r.first_level_approver,
-    r.first_level_status,
-    r.first_level_timestamp,
-    r.finance_team_status,
-    r.finance_team_remarks,
-    r.final_level_approver,
-    r.final_status,
-    r.final_timestamp,
-    r.hisaab_week_str,
-    r.hisaab_week_number,
-    r.source_row,
-    nowStr || formatTimestamp(new Date())
-  ];
 }
 
 // =============================================================================
@@ -652,8 +601,23 @@ function upsertAdjustmentRecords(records) {
 }
 
 // =============================================================================
-// SYNC & TRIGGER HANDLERS
+// SYNC & TRIGGER HANDLERS (PURE DB INGESTION ENGINE - NO SHEET WRITE-BACK)
 // =============================================================================
+
+function buildHeaderMap(sheet) {
+  var headerMap = {};
+  if (!sheet) return headerMap;
+  try {
+    var rawHeaders = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+    for (var i = 0; i < rawHeaders.length; i++) {
+      if (rawHeaders[i] !== null && rawHeaders[i] !== undefined) {
+        var key = String(rawHeaders[i]).trim().toLowerCase();
+        if (key) headerMap[key] = i;
+      }
+    }
+  } catch(e) {}
+  return headerMap;
+}
 
 /**
  * Real-Time On-Edit Trigger with exponential backoff
@@ -687,22 +651,12 @@ function handleOnEdit(e) {
     var actualStart = Math.max(2, startRow);
     var numRows = endRow - actualStart + 1;
     var rawData = sheet.getRange(actualStart, 1, numRows, sheet.getLastColumn()).getValues();
+    var headerMap = buildHeaderMap(sheet);
     
     var records = [];
-    var sheetRows = [];
-    var targetSheet = getTargetSheet();
-    var nowStr = formatTimestamp(new Date());
-
     for (var i = 0; i < rawData.length; i++) {
-      var transformed = transformAdjustmentRow(rawData[i], actualStart + i);
-      if (transformed) {
-        records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
-      }
-    }
-    
-    if (sheetRows.length > 0 && targetSheet) {
-      targetSheet.getRange(actualStart, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
+      var transformed = transformAdjustmentRow(rawData[i], actualStart + i, headerMap);
+      if (transformed) records.push(transformed);
     }
     
     if (records.length > 0) {
@@ -734,13 +688,10 @@ function handleOnFormSubmit(e) {
 
   try {
     var rowIdx = e.range ? e.range.getRow() : 0;
-    var transformed = transformAdjustmentRow(e.values, rowIdx);
+    var sourceSheet = getSourceSheet();
+    var headerMap = buildHeaderMap(sourceSheet);
+    var transformed = transformAdjustmentRow(e.values, rowIdx, headerMap);
     if (transformed) {
-      var targetSheet = getTargetSheet();
-      if (targetSheet && rowIdx > 1) {
-        var sheetRow = formatRecordForSheet(transformed, formatTimestamp(new Date()));
-        targetSheet.getRange(rowIdx, 1, 1, sheetRow.length).setValues([sheetRow]);
-      }
       upsertAdjustmentRecords([transformed]);
     }
   } finally {
@@ -789,30 +740,23 @@ function syncRecentAdjustments() {
     var trueLastRow = getTrueLastRow(sourceSheet);
     if (trueLastRow <= 1) return;
     
-    var WINDOW_SIZE = 100;
+    var WINDOW_SIZE = 1000;
     var startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
     var numRows = trueLastRow - startRow + 1;
+    Logger.log("Starting 1-min catch-up sync (scanning last " + numRows + " rows up to row " + trueLastRow + ")...");
     
     var data = sourceSheet.getRange(startRow, 1, numRows, sourceSheet.getLastColumn()).getValues();
+    var headerMap = buildHeaderMap(sourceSheet);
     var records = [];
-    var sheetRows = [];
-    var nowStr = formatTimestamp(new Date());
 
     for (var i = 0; i < data.length; i++) {
-      var transformed = transformAdjustmentRow(data[i], startRow + i);
-      if (transformed) {
-        records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
-      }
+      var transformed = transformAdjustmentRow(data[i], startRow + i, headerMap);
+      if (transformed) records.push(transformed);
     }
     
     if (records.length > 0) {
-      var targetSheet = getTargetSheet();
-      if (targetSheet && sheetRows.length > 0) {
-        targetSheet.getRange(startRow, 1, sheetRows.length, sheetRows[0].length).setValues(sheetRows);
-      }
       upsertAdjustmentRecords(records);
-      Logger.log("Catch-up sync (1-min) successfully updated " + records.length + " recent adjustment records.");
+      Logger.log("Catch-up sync (1-min) successfully upserted " + records.length + " recent adjustment records to PostgreSQL DB.");
     }
   } finally {
     lock.releaseLock();
@@ -820,7 +764,7 @@ function syncRecentAdjustments() {
 }
 
 /**
- * Full Manual Backfill Synchronization
+ * Full Manual Backfill Synchronization directly to PostgreSQL Database
  */
 function syncAllAdjustments() {
   var lock = LockService.getScriptLock();
@@ -838,28 +782,15 @@ function syncAllAdjustments() {
       return;
     }
     
+    var headerMap = buildHeaderMap(sourceSheet);
     var records = [];
-    var sheetRows = [];
-    var nowStr = formatTimestamp(new Date());
 
     for (var i = 1; i < data.length; i++) {
-      var transformed = transformAdjustmentRow(data[i], i + 1);
-      if (transformed) {
-        records.push(transformed);
-        sheetRows.push(formatRecordForSheet(transformed, nowStr));
-      }
+      var transformed = transformAdjustmentRow(data[i], i + 1, headerMap);
+      if (transformed) records.push(transformed);
     }
     
     Logger.log("Transformed " + records.length + " valid adjustment records.");
-    
-    // Write clean standardized rows to targetSheet in chunks of 500
-    var targetSheet = getTargetSheet();
-    var CHUNK_SIZE = 500;
-    for (var s = 0; s < sheetRows.length; s += CHUNK_SIZE) {
-      var sChunk = sheetRows.slice(s, s + CHUNK_SIZE);
-      targetSheet.getRange(s + 2, 1, sChunk.length, sChunk[0].length).setValues(sChunk);
-    }
-    Logger.log("Wrote " + sheetRows.length + " rows to tab '" + getDbConfig().targetSheetName + "'.");
 
     // Parameterized batch upsert into PostgreSQL
     Logger.log("Starting PostgreSQL upsert for " + records.length + " adjustment records...");
