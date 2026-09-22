@@ -134,12 +134,15 @@ BEGIN
             COALESCE(t.date_for, t.stmt_date) AS service_date,
             UPPER(REPLACE(t.vehicle_number, ' ', '')) AS veh_no,
             COALESCE(SUM(t.amount_raw) FILTER (WHERE t.transaction_type ILIKE '%incentive%'), 0.00) AS portal_incentive,
-            COALESCE(SUM(t.amount_raw) FILTER (WHERE t.transaction_type ILIKE '%platform%'), 0.00) AS platform_fee,
+            COALESCE(SUM(t.amount_raw) FILTER (WHERE t.transaction_type ILIKE '%platform%' OR t.transaction_type = 'bank_transfer_charge'), 0.00) AS platform_fee,
             COALESCE(SUM(t.amount_raw) FILTER (WHERE t.transaction_type ILIKE '%subscription%' AND t.payment_type = 'debit'), 0.00)
               - COALESCE(SUM(t.amount_raw) FILTER (WHERE t.transaction_type = 'collection' AND t.sub_category = 'subscription_fee'), 0.00) AS subscription_fee,
             COALESCE(SUM(t.amount_raw) FILTER (
                 WHERE (t.transaction_type IN ('ondemand_account_transfer', 'bank_account_transfer') AND t.payment_type = 'debit')
                    OR (t.transaction_type = 'collection' AND t.sub_category = 'online_payment')
+            ), 0.00)
+              - COALESCE(SUM(t.amount_raw) FILTER (
+                WHERE t.transaction_type = 'failed_ondemand_account_transfer' AND t.payment_type = 'credit'
             ), 0.00) AS online_payouts
         FROM public.ola_raw_transactions t
         WHERE t.transaction_status <> 'Reversed'
@@ -277,7 +280,7 @@ BEGIN
                  GROUP BY partner_id 
                  ORDER BY COUNT(*) DESC, MAX(status_date) DESC LIMIT 1),
                 (SELECT partner_id 
-                 FROM public.core_rent cr 
+                 FROM public.rental_custom_partner_plans cr 
                  WHERE cr.vehicle_number = w.vehicle_number AND cr.is_active = TRUE 
                  LIMIT 1)
             ) AS vendor_code

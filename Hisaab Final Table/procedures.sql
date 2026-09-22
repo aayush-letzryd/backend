@@ -137,7 +137,7 @@ BEGIN
                 COALESCE(SUM(o.cash_collected), 0.00) AS ola_cash_collection,
                 COALESCE(SUM(o.toll_and_parking), 0.00) AS ola_toll,
                 0.00 AS ola_gst,
-                COALESCE(SUM(o.net_ola_to_pay), 0.00) AS ola_online_payment,
+                COALESCE(SUM(o.online_payouts), 0.00) AS ola_online_payment,
                 COALESCE(SUM(o.portal_incentive), 0.00) AS ola_incentive,
                 (COALESCE(SUM(o.operator_bill), 0.00) - COALESCE(SUM(o.cash_collected), 0.00)) AS ola_week_os
             FROM public.core_ola_daily o

@@ -55,7 +55,7 @@ def run_sp_sync(conn, start_date=None, end_date=None):
     """Executes the production sp_sync_core_ola stored procedure."""
     logger.info(f"Executing sp_sync_core_ola(start_date={start_date}, end_date={end_date})...")
     with conn.cursor() as cur:
-        cur.execute("CALL public.sp_sync_core_ola(%s, %s);", (start_date, end_date))
+        cur.execute("CALL public.sp_sync_core_ola(%s::date, %s::date);", (start_date, end_date))
     conn.commit()
     logger.info("sp_sync_core_ola executed successfully.")
 
