@@ -90,4 +90,26 @@ python test_rental_system.py
 
 # Run master reconciliation parity proof against weekly Hisaab workbooks
 python verify_hisaabs.py
+
+# Create or verify the portal staging table (public.portal_rental_plans)
+python create_staging_table.py
+
+# Promote approved portal staged configurations into production canonical tables
+python sync_portal_to_rental_tables.py
 ```
+
+---
+
+## 5. Portal Intake Staging Architecture (`public.portal_rental_plans`)
+
+To allow portal operations (plan creation, overrides, partner assignments, dynamic slabs, model baselines, fee waivers) without touching live production tables, a single staging intake table is utilized:
+
+1. **Intake Table**: `public.portal_rental_plans` (DDL in `unified_staging_schema.sql`).
+2. **Promotion Pipeline**: `sync_portal_to_rental_tables.py` reads approved records from `portal_rental_plans` and upserts them into:
+   - `public.rental_exceptions` (for `EXCEPTION_OVERRIDE`)
+   - `public.rental_custom_partner_plans` (for `PARTNER_DEAL`)
+   - `public.rental_rate_slabs` (for `RATE_SLAB`)
+   - `public.rental_model_baselines` (for `MODEL_BASELINE`)
+   - `public.rental_fee_rules` (for `FEE_WAIVER`)
+   - `public.core_rental_plans` (for `CORE_PLAN`)
+
