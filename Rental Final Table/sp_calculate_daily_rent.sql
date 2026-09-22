@@ -64,6 +64,7 @@ BEGIN
                     -- Dynamic mapping from raw operational onboarding strings to canonical rental plan codes
                     WHEN po.driver_plan ILIKE '%Uber Reducing%' AND (s.city ILIKE 'blr%' OR s.city ILIKE 'bengalur%') THEN 'BLR_UBER_TBS'
                     WHEN po.driver_plan IN ('D2R', 'Drive to Rent') AND (s.city ILIKE 'blr%' OR s.city ILIKE 'bengalur%') THEN 'BLR_MASTER_IND'
+                    WHEN po.driver_plan ILIKE 'Rapido%' AND (s.city ILIKE 'blr%' OR s.city ILIKE 'bengalur%') THEN 'BLR_ALL_PLATFORM'
                     WHEN (po.driver_plan ILIKE '%EBS%' OR po.driver_plan = 'LIP') AND (s.city ILIKE 'hyd%') THEN 'HYD_UBER_EBS'
                     -- Contracted operator specific agreements
                     WHEN s.partner_id = 'LETZBLRIP7034607989' THEN 'BLR_OP_HAMZA'
@@ -125,7 +126,7 @@ BEGIN
                         WHEN rs.city = 'Hyderabad' THEN 6   -- HYD_UBER_TBS
                         WHEN rs.city = 'Mumbai' THEN 10      -- MUM_UBER_REDUCING
                         WHEN rs.city = 'Bangalore' THEN
-                            CASE WHEN rs.customer_type = 'Operator' THEN 2 ELSE 1 END
+                            CASE WHEN rs.customer_type = 'Operator' THEN 20 ELSE 1 END
                         ELSE 9
                     END
                 ) AS default_plan_id
