@@ -334,17 +334,34 @@ LIMIT 20;
 
 ---
 
-## 8. Nightly Cron Job Configuration
+## 8. In-Database Automated Scheduling (`pg_cron`)
 
-To automate the daily attendance ledger for finance and operations, configure a nightly cron job scheduled at 23:59 IST (18:29 UTC):
+Daily status ledger generation is automated natively inside PostgreSQL via `pg_cron`. This dual-cadence scheduling architecture guarantees zero manual intervention, total fault isolation, and automatic self-healing for late weekend/holiday submissions:
 
-```bash
-# Edit crontab
-crontab -e
+### Active Scheduled Jobs
 
-# Add execution entry (executes daily at 23:59 IST / 18:29 UTC)
-29 18 * * * PGPASSWORD='YOUR_DB_PASSWORD' psql -h 35.200.196.113 -U postgres -d postgres -c "CALL public.sp_generate_daily_vehicle_status(CURRENT_DATE);" >> /var/log/letzryd_daily_status.log 2>&1
+| Job ID | Job Name | Schedule | Command | Execution Target |
+| :--- | :--- | :--- | :--- | :--- |
+| `1` | `refresh_daily_vehicle_status_15m` | `*/15 * * * *` (Every 15 min) | `CALL public.sp_refresh_vehicle_status_rolling(1);` | Rapid intraday catch-up (Yesterday + Today in ~1.5s). Captures same-day and previous-day drop-off submissions immediately. |
+| `11` | `nightly_vehicle_status_rolling_7d` | `15 1 * * *` (Every night at 01:15 AM) | `CALL public.sp_refresh_vehicle_status_rolling(7);` | Deep rolling 7-day lookback (~7.0s execution). Sweeps and reconciles late weekend/holiday drop-offs and garage tickets 45 minutes before daily rent calculation (`02:00 AM`). |
+
+### Management & Manual Intervention SQL:
+```sql
+-- 1. Inspect execution status:
+SELECT jobid, jobname, schedule, command, active FROM cron.job;
+
+-- 2. Inspect recent execution runs:
+SELECT jobid, runid, job_pid, status, return_message, start_time, end_time 
+FROM cron.job_run_details 
+ORDER BY start_time DESC LIMIT 10;
+
+-- 3. Manually refresh past N days (e.g. past 7 days):
+CALL public.sp_refresh_vehicle_status_rolling(7);
+
+-- 4. Manually refresh an arbitrary date range:
+CALL public.sp_refresh_vehicle_status_range('2026-09-01', '2026-09-20');
 ```
+
 
 ---
 

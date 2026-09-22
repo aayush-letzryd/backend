@@ -583,10 +583,18 @@ DROP TRIGGER IF EXISTS trg_sync_core_daily_status_from_sheet ON public.sheet_veh
 -- Stateful ground-truth generation for all 1,647 onboarded fleet vehicles.
 -- Decoupled, self-contained, and soft-delete aware (WHERE is_deleted = FALSE).
 -- ------------------------------------------------------------------------------
-CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(IN p_target_date DATE)
-LANGUAGE plpgsql
+
+-- ------------------------------------------------------------------------------
+-- 6. STORED PROCEDURES & AUTOMATED RECONCILIATION PIPELINE
+-- ------------------------------------------------------------------------------
+
+-- 6.1 Single Day Refresh Engine
+CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(IN p_target_date date)
+ LANGUAGE plpgsql
 AS $procedure$
+
 BEGIN
+    DROP TABLE IF EXISTS tmp_daily_calc;
     CREATE TEMP TABLE tmp_daily_calc ON COMMIT DROP AS
     WITH ranked_allocs AS (
         SELECT 
@@ -841,4 +849,96 @@ BEGIN
     LEFT JOIN svs_today_latest svs ON vo.registration_no = svs.vehicle_number
     WHERE vo.is_deleted = FALSE;
 
+    -- Bulk MERGE into physical table core_daily_vehicle_status
+    MERGE INTO public.core_daily_vehicle_status AS target
+    USING tmp_daily_calc AS src
+    ON (target.status_date = src.status_date AND target.vehicle_number = src.vehicle_number)
+    WHEN MATCHED THEN
+        UPDATE SET
+            city = src.city,
+            car_model = src.car_model,
+            hub_name = src.hub_name,
+            final_status = src.final_status,
+            cohort = src.cohort,
+            partner_id = src.partner_id,
+            partner_name = src.partner_name,
+            partner_phone = src.partner_phone,
+            allocation_id = src.allocation_id,
+            allocation_date = src.allocation_date,
+            dropoff_id = src.dropoff_id,
+            dropoff_date = src.dropoff_date,
+            maintenance_id = src.maintenance_id,
+            source_origin = src.source_origin,
+            updated_at = NOW()
+    WHEN NOT MATCHED THEN
+        INSERT (
+            status_date, vehicle_number, city, car_model, hub_name,
+            final_status, cohort, partner_id, partner_name, partner_phone,
+            allocation_id, allocation_date, dropoff_id, dropoff_date, maintenance_id,
+            source_origin, created_at, updated_at
+        )
+        VALUES (
+            src.status_date, src.vehicle_number, src.city, src.car_model, src.hub_name,
+            src.final_status, src.cohort, src.partner_id, src.partner_name, src.partner_phone,
+            src.allocation_id, src.allocation_date, src.dropoff_id, src.dropoff_date, src.maintenance_id,
+            src.source_origin, NOW(), NOW()
+        );
+    DROP TABLE IF EXISTS tmp_daily_calc;
+END;
 
+$procedure$
+;
+
+-- 6.2 Date-Range Catch-Up Engine
+CREATE OR REPLACE PROCEDURE public.sp_refresh_vehicle_status_range(IN p_start_date date, IN p_end_date date DEFAULT CURRENT_DATE)
+ LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    v_curr DATE := p_start_date;
+BEGIN
+    IF p_start_date IS NULL OR p_end_date IS NULL OR p_start_date > p_end_date THEN
+        RAISE EXCEPTION 'Invalid date range: % to %', p_start_date, p_end_date;
+    END IF;
+
+    WHILE v_curr <= p_end_date LOOP
+        CALL public.sp_generate_daily_vehicle_status(v_curr);
+        COMMIT;
+        v_curr := v_curr + 1;
+    END LOOP;
+END;
+$procedure$
+;
+
+-- 6.3 Automated Rolling Lookback Engine (Catches Holiday/Weekend Delays)
+CREATE OR REPLACE PROCEDURE public.sp_refresh_vehicle_status_rolling(IN p_lookback_days integer DEFAULT 7)
+ LANGUAGE plpgsql
+AS $procedure$
+BEGIN
+    CALL public.sp_refresh_vehicle_status_range(
+        CURRENT_DATE - p_lookback_days,
+        CURRENT_DATE
+    );
+END;
+$procedure$
+;
+
+-- ------------------------------------------------------------------------------
+-- 7. NATIVE IN-DATABASE SCHEDULING (pg_cron)
+-- ------------------------------------------------------------------------------
+-- Job 1: Intraday 15-minute rolling refresh (Yesterday + Today, ~1.5s execution)
+-- Captures same-day and previous-day drop-off submissions immediately.
+SELECT cron.unschedule('refresh_daily_vehicle_status_15m');
+SELECT cron.schedule(
+    'refresh_daily_vehicle_status_15m',
+    '*/15 * * * *',
+    'CALL public.sp_refresh_vehicle_status_rolling(1);'
+);
+
+-- Job 11: Nightly 7-Day lookback reconciliation (Every night at 01:15 AM)
+-- Runs 45 minutes before rental billing (02:00 AM) to sweep weekend & holiday backlogs.
+SELECT cron.unschedule('nightly_vehicle_status_rolling_7d');
+SELECT cron.schedule(
+    'nightly_vehicle_status_rolling_7d',
+    '15 1 * * *',
+    'CALL public.sp_refresh_vehicle_status_rolling(7);'
+);
