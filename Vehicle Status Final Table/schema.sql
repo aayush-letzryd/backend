@@ -579,16 +579,157 @@ DROP TRIGGER IF EXISTS trg_live_status_from_onboarding ON public.core_vehicle_on
 DROP TRIGGER IF EXISTS trg_sync_core_daily_status_from_sheet ON public.sheet_vehicle_status;
 
 -- ------------------------------------------------------------------------------
--- 6. AUTHORITATIVE STORED PROCEDURE: sp_generate_daily_vehicle_status()
--- Stateful ground-truth generation for all 1,647 onboarded fleet vehicles.
--- Decoupled, self-contained, and soft-delete aware (WHERE is_deleted = FALSE).
--- ------------------------------------------------------------------------------
+
+-- 5.1 OPERATIONAL TRIGGER: fn_sync_core_daily_status_from_sheet()
+-- Real-time synchronization trigger on sheet_vehicle_status with Operator ID override.
+CREATE OR REPLACE FUNCTION public.fn_sync_core_daily_status_from_sheet()
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    v_cohort VARCHAR(20);
+    v_billable BOOLEAN;
+    v_waive_reason VARCHAR(100);
+    v_final_partner_id VARCHAR(50);
+    v_final_partner_name VARCHAR(150);
+    v_extracted_id VARCHAR(50);
+BEGIN
+    IF TG_OP = 'DELETE' THEN
+        DELETE FROM public.core_daily_vehicle_status 
+        WHERE status_date = OLD.status_date AND vehicle_number = OLD.vehicle_number;
+        RETURN OLD;
+    END IF;
+
+    -- Compute cohort from final_status
+    IF NEW.cohort IS NOT NULL AND NEW.cohort != '' THEN
+        v_cohort := NEW.cohort;
+    ELSIF NEW.final_status IN ('Active', 'Allocation', 'Same Day D&A') THEN
+        v_cohort := 'On Road';
+    ELSIF NEW.final_status IN ('Maintenance', 'Drop Off') THEN
+        v_cohort := 'Off Road';
+    ELSE
+        v_cohort := 'In Yard';
+    END IF;
+
+    -- Compute billing flag
+    IF NEW.final_status IN ('Active', 'Allocation', 'Same Day D&A') THEN
+        v_billable := TRUE;
+        v_waive_reason := NULL;
+    ELSIF NEW.final_status = 'Maintenance' THEN
+        v_billable := FALSE;
+        v_waive_reason := 'WORKSHOP_MAINTENANCE';
+    ELSIF NEW.final_status = 'Drop Off' THEN
+        v_billable := FALSE;
+        v_waive_reason := 'DROPOFF_INSPECTION';
+    ELSE
+        v_billable := FALSE;
+        v_waive_reason := 'RFD_IN_YARD';
+    END IF;
+
+    -- Resolve partner_id & partner_name with operator override
+    IF v_cohort IN ('Off Road', 'In Yard') OR NEW.final_status IN ('RFD', 'Maintenance', 'Drop Off', 'New Deployment') THEN
+        v_final_partner_id := NULL;
+        v_final_partner_name := NULL;
+    ELSE
+        -- Priority 1: Check if new_partner_name contains a valid partner ID (starts with LETZ)
+        IF NEW.new_partner_name IS NOT NULL AND TRIM(NEW.new_partner_name) NOT IN ('', '-') THEN
+            v_extracted_id := (regexp_match(TRIM(NEW.new_partner_name), '(LETZ[A-Z0-9]+)'))[1];
+        ELSE
+            v_extracted_id := NULL;
+        END IF;
+
+        IF v_extracted_id IS NOT NULL THEN
+            v_final_partner_id := v_extracted_id;
+            -- Lookup operator name from core_partner_onboarding or core_vehicle_allocation
+            SELECT COALESCE(cpo.driver_name, cva.driver_name, NEW.partner_name)
+            INTO v_final_partner_name
+            FROM (SELECT v_extracted_id AS pid) x
+            LEFT JOIN public.core_partner_onboarding cpo ON cpo.partner_id = x.pid
+            LEFT JOIN LATERAL (
+                SELECT driver_name 
+                FROM public.core_vehicle_allocation 
+                WHERE partner_id = x.pid 
+                ORDER BY id DESC LIMIT 1
+            ) cva ON TRUE;
+        ELSE
+            -- Fallback to standard driver partner_id and partner_name
+            v_final_partner_id := NEW.partner_id;
+            v_final_partner_name := NEW.partner_name;
+        END IF;
+    END IF;
+
+    -- Zero-Burn Check: Update if exists, Insert only if new
+    IF EXISTS (
+        SELECT 1 FROM public.core_daily_vehicle_status 
+        WHERE status_date = NEW.status_date AND vehicle_number = NEW.vehicle_number
+    ) THEN
+        UPDATE public.core_daily_vehicle_status SET
+            city = COALESCE(NEW.city, 'UNKNOWN'),
+            final_status = NEW.final_status,
+            cohort = v_cohort,
+            partner_id = v_final_partner_id,
+            partner_name = v_final_partner_name,
+            car_model = NEW.vehicle_model,
+            allocation_date = NEW.allocation_date,
+            dropoff_date = NEW.dropoff_date,
+            billable_rent_day = v_billable,
+            rent_waived_reason = v_waive_reason,
+            source_origin = 'SHEET_STATUS_SYNC',
+            updated_at = CURRENT_TIMESTAMP
+        WHERE status_date = NEW.status_date AND vehicle_number = NEW.vehicle_number;
+    ELSE
+        INSERT INTO public.core_daily_vehicle_status (
+            status_date,
+            vehicle_number,
+            city,
+            final_status,
+            cohort,
+            partner_id,
+            partner_name,
+            partner_phone,
+            hub_name,
+            car_model,
+            allocation_date,
+            dropoff_date,
+            billable_rent_day,
+            rent_waived_reason,
+            source_origin,
+            updated_at
+        ) VALUES (
+            NEW.status_date,
+            NEW.vehicle_number,
+            COALESCE(NEW.city, 'UNKNOWN'),
+            NEW.final_status,
+            v_cohort,
+            v_final_partner_id,
+            v_final_partner_name,
+            NULL,
+            'MAIN_HUB',
+            NEW.vehicle_model,
+            NEW.allocation_date,
+            NEW.dropoff_date,
+            v_billable,
+            v_waive_reason,
+            'SHEET_STATUS_SYNC',
+            CURRENT_TIMESTAMP
+        );
+    END IF;
+
+    RETURN NEW;
+END;
+$function$
+;
+
+DROP TRIGGER IF EXISTS trg_sync_core_daily_status_from_sheet ON public.sheet_vehicle_status;
+CREATE TRIGGER trg_sync_core_daily_status_from_sheet
+AFTER INSERT OR UPDATE ON public.sheet_vehicle_status
+FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_daily_status_from_sheet();
 
 -- ------------------------------------------------------------------------------
 -- 6. STORED PROCEDURES & AUTOMATED RECONCILIATION PIPELINE
 -- ------------------------------------------------------------------------------
 
--- 6.1 Single Day Refresh Engine
+-- 6.1 Single Day Refresh Engine (Operator-Aware)
 CREATE OR REPLACE PROCEDURE public.sp_generate_daily_vehicle_status(IN p_target_date date)
  LANGUAGE plpgsql
 AS $procedure$
@@ -598,7 +739,7 @@ BEGIN
     CREATE TEMP TABLE tmp_daily_calc ON COMMIT DROP AS
     WITH ranked_allocs AS (
         SELECT 
-            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date,
+            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date, a.partner_type,
             ROW_NUMBER() OVER (PARTITION BY a.vehicle_number ORDER BY a.allocation_date DESC, a.id DESC) as rn
         FROM public.core_vehicle_allocation a
         WHERE a.is_deleted = FALSE
@@ -632,7 +773,7 @@ BEGIN
     ),
     alloc_today AS (
         SELECT 
-            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date,
+            a.id, a.vehicle_number, a.partner_id, a.driver_name, a.driver_phone, a.hub_name, a.car_model, a.city, a.allocation_date, a.partner_type,
             ROW_NUMBER() OVER (PARTITION BY a.vehicle_number ORDER BY a.id DESC) as rn
         FROM public.core_vehicle_allocation a
         WHERE a.is_deleted = FALSE
@@ -775,7 +916,14 @@ BEGIN
                     ELSE 'RFD'
                 END
             ) IN ('RFD', 'Maintenance', 'Drop Off', 'New Deployment') THEN NULL
-            ELSE COALESCE(svs.partner_id, at.partner_id, aa.partner_id)
+            ELSE COALESCE(
+                (regexp_match(TRIM(svs.new_partner_name), '(LETZ[A-Z0-9]+)'))[1],
+                CASE WHEN aa.partner_type = 'Operator' THEN aa.partner_id END,
+                CASE WHEN at.partner_type = 'Operator' THEN at.partner_id END,
+                svs.partner_id,
+                at.partner_id,
+                aa.partner_id
+            )
         END AS partner_id,
         
         -- Partner Name (Strictly NULL if Off Road / RFD / Maintenance / New Deployment)
@@ -801,7 +949,14 @@ BEGIN
                     ELSE 'RFD'
                 END
             ) IN ('RFD', 'Maintenance', 'Drop Off', 'New Deployment') THEN NULL
-            ELSE COALESCE(svs.partner_name, svs.new_partner_name, at.driver_name, aa.driver_name)
+            ELSE COALESCE(
+                op_svs.driver_name,
+                CASE WHEN aa.partner_type = 'Operator' THEN aa.driver_name END,
+                CASE WHEN at.partner_type = 'Operator' THEN at.driver_name END,
+                svs.partner_name,
+                at.driver_name,
+                aa.driver_name
+            )
         END AS partner_name,
         
         -- Partner Phone
@@ -847,6 +1002,15 @@ BEGIN
     LEFT JOIN drop_today_latest dt ON vo.registration_no = dt.vehicle_number
     LEFT JOIN active_maint_latest am ON vo.registration_no = am.vehicle_number
     LEFT JOIN svs_today_latest svs ON vo.registration_no = svs.vehicle_number
+    LEFT JOIN LATERAL (
+        SELECT COALESCE(cpo.driver_name, cva.driver_name) AS driver_name
+        FROM (SELECT (regexp_match(TRIM(svs.new_partner_name), '(LETZ[A-Z0-9]+)'))[1] AS pid) x
+        LEFT JOIN public.core_partner_onboarding cpo ON cpo.partner_id = x.pid
+        LEFT JOIN LATERAL (
+            SELECT driver_name FROM public.core_vehicle_allocation WHERE partner_id = x.pid ORDER BY id DESC LIMIT 1
+        ) cva ON TRUE
+        WHERE x.pid IS NOT NULL
+    ) op_svs ON TRUE
     WHERE vo.is_deleted = FALSE;
 
     -- Bulk MERGE into physical table core_daily_vehicle_status
@@ -926,7 +1090,7 @@ $procedure$
 -- 7. NATIVE IN-DATABASE SCHEDULING (pg_cron)
 -- ------------------------------------------------------------------------------
 -- Job 1: Intraday 15-minute rolling refresh (Yesterday + Today, ~1.5s execution)
--- Captures same-day and previous-day drop-off submissions immediately.
+-- Captures same-day and previous-day drop-off submissions and operator assignments immediately.
 SELECT cron.unschedule('refresh_daily_vehicle_status_15m');
 SELECT cron.schedule(
     'refresh_daily_vehicle_status_15m',
