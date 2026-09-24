@@ -707,11 +707,14 @@ function getTrueLastRow(sheet) {
   var lastRow = sheet.getLastRow();
   if (lastRow <= 1) return lastRow;
   
-  var colA = sheet.getRange(1, 1, lastRow, 1).getValues();
-  for (var i = colA.length - 1; i >= 0; i--) {
-    var val = colA[i][0];
-    if (val !== "" && val !== null && val !== undefined) {
-      return i + 1;
+  var maxCols = Math.min(sheet.getLastColumn(), 7);
+  var rangeValues = sheet.getRange(1, 1, lastRow, maxCols).getValues();
+  for (var i = rangeValues.length - 1; i >= 0; i--) {
+    for (var j = 0; j < maxCols; j++) {
+      var val = rangeValues[i][j];
+      if (val !== "" && val !== null && val !== undefined) {
+        return i + 1;
+      }
     }
   }
   return 1;
@@ -740,7 +743,7 @@ function syncRecentAdjustments() {
     var trueLastRow = getTrueLastRow(sourceSheet);
     if (trueLastRow <= 1) return;
     
-    var WINDOW_SIZE = 1000;
+    var WINDOW_SIZE = 2000;
     var startRow = Math.max(2, trueLastRow - WINDOW_SIZE + 1);
     var numRows = trueLastRow - startRow + 1;
     Logger.log("Starting 1-min catch-up sync (scanning last " + numRows + " rows up to row " + trueLastRow + ")...");
@@ -842,20 +845,12 @@ function setupTriggers() {
 
 function removeTriggers() {
   var triggers = ScriptApp.getProjectTriggers();
-  var adjustmentHandlers = [
-    "handleOnEdit",
-    "handleOnFormSubmit",
-    "syncRecentAdjustments",
-    "syncAllAdjustments"
-  ];
-
   for (var i = 0; i < triggers.length; i++) {
-    var handler = triggers[i].getHandlerFunction();
-    if (adjustmentHandlers.indexOf(handler) !== -1) {
+    try {
       ScriptApp.deleteTrigger(triggers[i]);
-    }
+    } catch(e) {}
   }
-  Logger.log("Adjustment pipeline triggers cleanly removed.");
+  Logger.log("All project triggers (including legacy triggers) forcefully deleted.");
 }
 
 function onOpen() {
