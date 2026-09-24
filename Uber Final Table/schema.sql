@@ -150,6 +150,9 @@ BEGIN
     -- ========================================================================
     -- 1. SYNC CORE_UBER_DAILY
     -- ========================================================================
+    DELETE FROM public.core_uber_daily
+    WHERE operational_date BETWEEN v_start_date AND v_end_date;
+
     WITH driver_daily_veh AS (
         SELECT DISTINCT ON (driver_uuid, ((trip_request_time - INTERVAL '4 hours')::date))
             driver_uuid,
@@ -159,16 +162,6 @@ BEGIN
         WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
           AND ((trip_request_time - INTERVAL '4 hours')::date) BETWEEN v_start_date AND v_end_date
         ORDER BY driver_uuid, ((trip_request_time - INTERVAL '4 hours')::date), trip_request_time DESC
-    ),
-    driver_week_veh AS (
-        SELECT DISTINCT ON (driver_uuid, DATE_TRUNC('week', (trip_request_time - INTERVAL '4 hours')::date)::date)
-            driver_uuid,
-            DATE_TRUNC('week', (trip_request_time - INTERVAL '4 hours')::date)::date AS week_start,
-            UPPER(REPLACE(car_no, ' ', '')) AS veh_no
-        FROM public.uber_pipeline_trips
-        WHERE car_no IS NOT NULL AND TRIM(car_no) <> ''
-          AND ((trip_request_time - INTERVAL '4 hours')::date) BETWEEN (v_start_date - INTERVAL '7 days') AND (v_end_date + INTERVAL '7 days')
-        ORDER BY driver_uuid, DATE_TRUNC('week', (trip_request_time - INTERVAL '4 hours')::date)::date, trip_request_time DESC
     ),
     trips_agg AS (
         SELECT 
@@ -210,14 +203,19 @@ BEGIN
             ((ot.reporting_time + INTERVAL '1 hour 30 minutes')::date),
             ot.trx_date
         ) BETWEEN v_start_date AND v_end_date
+          -- STRICT EXCLUSIONS of Non-Vehicle / Organization Adjustments
+          AND ot.description NOT ILIKE '%saas%'
+          AND ot.description NOT ILIKE '%discount%'
+          AND ot.description NOT ILIKE '%so.payout%'
+          AND ot.description NOT ILIKE '%transferred to bank%'
+          AND ot.description NOT ILIKE '%tds%'
     ),
     txns_agg AS (
         SELECT 
             r.op_date,
             COALESCE(
                 r.raw_veh_no,
-                ddv.veh_no,
-                dwv.veh_no
+                ddv.veh_no
             ) AS veh_no,
             r.driver_uuid,
             -- Net Fare Earnings: exclude promotions, milestone incentives, and platform fees (which are accounted in sub_fee)
@@ -239,9 +237,6 @@ BEGIN
         LEFT JOIN driver_daily_veh ddv 
           ON r.driver_uuid = ddv.driver_uuid 
          AND r.op_date = ddv.op_date
-        LEFT JOIN driver_week_veh dwv 
-          ON r.driver_uuid = dwv.driver_uuid 
-         AND DATE_TRUNC('week', r.op_date)::date = dwv.week_start
         GROUP BY 1, 2, 3
     ),
     combined AS (
@@ -305,6 +300,12 @@ BEGIN
     -- Aggregates full ISO weeks by vehicle to represent full activity,
     -- then resolves primary vendor without discarding any vehicle telemetry.
     -- ========================================================================
+    DELETE FROM public.core_uber_weekly
+    WHERE (settlement_year, settlement_week) IN (
+        SELECT DISTINCT EXTRACT(ISOYEAR FROM d)::int, EXTRACT(WEEK FROM d)::int
+        FROM generate_series(v_weekly_start, v_weekly_end, '1 day'::interval) d
+    );
+
     WITH weekly_cal AS (
         SELECT 
             d.operational_date,
@@ -384,7 +385,7 @@ BEGIN
         SELECT 
             UPPER(REPLACE(number_plate, ' ', '')) AS veh_no,
             start_date::date AS week_start,
-            SUM(total_payout) AS total_payout
+            MAX(total_payout) AS total_payout
         FROM public.uber_vehicle_incentives_raw
         WHERE number_plate IS NOT NULL AND TRIM(number_plate) <> '' AND number_plate <> 'nan'
           AND start_date::date BETWEEN v_weekly_start AND v_weekly_end
