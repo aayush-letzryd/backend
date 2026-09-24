@@ -107,6 +107,18 @@ CREATE INDEX IF NOT EXISTS idx_core_dropoffs_driver_type ON public.core_dropoffs
 
 DROP VIEW IF EXISTS public.active_core_dropoffs CASCADE;
 CREATE VIEW public.active_core_dropoffs AS
+WITH ranked AS (
+    SELECT *,
+           ROW_NUMBER() OVER (
+               PARTITION BY vehicle_number, return_date, driver_id
+               ORDER BY CASE WHEN data_source = 'MERGED' THEN 1 
+                             WHEN data_source = 'PORTAL_FORM' THEN 2 
+                             ELSE 3 END,
+                        id DESC
+           ) as rn
+    FROM public.core_dropoffs
+    WHERE is_deleted = FALSE
+)
 SELECT 
     id,
     dropoff_id,
@@ -128,8 +140,8 @@ SELECT
     source_reference_id,
     created_at,
     updated_at
-FROM public.core_dropoffs
-WHERE is_deleted = FALSE;
+FROM ranked
+WHERE rn = 1;
 
 -- ------------------------------------------------------------------------------
 -- 4. BUSINESS LOGIC HELPER FUNCTIONS
