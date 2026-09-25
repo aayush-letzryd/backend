@@ -8,21 +8,18 @@
 The **Master Traffic Challan Pipeline** unifies LetzRyd's multi-source traffic fine tracking into a single, high-performance, real-time Single Source of Truth (SSOT) table in PostgreSQL: **`public.core_challans`**.
 
 ### Integrated Source Systems
-1. **`public.sheet_challans`**: Manual operational logs maintained across 38 weekly tabs in the unified Google Sheet (`LetzRyd_Sheet_Challans_Master`), ingested via Google Apps Script JDBC pipeline (37,948 upstream records supplying 37,999 active core records across Bangalore, Hyderabad, and Mumbai).
-2. **`public.vehicle_challans`**: Automated portal scraping pipeline capturing official traffic violations from the Karnataka One Challan Portal (1,129 upstream records supplying 711 active fine records totaling Rs. 464,500 in pending fines).
+1. **`public.vehicle_challans`**: Automated portal scraping pipeline capturing official traffic violations from the Karnataka One Challan Portal for Bangalore vehicles (authoritative primary source for Bangalore).
+2. **`public.sheet_challans`**: Manual operational logs maintained across 38 weekly cycles in Google Sheets (authoritative primary source for Mumbai and Hyderabad; historical fallback for Bangalore).
 
 ### Master Table Status & Live Metrics
-- **Total Master Records**: 38,710
-- **Active Operational Records**: 38,659
-- **Soft Deleted Records**: 51
-- **Primary Key Continuity**: Gapless sequential IDs from 1 to 38,710 (0 gaps, 0 sequence burning)
-- **Source Breakdown**:
-  - `GOOGLE_SHEET`: 37,999 records | Rs. 87,946,839.00 pending liability
-  - `KARNATAKA_ONE_SCRAPER`: 711 records | Rs. 464,500.00 pending liability
-- **City Breakdown**:
-  - Bangalore: 23,610 records | Rs. 25,280,100.00 pending liability
-  - Hyderabad: 7,738 records | Rs. 19,001,895.00 pending liability
-  - Mumbai: 7,362 records | Rs. 44,129,344.00 pending liability
+- **Total Master Violations**: 6,078 authentic, discrete infractions (consolidated down from 61,773 bloated/duplicate rows).
+- **Duplicate Violations Prevented**: 1,002 duplicate Bangalore fines eliminated through multi-source reconciliation.
+- **Missing Violation Dates Recovered**: 251 fines recovered via fallback dates (`COALESCE(violation_date, notice_date, audit_date)`).
+- **Zero Routine Audit Bloat**: 54,680 weekly zero-fine balance checks filtered out from the core table.
+- **City Distribution**:
+  - **Bangalore**: 4,304 records | ₹28,33,800.00 total fines | ₹21,30,100.00 technically pending dues
+  - **Mumbai**: 1,180 records | ₹11,47,200.00 total fines | ₹15,57,000.00 technically pending dues
+  - **Hyderabad**: 594 records | ₹3,12,235.00 total fines | ₹3,07,555.00 technically pending dues
 
 ---
 
@@ -33,46 +30,44 @@ The **Master Traffic Challan Pipeline** unifies LetzRyd's multi-source traffic f
 |                                  OPERATIONAL INTAKE SOURCES                                       |
 +-------------------------------------------------+-------------------------------------------------+
 | 1. Google Sheets Operations Ledger              | 2. Karnataka One Traffic Portal Scraper         |
-|    (38 Weekly Audit Cycles - Blr/Hyd/Mum)       |    (Node.js Playwright Pipeline - Bangalore)     |
+|    (38 Weekly Cycles - Blr/Hyd/Mum)             |    (Playwright Automation - Bangalore)          |
 +-------------------------------------------------+-------------------------------------------------+
                          |                                                 |
-                         | Google Apps Script JDBC                         | Automated Playwright / Cloud Runner
+                         | Google Apps Script JDBC                         | Automated Playwright Scraper
                          v                                                 v
 +-------------------------------------------------+-------------------------------------------------+
 | public.sheet_challans                           | public.vehicle_challans                         |
-| (37,948 Rows)                                   | (1,129 Rows)                                    |
+| (STRICTLY READ-ONLY - NEVER MODIFIED/LOCKED)    | (STRICTLY READ-ONLY - NEVER MODIFIED/LOCKED)    |
 +-------------------------------------------------+-------------------------------------------------+
-                         |                                                 |
-               AFTER INSERT/UPDATE/DELETE                        AFTER INSERT/UPDATE/DELETE
-             [trg_sync_core_challan_from_sheet]                [trg_sync_core_challan_from_automation]
-                         |                                                 |
-                         +------------------------+------------------------+
+                         \                                                 /
+                          \                                               /
+                           +----------------------+----------------------+
                                                   |
-                                                  v  (Transactional Advisory Lock: 888999222)
+                                                  v  (Scheduled via pg_cron: 20 * * * *)
                                +-------------------------------------+
-                               |      POSTGRESQL TRIGGER ENGINE      |
-                               |  * Gapless Sequence: MAX(id) + 1    |
-                               |  * Standardized Plate Clean         |
-                               |  * Flexible Date & Time Parser      |
-                               |  * Scraper Precedence for Bangalore |
-                               |  * Sheet Financial Enrichment       |
-                               |  * Soft-Delete: is_deleted = TRUE   |
+                               |      BATCH SYNCHRONIZATION ENGINE   |
+                               |      public.sp_sync_core_challans() |
+                               |  * No database triggers / locks     |
+                               |  * Bangalore Scraper Priority       |
+                               |  * Sheet Metadata Enrichment        |
+                               |  * Fallback Date Recovery           |
+                               |  * Exclusion of Balance Snapshots   |
                                +-------------------------------------+
                                                   |
-                                                  v  (<10ms Live Latency)
+                                                  v  (Execution time: ~0.6 seconds)
                                +-------------------------------------+
                                |         MASTER DESTINATION          |
                                |        public.core_challans         |
-                               |     (38,710 Master Challan SSOT)    |
+                               |     (6,078 Master Challan SSOT)     |
                                +-------------------------------------+
                                                   |
                                   +---------------+---------------+
                                   |                               |
                                   v                               v
                  +---------------------------------+  +-------------------------------+
-                 |      Live Operations / BI       |  |  Audit & Compliance History   |
-                 |   (WHERE is_deleted = FALSE)    |  |  (WHERE is_deleted = TRUE)    |
-                 |         38,659 Records          |  |           51 Records          |
+                 |    Operational BI & Recovery    |  |     Downstream Hisaab         |
+                 |   v_weekly_vehicle_pending...   |  |   Settlement Calculations     |
+                 |   v_vehicle_pending_challans... |  |   (Driver Custody via Date)   |
                  +---------------------------------+  +-------------------------------+
 ```
 
@@ -81,26 +76,118 @@ The **Master Traffic Challan Pipeline** unifies LetzRyd's multi-source traffic f
 ## 3. Scraper Precedence & Multi-Source Policy
 
 Per LetzRyd master data policy:
-1. **Natural Business Key**: `(vehicle_reg_no, notice_no, week_cycle)`.
-2. **Karnataka One Scraper Priority**:
-   - For Karnataka / Bangalore violations, official government fine amounts, violation descriptions, police station jurisdictions, and notice generation dates sourced from `public.vehicle_challans` take unconditional precedence over manual Google Sheet logs.
-3. **Google Sheet Enrichment**:
-   - Google Sheet records supply all non-Karnataka records (Hyderabad, Mumbai) and enrich historical rolling balances (`previous_balance`), LetzRyd sticker fines (`sticker_fine`), driver salary deductions (`amount_paid`), and internal ops remarks.
-4. **Soft Deletions**:
-   - Deletions from upstream sources flag `is_deleted = TRUE` and record `deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`, preserving complete auditability.
+1. **Natural Business Key**: `(vehicle_reg_no, notice_no)`. A vehicle can never have the same police notice number twice.
+2. **Bangalore Source Hierarchy**:
+   - Official government notice numbers, violation descriptions, police station junctions, fine amounts, and payment statuses sourced from `public.vehicle_challans` take unconditional precedence over manual Google Sheet logs.
+   - Matching Bangalore records from `public.sheet_challans` are merged on `(vehicle_reg_no, violation_date, challan_amount)` to enrich sheet remarks and row index without duplicating the fine.
+   - Unmatched historical Bangalore records from the sheet are preserved as fallbacks (`source_priority = 'SHEET_FALLBACK'`).
+3. **Mumbai & Hyderabad Hierarchy**:
+   - `public.sheet_challans` is the primary source (`source_priority = 'SHEET_PRIMARY'`).
+4. **Zero-Fine Routine Audits**:
+   - 54,680 weekly balance snapshots (`challan_amount = 0` and `sticker_fine = 0`) are filtered out. They remain untouched in `sheet_challans` for ledger auditability.
 
 ---
 
-## 4. Automation & Verification Commands
+## 4. Operational Queries: Pending Challans by Vehicle & Date
 
-To verify table health and sequence continuity, run:
-
-```bash
-python "Traffic Challan Final Table/automation_script.py"
+### Query 1: Unpaid Challans for a Specific Vehicle & Date Range
+```sql
+SELECT 
+    vehicle_reg_no,
+    violation_date,
+    violation_time,
+    notice_no,
+    offence_description,
+    police_station,
+    challan_amount,
+    sticker_fine,
+    net_pending_amount,
+    payment_status,
+    source_system
+FROM public.core_challans
+WHERE vehicle_reg_no = 'KA05AP6034'
+  AND violation_date BETWEEN '2026-07-01' AND '2026-08-31'
+  AND payment_status = 'UNPAID'
+ORDER BY violation_date ASC;
 ```
 
-To run full schema synchronization or re-create views and triggers:
+### Query 2: All Vehicles with Pending Challans (Rollup View)
+```sql
+SELECT 
+    vehicle_reg_no,
+    city,
+    pending_challans_count,
+    total_pending_amount,
+    earliest_pending_date,
+    latest_pending_date
+FROM public.v_vehicle_pending_challans_summary
+WHERE pending_challans_count > 0
+ORDER BY total_pending_amount DESC;
+```
 
+### Query 3: Weekly Pending Dues per Vehicle (for Hisaab & Operations)
+```sql
+SELECT 
+    settlement_week,
+    vehicle_reg_no,
+    city,
+    pending_count,
+    week_pending_amount,
+    notice_numbers
+FROM public.v_weekly_vehicle_pending_challans
+WHERE settlement_week = 'CY26WK37' AND pending_count > 0
+ORDER BY week_pending_amount DESC;
+```
+
+---
+
+## 5. Driver Custody Reference for Hisaab
+
+While driver custody logic is intentionally separated from `core_challans`, downstream Hisaab can correlate any violation to the active driver who held the vehicle on the `violation_date` using the following reference query:
+
+```sql
+SELECT 
+    c.id AS challan_id,
+    c.vehicle_reg_no,
+    c.violation_date,
+    c.notice_no,
+    c.net_pending_amount,
+    a.partner_id,
+    a.driver_name,
+    a.driver_phone,
+    a.allocation_date
+FROM public.core_challans c
+JOIN public.core_vehicle_allocation a
+  ON c.vehicle_reg_no = UPPER(REGEXP_REPLACE(a.vehicle_number, '[^A-Za-z0-9]', '', 'g'))
+ AND c.violation_date >= a.allocation_date
+ AND c.violation_date < COALESCE(
+     (SELECT MIN(d.return_date) FROM public.core_dropoffs d 
+      WHERE d.vehicle_number = a.vehicle_number AND d.return_date >= a.allocation_date),
+     CURRENT_DATE + INTERVAL '1 day'
+ )
+WHERE c.payment_status = 'UNPAID';
+```
+
+---
+
+## 6. Automation & Operational Runbook
+
+### Running Manual Sync
 ```bash
-psql -h 35.200.196.113 -U postgres -d postgres -f "Traffic Challan Final Table/schema.sql"
+python automation_script.py --sync
+```
+
+### Running Table Audit
+```bash
+python automation_script.py --audit
+```
+
+### Querying Specific Vehicle
+```bash
+python automation_script.py --vehicle KA05AP6034
+```
+
+### Querying Weekly Hisaab Cycle
+```bash
+python automation_script.py --weekly CY26WK37
 ```

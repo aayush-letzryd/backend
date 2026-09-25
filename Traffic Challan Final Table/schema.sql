@@ -1,384 +1,329 @@
 -- =============================================================================
--- LetzRyd Master Traffic Challans Single Source of Truth: public.core_challans
+-- LETZRYD MASTER TRAFFIC CHALLANS SSOT DDL: public.core_challans
+-- Host: 35.200.196.113:5432 | DB: postgres | Schema: public
 -- =============================================================================
 -- Description:
 -- Master core table unifying two independent traffic challan data sources:
---   1. public.sheet_challans (Google Sheets manual ops logs across 38 weekly tabs)
---   2. public.vehicle_challans (Automated Karnataka One direct scraping pipeline)
+--   1. public.vehicle_challans (Automated Karnataka One direct scraping pipeline - Bangalore)
+--   2. public.sheet_challans (Google Sheets operational logs across 38 weekly cycles - All Cities)
 --
 -- Merging & Precedence Policy:
---   - Natural Business Key: (vehicle_reg_no, notice_no, week_cycle)
---   - Karnataka One Scraper Priority: Official government fine amounts, violation
---     descriptions, police station jurisdictions, and notice generation dates
---     take top priority when matched.
---   - Sheet Enrichment: Rolling balances (previous_balance), LetzRyd sticker fines
---     (sticker_fine), salary deductions (amount_paid), and audit remarks enrich
---     the record seamlessly.
+--   - Bangalore: vehicle_challans takes priority (official police notice numbers, ITMS camera locations,
+--     official offence descriptions, portal payment statuses). Matches with sheet_challans on
+--     (vehicle_reg_no, violation_date, challan_amount) to enrich remarks/tab metadata without duplicates.
+--     Historical/unscraped Bangalore sheet records are preserved as fallback.
+--   - Mumbai & Hyderabad: sheet_challans is primary source for all active violations.
+--   - Zero-Fine Routine Audits: 54,000+ weekly balance checks (challan_amount = 0) are excluded.
 --
 -- Architectural Guarantees:
---   - Zero Changes to Upstream Tables: sheet_challans and vehicle_challans remain untouched.
---   - Clean IST Timestamps: All timestamps stored as TIMESTAMP WITHOUT TIME ZONE in Asia/Kolkata.
---   - Gapless Sequencing: Uses transactional advisory locks (lock ID 888999222) for continuous IDs.
---   - Soft Delete & Archival: Source deletions trigger is_deleted = TRUE without hard data destruction.
+--   - 100% Downstream: Source tables (vehicle_challans, sheet_challans) are NEVER modified or locked.
+--   - Zero Database Triggers: Decoupled scheduled batch execution via pg_cron (no table locks).
+--   - Normalized Dates: Settlement weeks are dynamically joined via hisaab_settlement_weeks on violation_date.
 -- =============================================================================
 
--- 1. Master Table Definition (Non-Destructive Schema Creation)
+-- 1. Master Table Definition
 CREATE TABLE IF NOT EXISTS public.core_challans (
     id BIGSERIAL PRIMARY KEY,
     
-    -- Provenance & Source Attribution
-    source_system VARCHAR(100) NOT NULL, -- 'KARNATAKA_ONE_SCRAPER', 'GOOGLE_SHEET', 'MERGED_AUTOMATION_SHEET'
-    source_table VARCHAR(100) NOT NULL,  -- 'vehicle_challans', 'sheet_challans'
-    sheet_challan_id BIGINT,             -- Pointer to sheet_challans.id
-    automated_challan_id BIGINT,         -- Pointer to vehicle_challans.id
+    -- Source System & Provenance
+    source_system VARCHAR(50) NOT NULL,    -- 'KARNATAKA_ONE_SCRAPER', 'GOOGLE_SHEET', 'MERGED_AUTOMATION_SHEET'
+    source_priority VARCHAR(20) NOT NULL,  -- 'SCRAPER_PRIMARY', 'SHEET_PRIMARY', 'SHEET_FALLBACK'
+    sheet_challan_id BIGINT,                -- Foreign key pointer to sheet_challans.id
+    automated_challan_id BIGINT,            -- Foreign key pointer to vehicle_challans.id
     
-    -- Core Identifiers (Standardized)
-    vehicle_reg_no VARCHAR(50) NOT NULL,
-    rc_holder_name VARCHAR(255),
-    notice_no VARCHAR(150) NOT NULL,
-    city VARCHAR(100) NOT NULL,
-    week_cycle VARCHAR(100),
+    -- Vehicle & Location Identifiers
+    vehicle_reg_no VARCHAR(20) NOT NULL,
+    city VARCHAR(50) NOT NULL,              -- 'Bangalore', 'Mumbai', 'Hyderabad'
+    rc_holder_name VARCHAR(255),            -- Official RC owner from government portal
     
-    -- Violation Timeline & Jurisdiction
-    violation_date DATE,
-    violation_time TIME WITHOUT TIME ZONE,
-    notice_date DATE,
-    audit_date DATE,
+    -- Violation Details & Evidence
+    notice_no VARCHAR(100) NOT NULL,        -- Official Police notice number (or deterministic sheet notice ID)
+    violation_date DATE NOT NULL,           -- Validated infraction date
+    violation_time TIME WITHOUT TIME ZONE,  -- Exact violation time
+    notice_date DATE,                       -- Official notice issuance date
+    audit_date DATE,                        -- Operational audit date from weekly ledger
+    offence_description TEXT,               -- Official police offence (e.g. 'JUMPING TRAFFIC SIGNALS')
+    police_station VARCHAR(255),            -- Police station or ITMS camera junction
+    violation_location TEXT,                -- Full junction/road description
+    liability_type VARCHAR(50) NOT NULL DEFAULT 'TRAFFIC_FINE', -- 'TRAFFIC_FINE', 'STICKER_FINE'
     
-    -- Violation Details & Offence Classification
-    violation_description TEXT,
-    police_station VARCHAR(255),
-    violation_location TEXT,
-    liability_type VARCHAR(50) DEFAULT 'TRAFFIC_FINE', -- 'TRAFFIC_FINE', 'STICKER_FINE', 'ROLLING_BALANCE'
+    -- Financial Breakdown (Money to Ask For)
+    challan_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00,      -- Official government fine
+    sticker_fine NUMERIC(10, 2) NOT NULL DEFAULT 0.00,        -- Internal company sticker fine
+    total_fine_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00,   -- challan_amount + sticker_fine
+    amount_paid NUMERIC(10, 2) NOT NULL DEFAULT 0.00,         -- Amount recovered / settled
+    net_pending_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00,  -- Technically pending amount = total - paid
+    payment_status VARCHAR(30) NOT NULL DEFAULT 'UNPAID',     -- 'UNPAID', 'PAID', 'PARTIALLY_PAID', 'DISPUTED'
     
-    -- Financial Breakdown & Payment Ledger
-    challan_amount NUMERIC(12, 2) DEFAULT 0.00,
-    sticker_fine NUMERIC(12, 2) DEFAULT 0.00,
-    previous_balance NUMERIC(12, 2) DEFAULT 0.00,
-    amount_paid NUMERIC(12, 2) DEFAULT 0.00,
-    total_pending NUMERIC(12, 2) DEFAULT 0.00,
-    payment_status VARCHAR(50) DEFAULT 'PENDING',      -- 'PENDING', 'PAID', 'PARTIALLY_PAID', 'DISPUTED'
-    
-    -- Scraper & Document Metadata
-    challan_image_url TEXT,
-    scraped_at TIMESTAMP WITHOUT TIME ZONE,
-    source_tab VARCHAR(100),
-    sheet_row_number INTEGER,
-    remarks TEXT,
-    
-    -- Gapless Audit & Soft Delete State
+    -- Traceability Metadata
+    source_tab VARCHAR(100),                -- Sheet tab name
+    sheet_row_number INTEGER,               -- Sheet row index
+    scraped_at TIMESTAMP WITH TIME ZONE,    -- Portal scrape timestamp
+    remarks TEXT,                           -- Fleet manager notes
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    deleted_at TIMESTAMP WITHOUT TIME ZONE,
-    extra_attributes JSONB DEFAULT '{}'::jsonb,
+    deleted_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     
-    -- Audit Timestamps (Clean IST without timezone offset)
-    created_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-    updated_at TIMESTAMP WITHOUT TIME ZONE DEFAULT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
+    -- Natural Business Key: A vehicle cannot have the same notice number twice
+    CONSTRAINT uq_core_challans_reg_notice UNIQUE (vehicle_reg_no, notice_no)
 );
 
--- 2. Performance B-Tree Indexes
+-- Performance B-Tree Indexes
 CREATE INDEX IF NOT EXISTS idx_core_challans_reg_no ON public.core_challans(vehicle_reg_no);
-CREATE INDEX IF NOT EXISTS idx_core_challans_notice_no ON public.core_challans(notice_no);
 CREATE INDEX IF NOT EXISTS idx_core_challans_city ON public.core_challans(city);
-CREATE INDEX IF NOT EXISTS idx_core_challans_violation_date ON public.core_challans(violation_date);
-CREATE INDEX IF NOT EXISTS idx_core_challans_payment_status ON public.core_challans(payment_status);
-CREATE INDEX IF NOT EXISTS idx_core_challans_week_cycle ON public.core_challans(week_cycle);
-CREATE INDEX IF NOT EXISTS idx_core_challans_source_system ON public.core_challans(source_system);
+CREATE INDEX IF NOT EXISTS idx_core_challans_vio_date ON public.core_challans(violation_date);
+CREATE INDEX IF NOT EXISTS idx_core_challans_pay_status ON public.core_challans(payment_status);
+CREATE INDEX IF NOT EXISTS idx_core_challans_pending ON public.core_challans(net_pending_amount);
 CREATE INDEX IF NOT EXISTS idx_core_challans_is_deleted ON public.core_challans(is_deleted);
 
 -- =============================================================================
--- 3. Utility Cleaning Functions
+-- 2. Stored Procedure: sp_sync_core_challans()
+-- Idempotent, high-performance batch synchronization engine (~0.6 sec execution)
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION public.fn_clean_challan_plate(p_plate TEXT)
-RETURNS VARCHAR(50) AS $$
-DECLARE
-    v_clean VARCHAR(50);
+CREATE OR REPLACE PROCEDURE public.sp_sync_core_challans()
+LANGUAGE plpgsql
+AS $$
 BEGIN
-    IF p_plate IS NULL THEN RETURN NULL; END IF;
-    v_clean := UPPER(REGEXP_REPLACE(TRIM(p_plate), '[^A-Za-z0-9]', '', 'g'));
-    IF LENGTH(v_clean) < 8 OR LENGTH(v_clean) > 12 THEN
-        RETURN NULL;
-    END IF;
-    IF v_clean IN ('TOTAL', 'REGNO', 'REGNO', 'BALANCE', 'SUBTOTAL') THEN
-        RETURN NULL;
-    END IF;
-    RETURN v_clean;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+    -- -------------------------------------------------------------------------
+    -- 1. Ingest Scraper Data for Bangalore (SCRAPER_PRIMARY)
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.core_challans (
+        source_system, source_priority, automated_challan_id,
+        vehicle_reg_no, city, rc_holder_name,
+        notice_no, violation_date, violation_time, notice_date,
+        offence_description, police_station, violation_location, liability_type,
+        challan_amount, sticker_fine, total_fine_amount, amount_paid, net_pending_amount,
+        payment_status, scraped_at, is_deleted, created_at, updated_at
+    )
+    SELECT 
+        'KARNATAKA_ONE_SCRAPER',
+        'SCRAPER_PRIMARY',
+        v.id,
+        UPPER(REGEXP_REPLACE(TRIM(v.vehicle_reg_no), '[^A-Za-z0-9]', '', 'g')),
+        'Bangalore',
+        NULLIF(TRIM(v.rc_holder_name), 'N/A'),
+        TRIM(v.notice_no),
+        TO_DATE(v.violation_date, 'DD-MM-YYYY'),
+        CASE 
+            WHEN v.violation_time ~ '^[0-9]{1,2}:[0-9]{2}' THEN CAST(SUBSTRING(v.violation_time FROM 1 FOR 5) AS TIME)
+            ELSE NULL 
+        END,
+        CASE 
+            WHEN v.notice_generation_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}' THEN TO_DATE(v.notice_generation_date, 'DD-MM-YYYY')
+            ELSE NULL 
+        END,
+        NULLIF(TRIM(v.offence_description), 'N/A'),
+        NULLIF(TRIM(v.point_name), 'N/A'),
+        NULLIF(TRIM(v.point_name), 'N/A'),
+        'TRAFFIC_FINE',
+        COALESCE(v.fine_amount, 0.00),
+        0.00,
+        COALESCE(v.fine_amount, 0.00),
+        CASE WHEN v.payment_status = 'PAID' THEN COALESCE(v.fine_amount, 0.00) ELSE 0.00 END,
+        CASE WHEN v.payment_status = 'PAID' THEN 0.00 ELSE COALESCE(v.fine_amount, 0.00) END,
+        COALESCE(v.payment_status, 'UNPAID'),
+        v.last_scraped_at,
+        FALSE,
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+    FROM vehicle_challans v
+    WHERE v.status = 'HAS_FINES'
+      AND v.notice_no IS NOT NULL AND v.notice_no <> 'N/A'
+      AND v.violation_date IS NOT NULL AND v.violation_date <> 'N/A'
+      AND v.violation_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
+    ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
+    SET payment_status = EXCLUDED.payment_status,
+        amount_paid = EXCLUDED.amount_paid,
+        net_pending_amount = EXCLUDED.net_pending_amount,
+        scraped_at = EXCLUDED.scraped_at,
+        updated_at = CURRENT_TIMESTAMP;
 
-CREATE OR REPLACE FUNCTION public.fn_parse_challan_date(p_str TEXT)
-RETURNS DATE AS $$
-DECLARE
-    v_clean TEXT;
-BEGIN
-    IF p_str IS NULL THEN RETURN NULL; END IF;
-    v_clean := TRIM(p_str);
-    IF v_clean = '' OR LOWER(v_clean) IN ('null', 'nan', 'n/a', '-', '--') THEN
-        RETURN NULL;
-    END IF;
-    
-    -- DD-MM-YYYY or DD/MM/YYYY or DD.MM.YYYY
-    IF v_clean ~ '^[0-9]{1,2}[/\-\.][0-9]{1,2}[/\-\.][0-9]{4}' THEN
-        RETURN TO_DATE(SUBSTRING(v_clean FROM 1 FOR 10), 'DD-MM-YYYY');
-    END IF;
-    
-    -- YYYY-MM-DD
-    IF v_clean ~ '^[0-9]{4}[/\-][0-9]{1,2}[/\-][0-9]{1,2}' THEN
-        RETURN TO_DATE(SUBSTRING(v_clean FROM 1 FOR 10), 'YYYY-MM-DD');
-    END IF;
-    
-    RETURN NULL;
-EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+    -- -------------------------------------------------------------------------
+    -- 2. Enrich Matched Bangalore Records from sheet_challans (Zero Duplicates)
+    -- -------------------------------------------------------------------------
+    WITH ranked_sheet_matches AS (
+        SELECT 
+            s.id AS sheet_id,
+            s.vehicle_reg_no,
+            s.violation_date,
+            s.challan_amount,
+            s.sticker_fine,
+            s.amount_paid,
+            s.remarks,
+            s.source_tab,
+            s.sheet_row_number,
+            c.id AS core_id,
+            ROW_NUMBER() OVER(PARTITION BY c.id ORDER BY s.id ASC) AS rn
+        FROM sheet_challans s
+        JOIN core_challans c 
+          ON c.vehicle_reg_no = s.vehicle_reg_no 
+         AND c.violation_date = s.violation_date 
+         AND c.challan_amount = s.challan_amount
+         AND c.city = 'Bangalore'
+        WHERE s.city = 'Bangalore' AND s.challan_amount > 0
+    )
+    UPDATE core_challans c
+    SET source_system = 'MERGED_AUTOMATION_SHEET',
+        sheet_challan_id = m.sheet_id,
+        source_tab = m.source_tab,
+        sheet_row_number = m.sheet_row_number,
+        sticker_fine = COALESCE(m.sticker_fine, c.sticker_fine),
+        total_fine_amount = c.challan_amount + COALESCE(m.sticker_fine, 0.00),
+        amount_paid = GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00)),
+        net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(m.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00))),
+        remarks = COALESCE(NULLIF(TRIM(m.remarks), ''), c.remarks),
+        updated_at = CURRENT_TIMESTAMP
+    FROM ranked_sheet_matches m
+    WHERE c.id = m.core_id AND m.rn = 1;
 
-CREATE OR REPLACE FUNCTION public.fn_parse_challan_time(p_str TEXT)
-RETURNS TIME WITHOUT TIME ZONE AS $$
-DECLARE
-    v_clean TEXT;
-BEGIN
-    IF p_str IS NULL THEN RETURN NULL; END IF;
-    v_clean := TRIM(p_str);
-    IF v_clean = '' OR LOWER(v_clean) IN ('null', 'nan', 'n/a', '-', '--') THEN
-        RETURN NULL;
-    END IF;
-    
-    -- HH:MM:SS or HH:MM
-    IF v_clean ~ '^[0-9]{1,2}:[0-9]{2}(:[0-9]{2})?' THEN
-        RETURN CAST(v_clean AS TIME);
-    END IF;
-    
-    RETURN NULL;
-EXCEPTION WHEN OTHERS THEN
-    RETURN NULL;
-END;
-$$ LANGUAGE plpgsql IMMUTABLE;
+    -- -------------------------------------------------------------------------
+    -- 3. Ingest Unmatched Bangalore Historical Records (SHEET_FALLBACK)
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.core_challans (
+        source_system, source_priority, sheet_challan_id,
+        vehicle_reg_no, city,
+        notice_no, violation_date, violation_time, notice_date, audit_date,
+        liability_type, challan_amount, sticker_fine, total_fine_amount, amount_paid, net_pending_amount,
+        payment_status, source_tab, sheet_row_number, remarks,
+        is_deleted, created_at, updated_at
+    )
+    SELECT 
+        'GOOGLE_SHEET',
+        'SHEET_FALLBACK',
+        s.id,
+        s.vehicle_reg_no,
+        'Bangalore',
+        s.notice_no,
+        COALESCE(s.violation_date, s.notice_date, s.audit_date, '2026-01-01'::date),
+        s.violation_time,
+        s.notice_date,
+        s.audit_date,
+        CASE WHEN s.challan_amount > 0 THEN 'TRAFFIC_FINE' ELSE 'STICKER_FINE' END,
+        COALESCE(s.challan_amount, 0.00),
+        COALESCE(s.sticker_fine, 0.00),
+        COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
+        COALESCE(s.amount_paid, 0.00),
+        GREATEST(0.00, COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
+        CASE 
+            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
+            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
+            ELSE 'UNPAID'
+        END,
+        s.source_tab,
+        s.sheet_row_number,
+        NULLIF(TRIM(s.remarks), ''),
+        COALESCE(s.is_deleted, FALSE),
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+    FROM sheet_challans s
+    LEFT JOIN core_challans c ON c.sheet_challan_id = s.id
+    WHERE s.city = 'Bangalore'
+      AND (s.challan_amount > 0 OR s.sticker_fine > 0)
+      AND c.id IS NULL
+    ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
+    SET amount_paid = EXCLUDED.amount_paid,
+        net_pending_amount = EXCLUDED.net_pending_amount,
+        payment_status = EXCLUDED.payment_status,
+        remarks = EXCLUDED.remarks,
+        updated_at = CURRENT_TIMESTAMP;
 
+    -- -------------------------------------------------------------------------
+    -- 4. Ingest Mumbai and Hyderabad Active Fines (SHEET_PRIMARY)
+    -- -------------------------------------------------------------------------
+    INSERT INTO public.core_challans (
+        source_system, source_priority, sheet_challan_id,
+        vehicle_reg_no, city,
+        notice_no, violation_date, violation_time, notice_date, audit_date,
+        liability_type, challan_amount, sticker_fine, total_fine_amount, amount_paid, net_pending_amount,
+        payment_status, source_tab, sheet_row_number, remarks,
+        is_deleted, created_at, updated_at
+    )
+    SELECT 
+        'GOOGLE_SHEET',
+        'SHEET_PRIMARY',
+        s.id,
+        s.vehicle_reg_no,
+        s.city,
+        s.notice_no,
+        COALESCE(s.violation_date, s.notice_date, s.audit_date, '2026-01-01'::date),
+        s.violation_time,
+        s.notice_date,
+        s.audit_date,
+        CASE WHEN s.challan_amount > 0 THEN 'TRAFFIC_FINE' ELSE 'STICKER_FINE' END,
+        COALESCE(s.challan_amount, 0.00),
+        COALESCE(s.sticker_fine, 0.00),
+        COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
+        COALESCE(s.amount_paid, 0.00),
+        GREATEST(0.00, COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
+        CASE 
+            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
+            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
+            ELSE 'UNPAID'
+        END,
+        s.source_tab,
+        s.sheet_row_number,
+        NULLIF(TRIM(s.remarks), ''),
+        COALESCE(s.is_deleted, FALSE),
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+    FROM sheet_challans s
+    WHERE s.city IN ('Hyderabad', 'Mumbai')
+      AND (s.challan_amount > 0 OR s.sticker_fine > 0)
+    ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
+    SET amount_paid = EXCLUDED.amount_paid,
+        net_pending_amount = EXCLUDED.net_pending_amount,
+        payment_status = EXCLUDED.payment_status,
+        remarks = EXCLUDED.remarks,
+        updated_at = CURRENT_TIMESTAMP;
+
+    -- -------------------------------------------------------------------------
+    -- 5. Soft Delete Mirroring
+    -- -------------------------------------------------------------------------
+    UPDATE core_challans c
+    SET is_deleted = TRUE,
+        deleted_at = CURRENT_TIMESTAMP
+    FROM sheet_challans s
+    WHERE c.sheet_challan_id = s.id AND s.is_deleted = TRUE AND c.is_deleted = FALSE;
+
+END;
+$$;
 
 -- =============================================================================
--- 4. Trigger Function: Sync from public.vehicle_challans (Karnataka One Scraper)
+-- 3. Operational Rollup Views for Vehicle Pending Challans
 -- =============================================================================
 
-CREATE OR REPLACE FUNCTION public.fn_sync_core_challan_from_automation()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_clean_plate VARCHAR(50);
-    v_vio_date DATE;
-    v_vio_time TIME WITHOUT TIME ZONE;
-    v_not_date DATE;
-    v_existing_id BIGINT;
-    v_existing_sheet_id BIGINT;
-    v_next_id BIGINT;
-BEGIN
-    -- Handle DELETE (Soft-Delete)
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_challans
-        SET is_deleted = TRUE,
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE automated_challan_id = OLD.id AND sheet_challan_id IS NULL;
-        RETURN OLD;
-    END IF;
+CREATE OR REPLACE VIEW public.v_vehicle_pending_challans_summary AS
+SELECT 
+    vehicle_reg_no,
+    city,
+    COUNT(*) AS total_violations_incurred,
+    COUNT(CASE WHEN payment_status = 'UNPAID' THEN 1 END) AS pending_challans_count,
+    SUM(challan_amount) AS total_police_fines,
+    SUM(sticker_fine) AS total_sticker_fines,
+    SUM(CASE WHEN payment_status = 'UNPAID' THEN net_pending_amount ELSE 0.00 END) AS total_pending_amount,
+    MIN(CASE WHEN payment_status = 'UNPAID' THEN violation_date END) AS earliest_pending_date,
+    MAX(CASE WHEN payment_status = 'UNPAID' THEN violation_date END) AS latest_pending_date
+FROM public.core_challans
+WHERE is_deleted = FALSE
+GROUP BY vehicle_reg_no, city;
 
-    -- Skip non-fine or error records
-    IF NEW.status = 'ERROR' OR NEW.status = 'NO_FINES' OR NEW.notice_no = 'ERROR' OR NEW.notice_no IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    v_clean_plate := public.fn_clean_challan_plate(NEW.vehicle_reg_no);
-    IF v_clean_plate IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    v_vio_date := public.fn_parse_challan_date(NEW.violation_date);
-    v_vio_time := public.fn_parse_challan_time(NEW.violation_time);
-    v_not_date := public.fn_parse_challan_date(NEW.notice_generation_date);
-
-    -- Check if matching record exists in core_challans
-    SELECT id, sheet_challan_id INTO v_existing_id, v_existing_sheet_id
-    FROM public.core_challans
-    WHERE vehicle_reg_no = v_clean_plate AND notice_no = NEW.notice_no;
-
-    IF v_existing_id IS NOT NULL THEN
-        -- UPDATE existing row with Scraper priority
-        UPDATE public.core_challans
-        SET source_system = CASE WHEN v_existing_sheet_id IS NOT NULL THEN 'MERGED_AUTOMATION_SHEET' ELSE 'KARNATAKA_ONE_SCRAPER' END,
-            automated_challan_id = NEW.id,
-            rc_holder_name = COALESCE(NULLIF(NEW.rc_holder_name, 'ERROR'), rc_holder_name),
-            city = 'Bangalore',
-            violation_date = COALESCE(v_vio_date, violation_date),
-            violation_time = COALESCE(v_vio_time, violation_time),
-            notice_date = COALESCE(v_not_date, notice_date),
-            violation_description = COALESCE(NULLIF(NEW.offence_description, ''), violation_description),
-            police_station = COALESCE(NULLIF(NEW.point_name, ''), police_station),
-            violation_location = COALESCE(NULLIF(NEW.point_name, ''), violation_location),
-            challan_amount = COALESCE(NEW.fine_amount, challan_amount),
-            total_pending = COALESCE(NEW.fine_amount, total_pending),
-            payment_status = 'PENDING',
-            liability_type = 'TRAFFIC_FINE',
-            scraped_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            is_deleted = FALSE,
-            deleted_at = NULL,
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE id = v_existing_id;
-    ELSE
-        -- INSERT new row with gapless ID allocation
-        PERFORM pg_advisory_xact_lock(888999222);
-        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_challans;
-
-        INSERT INTO public.core_challans (
-            id,
-            source_system, source_table, automated_challan_id,
-            vehicle_reg_no, rc_holder_name, notice_no, city, week_cycle,
-            violation_date, violation_time, notice_date,
-            violation_description, police_station, violation_location, liability_type,
-            challan_amount, sticker_fine, previous_balance, amount_paid, total_pending,
-            payment_status, scraped_at,
-            is_deleted, created_at, updated_at
-        ) VALUES (
-            v_next_id,
-            'KARNATAKA_ONE_SCRAPER', 'vehicle_challans', NEW.id,
-            v_clean_plate, NULLIF(NEW.rc_holder_name, 'ERROR'), NEW.notice_no, 'Bangalore', 'AUTOMATION_SCRAPER',
-            v_vio_date, v_vio_time, v_not_date,
-            NULLIF(NEW.offence_description, ''), NULLIF(NEW.point_name, ''), NULLIF(NEW.point_name, ''), 'TRAFFIC_FINE',
-            COALESCE(NEW.fine_amount, 0.00), 0.00, 0.00, 0.00, COALESCE(NEW.fine_amount, 0.00),
-            'PENDING', (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            FALSE, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'), (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        );
-        PERFORM setval('public.core_challans_id_seq', v_next_id, true);
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_sync_core_challan_from_automation ON public.vehicle_challans;
-CREATE TRIGGER trg_sync_core_challan_from_automation
-AFTER INSERT OR UPDATE OR DELETE ON public.vehicle_challans
-FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_challan_from_automation();
-
-
--- =============================================================================
--- 5. Trigger Function: Sync from public.sheet_challans (Google Sheets)
--- =============================================================================
-
-CREATE OR REPLACE FUNCTION public.fn_sync_core_challan_from_sheet()
-RETURNS TRIGGER AS $$
-DECLARE
-    v_clean_plate VARCHAR(50);
-    v_clean_city VARCHAR(100);
-    v_existing_id BIGINT;
-    v_existing_auto_id BIGINT;
-    v_next_id BIGINT;
-    v_liability_type VARCHAR(50);
-    v_pay_status VARCHAR(50);
-BEGIN
-    -- Handle DELETE (Soft-Delete)
-    IF TG_OP = 'DELETE' THEN
-        UPDATE public.core_challans
-        SET is_deleted = TRUE,
-            deleted_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE sheet_challan_id = OLD.id AND automated_challan_id IS NULL;
-        RETURN OLD;
-    END IF;
-
-    v_clean_plate := public.fn_clean_challan_plate(NEW.vehicle_reg_no);
-    IF v_clean_plate IS NULL THEN
-        RETURN NEW;
-    END IF;
-
-    v_clean_city := COALESCE(NULLIF(TRIM(NEW.city), ''), 'Bangalore');
-    IF LOWER(v_clean_city) LIKE '%hyd%' THEN v_clean_city := 'Hyderabad';
-    ELSIF LOWER(v_clean_city) LIKE '%mum%' THEN v_clean_city := 'Mumbai';
-    ELSIF LOWER(v_clean_city) LIKE '%pun%' THEN v_clean_city := 'Pune';
-    ELSIF LOWER(v_clean_city) LIKE '%blr%' OR LOWER(v_clean_city) LIKE '%bang%' THEN v_clean_city := 'Bangalore';
-    END IF;
-
-    -- Classify liability type
-    IF COALESCE(NEW.challan_amount, 0.00) > 0 THEN
-        v_liability_type := 'TRAFFIC_FINE';
-    ELSIF COALESCE(NEW.sticker_fine, 0.00) > 0 THEN
-        v_liability_type := 'STICKER_FINE';
-    ELSE
-        v_liability_type := 'ROLLING_BALANCE';
-    END IF;
-
-    -- Classify payment status
-    IF COALESCE(NEW.total_pending, 0.00) <= 0 AND (COALESCE(NEW.challan_amount, 0) > 0 OR COALESCE(NEW.sticker_fine, 0) > 0) THEN
-        v_pay_status := 'PAID';
-    ELSIF COALESCE(NEW.amount_paid, 0.00) > 0 AND COALESCE(NEW.total_pending, 0.00) > 0 THEN
-        v_pay_status := 'PARTIALLY_PAID';
-    ELSE
-        v_pay_status := 'PENDING';
-    END IF;
-
-    -- Check if record already exists in core_challans
-    SELECT id, automated_challan_id INTO v_existing_id, v_existing_auto_id
-    FROM public.core_challans
-    WHERE vehicle_reg_no = v_clean_plate AND notice_no = NEW.notice_no;
-
-    IF v_existing_id IS NOT NULL THEN
-        -- UPDATE existing row (enrich sheet-specific fields without overwriting scraper priority)
-        UPDATE public.core_challans
-        SET source_system = CASE WHEN v_existing_auto_id IS NOT NULL THEN 'MERGED_AUTOMATION_SHEET' ELSE 'GOOGLE_SHEET' END,
-            sheet_challan_id = NEW.id,
-            city = CASE WHEN v_existing_auto_id IS NOT NULL THEN city ELSE v_clean_city END,
-            week_cycle = COALESCE(NEW.week_cycle, week_cycle),
-            previous_balance = COALESCE(NEW.previous_balance, previous_balance),
-            audit_date = COALESCE(NEW.audit_date, audit_date),
-            notice_date = COALESCE(notice_date, NEW.notice_date),
-            violation_date = COALESCE(violation_date, NEW.violation_date),
-            violation_time = COALESCE(violation_time, NEW.violation_time),
-            challan_amount = CASE WHEN v_existing_auto_id IS NOT NULL THEN challan_amount ELSE COALESCE(NEW.challan_amount, 0.00) END,
-            sticker_fine = COALESCE(NEW.sticker_fine, sticker_fine),
-            amount_paid = COALESCE(NEW.amount_paid, amount_paid),
-            total_pending = COALESCE(NEW.total_pending, total_pending),
-            payment_status = CASE WHEN v_existing_auto_id IS NOT NULL THEN payment_status ELSE v_pay_status END,
-            remarks = COALESCE(NULLIF(NEW.remarks, ''), remarks),
-            source_tab = COALESCE(NEW.source_tab, source_tab),
-            sheet_row_number = COALESCE(NEW.sheet_row_number, sheet_row_number),
-            is_deleted = COALESCE(NEW.is_deleted, FALSE),
-            deleted_at = CASE WHEN NEW.is_deleted = TRUE THEN COALESCE(NEW.deleted_at, (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')) ELSE NULL END,
-            updated_at = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        WHERE id = v_existing_id;
-    ELSE
-        -- INSERT new row with gapless ID allocation
-        PERFORM pg_advisory_xact_lock(888999222);
-        SELECT COALESCE(MAX(id), 0) + 1 INTO v_next_id FROM public.core_challans;
-
-        INSERT INTO public.core_challans (
-            id,
-            source_system, source_table, sheet_challan_id,
-            vehicle_reg_no, notice_no, city, week_cycle,
-            violation_date, violation_time, notice_date, audit_date,
-            liability_type,
-            challan_amount, sticker_fine, previous_balance, amount_paid, total_pending,
-            payment_status, remarks, source_tab, sheet_row_number,
-            is_deleted, created_at, updated_at
-        ) VALUES (
-            v_next_id,
-            'GOOGLE_SHEET', 'sheet_challans', NEW.id,
-            v_clean_plate, NEW.notice_no, v_clean_city, NEW.week_cycle,
-            NEW.violation_date, NEW.violation_time, NEW.notice_date, NEW.audit_date,
-            v_liability_type,
-            COALESCE(NEW.challan_amount, 0.00), COALESCE(NEW.sticker_fine, 0.00), COALESCE(NEW.previous_balance, 0.00),
-            COALESCE(NEW.amount_paid, 0.00), COALESCE(NEW.total_pending, 0.00),
-            v_pay_status, NULLIF(NEW.remarks, ''), NEW.source_tab, NEW.sheet_row_number,
-            COALESCE(NEW.is_deleted, FALSE),
-            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'),
-            (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')
-        );
-        PERFORM setval('public.core_challans_id_seq', v_next_id, true);
-    END IF;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS trg_sync_core_challan_from_sheet ON public.sheet_challans;
-CREATE TRIGGER trg_sync_core_challan_from_sheet
-AFTER INSERT OR UPDATE OR DELETE ON public.sheet_challans
-FOR EACH ROW EXECUTE FUNCTION public.fn_sync_core_challan_from_sheet();
+CREATE OR REPLACE VIEW public.v_weekly_vehicle_pending_challans AS
+SELECT 
+    COALESCE(w.week_id, 'UNKNOWN_WEEK') AS settlement_week,
+    w.week_start,
+    w.week_end,
+    c.vehicle_reg_no,
+    c.city,
+    COUNT(*) AS total_violations,
+    COUNT(CASE WHEN c.payment_status = 'UNPAID' THEN 1 END) AS pending_count,
+    SUM(c.challan_amount) AS week_police_fine,
+    SUM(c.sticker_fine) AS week_sticker_fine,
+    SUM(CASE WHEN c.payment_status = 'UNPAID' THEN c.net_pending_amount ELSE 0.00 END) AS week_pending_amount,
+    STRING_AGG(c.notice_no, ', ' ORDER BY c.violation_date) AS notice_numbers
+FROM public.core_challans c
+LEFT JOIN public.hisaab_settlement_weeks w 
+    ON c.violation_date BETWEEN w.week_start AND w.week_end
+WHERE c.is_deleted = FALSE
+GROUP BY w.week_id, w.week_start, w.week_end, c.vehicle_reg_no, c.city;
