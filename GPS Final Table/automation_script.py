@@ -115,18 +115,28 @@ def run_health_check():
         print(f"   - Flagged Assets      : {alert_veh:,}")
         print(f"   - Alert Distance      : {alert_km:,.2f} km")
         
-        # 7. Active Trigger Check
+        # 7. pg_cron Scheduled Ingestion & Decoupled Architecture Check
         cur.execute("""
-            SELECT trigger_name, event_manipulation, event_object_table, action_statement
-            FROM information_schema.triggers
-            WHERE event_object_table = 'sheet_gps_telematics'
-              AND trigger_name = 'trg_sync_core_gps_from_telematics';
+            SELECT jobid, jobname, schedule, command, active
+            FROM cron.job
+            WHERE jobname LIKE '%gps%';
         """)
-        trig = cur.fetchone()
-        if trig:
-            print(f"\n7. Real-time Trigger Status: ACTIVE ({trig[0]} on {trig[2]})")
+        cron_jobs = cur.fetchall()
+        print(f"\n7. Decoupled pg_cron Pipeline Status: {len(cron_jobs)} Jobs Configured")
+        for jid, jname, jsch, jcmd, jact in cron_jobs:
+            status_text = "ACTIVE" if jact else "INACTIVE"
+            print(f"   - [{status_text}] Job {jid} ({jname}): Schedule '{jsch}' -> {jcmd}")
+            
+        cur.execute("""
+            SELECT proname 
+            FROM pg_proc 
+            WHERE proname = 'sp_sync_core_gps';
+        """)
+        proc = cur.fetchone()
+        if proc:
+            print(f"   - Stored Procedure   : public.sp_sync_core_gps verified.")
         else:
-            print(f"\n7. Real-time Trigger Status: NOT FOUND")
+            print(f"   - Stored Procedure   : WARNING: sp_sync_core_gps NOT FOUND.")
             
         conn.close()
         print("=" * 70)

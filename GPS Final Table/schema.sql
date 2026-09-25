@@ -72,69 +72,46 @@ BEGIN
 END;
 $func$ LANGUAGE plpgsql STABLE;
 
--- 4. Real-time Ingestion Synchronization Trigger Function
-CREATE OR REPLACE FUNCTION fn_sync_core_gps_from_telematics()
-RETURNS TRIGGER AS $func$
+-- 4. Batch Ingestion Synchronization Procedure (Decoupled pg_cron Architecture)
+CREATE OR REPLACE PROCEDURE public.sp_sync_core_gps(p_days_back INT DEFAULT 3)
+LANGUAGE plpgsql
+AS $proc$
 DECLARE
-    v_clean_vehicle VARCHAR(20);
-    v_city VARCHAR(20);
-    v_partner_id VARCHAR(50);
-    v_partner_name VARCHAR(150);
-    v_partner_phone VARCHAR(20);
-    v_final_status VARCHAR(30) := 'RFD';
-    v_cohort VARCHAR(20) := 'In Yard';
-    v_is_alert BOOLEAN := FALSE;
+    v_rows_affected INT := 0;
 BEGIN
-    -- Clean and resolve vehicle plate or chassis number
-    v_clean_vehicle := fn_clean_gps_vehicle_number(NEW.vehicle_id);
-    
-    IF v_clean_vehicle IS NULL OR v_clean_vehicle = '' THEN
-        RETURN NEW;
-    END IF;
-
-    -- Lookup operational context from core_daily_vehicle_status
-    SELECT 
-        dvs.city,
-        dvs.partner_id,
-        dvs.partner_name,
-        dvs.partner_phone,
-        dvs.final_status,
-        dvs.cohort
-    INTO 
-        v_city,
-        v_partner_id,
-        v_partner_name,
-        v_partner_phone,
-        v_final_status,
-        v_cohort
-    FROM core_daily_vehicle_status dvs
-    WHERE dvs.status_date = NEW.record_date 
-      AND dvs.vehicle_number = v_clean_vehicle
-    LIMIT 1;
-
-    -- Fallback to core_vehicle_onboarding for city if unassigned
-    IF v_city IS NULL THEN
-        SELECT cvo.city INTO v_city
-        FROM core_vehicle_onboarding cvo
-        WHERE cvo.registration_no = v_clean_vehicle
-        LIMIT 1;
-        
-        IF v_city IS NULL THEN
-            v_city := 'Bangalore';
-        END IF;
-    END IF;
-
-    IF v_final_status IS NULL THEN
-        v_final_status := 'RFD';
-        v_cohort := 'In Yard';
-    END IF;
-
-    -- Flag idle movement alert (> 5km movement while in yard or maintenance)
-    IF v_final_status IN ('RFD', 'Maintenance', 'Workshop', 'Accidental', 'BD') AND COALESCE(NEW.distance_km, 0) > 5.0 THEN
-        v_is_alert := TRUE;
-    END IF;
-
-    -- Upsert into core_gps with idempotency
+    WITH cleaned_telematics AS (
+        SELECT
+            s.record_date,
+            fn_clean_gps_vehicle_number(s.vehicle_id) AS vehicle_number,
+            MAX(COALESCE(s.distance_km, 0.00)) AS distance_km,
+            MAX(s.vehicle_id) AS raw_vehicle_id
+        FROM public.sheet_gps_telematics s
+        WHERE (p_days_back IS NULL OR s.record_date >= CURRENT_DATE - (p_days_back || ' days')::INTERVAL)
+        GROUP BY s.record_date, fn_clean_gps_vehicle_number(s.vehicle_id)
+        HAVING fn_clean_gps_vehicle_number(s.vehicle_id) IS NOT NULL 
+           AND fn_clean_gps_vehicle_number(s.vehicle_id) != ''
+    ),
+    enriched AS (
+        SELECT
+            ct.record_date,
+            ct.vehicle_number,
+            ct.distance_km,
+            COALESCE(dvs.city, cvo.city, 'Bangalore') AS city,
+            dvs.partner_id,
+            dvs.partner_name,
+            dvs.partner_phone AS driver_phone,
+            COALESCE(dvs.final_status, 'RFD') AS vehicle_status,
+            COALESCE(dvs.cohort, 'In Yard') AS cohort,
+            'INTELLICAR'::VARCHAR(50) AS source_provider,
+            ct.raw_vehicle_id,
+            (COALESCE(dvs.final_status, 'RFD') IN ('RFD', 'Maintenance', 'Workshop', 'Accidental', 'BD') 
+             AND ct.distance_km > 5.0) AS is_idle_movement_alert
+        FROM cleaned_telematics ct
+        LEFT JOIN public.core_daily_vehicle_status dvs 
+            ON dvs.status_date = ct.record_date AND dvs.vehicle_number = ct.vehicle_number
+        LEFT JOIN public.core_vehicle_onboarding cvo 
+            ON cvo.registration_no = ct.vehicle_number
+    )
     INSERT INTO public.core_gps (
         record_date,
         vehicle_number,
@@ -150,22 +127,23 @@ BEGIN
         is_idle_movement_alert,
         created_at,
         updated_at
-    ) VALUES (
-        NEW.record_date,
-        v_clean_vehicle,
-        COALESCE(NEW.distance_km, 0.00),
-        v_city,
-        v_partner_id,
-        v_partner_name,
-        v_partner_phone,
-        v_final_status,
-        v_cohort,
-        'INTELLICAR',
-        NEW.vehicle_id,
-        v_is_alert,
+    )
+    SELECT
+        e.record_date,
+        e.vehicle_number,
+        e.distance_km,
+        e.city,
+        e.partner_id,
+        e.partner_name,
+        e.driver_phone,
+        e.vehicle_status,
+        e.cohort,
+        e.source_provider,
+        e.raw_vehicle_id,
+        e.is_idle_movement_alert,
         CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata',
         CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata'
-    )
+    FROM enriched e
     ON CONFLICT (record_date, vehicle_number)
     DO UPDATE SET
         distance_km = GREATEST(core_gps.distance_km, EXCLUDED.distance_km),
@@ -175,20 +153,36 @@ BEGIN
         driver_phone = COALESCE(EXCLUDED.driver_phone, core_gps.driver_phone),
         vehicle_status = COALESCE(EXCLUDED.vehicle_status, core_gps.vehicle_status),
         cohort = COALESCE(EXCLUDED.cohort, core_gps.cohort),
-        is_idle_movement_alert = (COALESCE(EXCLUDED.vehicle_status, core_gps.vehicle_status) IN ('RFD', 'Maintenance', 'Workshop', 'Accidental', 'BD') AND GREATEST(core_gps.distance_km, EXCLUDED.distance_km) > 5.0),
+        is_idle_movement_alert = (
+            COALESCE(EXCLUDED.vehicle_status, core_gps.vehicle_status) IN ('RFD', 'Maintenance', 'Workshop', 'Accidental', 'BD') 
+            AND GREATEST(core_gps.distance_km, EXCLUDED.distance_km) > 5.0
+        ),
         updated_at = CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata';
 
-    RETURN NEW;
+    GET DIAGNOSTICS v_rows_affected = ROW_COUNT;
+    RAISE NOTICE 'sp_sync_core_gps: Synced % rows into core_gps (Lookback: % days)', v_rows_affected, p_days_back;
 END;
-$func$ LANGUAGE plpgsql;
+$proc$ LANGUAGE plpgsql;
 
--- 5. Trigger Installation
+-- 5. Safe Trigger Detachment (Prevents Ingestion Transaction Rollbacks)
 DROP TRIGGER IF EXISTS trg_sync_core_gps_from_telematics ON public.sheet_gps_telematics;
-CREATE TRIGGER trg_sync_core_gps_from_telematics
-AFTER INSERT OR UPDATE ON public.sheet_gps_telematics
-FOR EACH ROW EXECUTE FUNCTION fn_sync_core_gps_from_telematics();
 
--- 6. Operational Verification Queries
+-- 6. pg_cron Scheduling Setup
+-- Run every hour at minute 25 (catches post-API runs and midday updates)
+SELECT cron.schedule(
+    'sync-core-gps-hourly',
+    '25 * * * *',
+    'CALL public.sp_sync_core_gps(3);'
+);
+
+-- Morning Deep Sync (7-day lookback) at 08:30 AM IST (03:00 AM UTC)
+SELECT cron.schedule(
+    'sync-core-gps-morning-deep',
+    '0 3 * * *',
+    'CALL public.sp_sync_core_gps(7);'
+);
+
+-- 7. Operational Verification Queries
 -- Verify sequence continuity
 SELECT MIN(id), MAX(id), COUNT(*), (SELECT last_value FROM pg_sequences WHERE sequencename = 'core_gps_id_seq') AS seq_last_val FROM public.core_gps;
 
@@ -197,3 +191,6 @@ SELECT city, COUNT(DISTINCT vehicle_number) AS active_vehicles, SUM(distance_km)
 
 -- Verify idle movement alerts
 SELECT record_date, vehicle_number, city, vehicle_status, distance_km, raw_vehicle_id FROM public.core_gps WHERE is_idle_movement_alert = TRUE ORDER BY record_date DESC, distance_km DESC LIMIT 20;
+
+-- Verify pg_cron job status
+SELECT jobid, jobname, schedule, command, active FROM cron.job WHERE jobname LIKE '%gps%';
