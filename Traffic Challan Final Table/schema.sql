@@ -141,7 +141,51 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 2. Enrich Matched Bangalore Records from sheet_challans (Zero Duplicates)
+    -- 2. Retroactive Scraper Match: Merge and Remove any Prior SHEET_FALLBACK
+    --    (Guarantees zero duplicates if a fine was entered in Sheet before scraper ran)
+    -- -------------------------------------------------------------------------
+    WITH duplicate_fallbacks AS (
+        SELECT 
+            c_sheet.id AS sheet_core_id,
+            c_sheet.sheet_challan_id,
+            c_sheet.source_tab,
+            c_sheet.sheet_row_number,
+            c_sheet.sticker_fine,
+            c_sheet.amount_paid,
+            c_sheet.remarks,
+            c_scraper.id AS scraper_core_id,
+            ROW_NUMBER() OVER (PARTITION BY c_sheet.id ORDER BY c_scraper.id ASC) AS rn
+        FROM core_challans c_sheet
+        JOIN core_challans c_scraper 
+          ON c_sheet.vehicle_reg_no = c_scraper.vehicle_reg_no
+         AND c_sheet.violation_date = c_scraper.violation_date
+         AND c_sheet.challan_amount = c_scraper.challan_amount
+         AND c_sheet.city = 'Bangalore'
+         AND c_scraper.city = 'Bangalore'
+        WHERE c_sheet.source_priority = 'SHEET_FALLBACK'
+          AND c_scraper.source_priority = 'SCRAPER_PRIMARY'
+          AND c_sheet.id <> c_scraper.id
+    )
+    , updated_scraper AS (
+        UPDATE core_challans c
+        SET source_system = 'MERGED_AUTOMATION_SHEET',
+            sheet_challan_id = d.sheet_challan_id,
+            source_tab = d.source_tab,
+            sheet_row_number = d.sheet_row_number,
+            sticker_fine = COALESCE(d.sticker_fine, c.sticker_fine),
+            total_fine_amount = c.challan_amount + COALESCE(d.sticker_fine, 0.00),
+            amount_paid = GREATEST(c.amount_paid, COALESCE(d.amount_paid, 0.00)),
+            net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(d.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(d.amount_paid, 0.00))),
+            remarks = COALESCE(d.remarks, c.remarks),
+            updated_at = CURRENT_TIMESTAMP
+        FROM duplicate_fallbacks d
+        WHERE c.id = d.scraper_core_id AND d.rn = 1
+    )
+    DELETE FROM core_challans
+    WHERE id IN (SELECT sheet_core_id FROM duplicate_fallbacks);
+
+    -- -------------------------------------------------------------------------
+    -- 3. Enrich Matched Bangalore Records from sheet_challans (Zero Duplicates)
     -- -------------------------------------------------------------------------
     WITH ranked_sheet_matches AS (
         SELECT 
@@ -173,13 +217,44 @@ BEGIN
         total_fine_amount = c.challan_amount + COALESCE(m.sticker_fine, 0.00),
         amount_paid = GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00)),
         net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(m.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00))),
+        payment_status = CASE 
+            WHEN c.payment_status = 'PAID' THEN 'PAID'
+            WHEN GREATEST(0.00, c.challan_amount + COALESCE(m.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00))) <= 0 THEN 'PAID'
+            WHEN GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00)) > 0 THEN 'PARTIALLY_PAID'
+            ELSE 'UNPAID'
+        END,
         remarks = COALESCE(NULLIF(TRIM(m.remarks), ''), c.remarks),
         updated_at = CURRENT_TIMESTAMP
     FROM ranked_sheet_matches m
     WHERE c.id = m.core_id AND m.rn = 1;
 
     -- -------------------------------------------------------------------------
-    -- 3. Ingest Unmatched Bangalore Historical Records (SHEET_FALLBACK)
+    -- 4. Update Existing Bangalore SHEET_FALLBACK Records on Sheet Changes
+    -- -------------------------------------------------------------------------
+    UPDATE core_challans c
+    SET amount_paid = COALESCE(s.amount_paid, 0.00),
+        sticker_fine = COALESCE(s.sticker_fine, 0.00),
+        total_fine_amount = c.challan_amount + COALESCE(s.sticker_fine, 0.00),
+        net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
+        payment_status = CASE 
+            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
+            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
+            ELSE 'UNPAID'
+        END,
+        remarks = COALESCE(NULLIF(TRIM(s.remarks), ''), c.remarks),
+        updated_at = CURRENT_TIMESTAMP
+    FROM sheet_challans s
+    WHERE c.sheet_challan_id = s.id 
+      AND c.source_priority = 'SHEET_FALLBACK'
+      AND c.city = 'Bangalore'
+      AND (
+          c.amount_paid IS DISTINCT FROM COALESCE(s.amount_paid, 0.00) OR
+          c.sticker_fine IS DISTINCT FROM COALESCE(s.sticker_fine, 0.00) OR
+          c.remarks IS DISTINCT FROM NULLIF(TRIM(s.remarks), '')
+      );
+
+    -- -------------------------------------------------------------------------
+    -- 5. Ingest New Unmatched Bangalore Historical Records (SHEET_FALLBACK)
     -- -------------------------------------------------------------------------
     INSERT INTO public.core_challans (
         source_system, source_priority, sheet_challan_id,
@@ -230,7 +305,7 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 4. Ingest Mumbai and Hyderabad Active Fines (SHEET_PRIMARY)
+    -- 6. Ingest / Update Mumbai and Hyderabad Active Fines (SHEET_PRIMARY)
     -- -------------------------------------------------------------------------
     INSERT INTO public.core_challans (
         source_system, source_priority, sheet_challan_id,
@@ -279,7 +354,7 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 5. Soft Delete Mirroring
+    -- 7. Soft Delete Mirroring
     -- -------------------------------------------------------------------------
     UPDATE core_challans c
     SET is_deleted = TRUE,
