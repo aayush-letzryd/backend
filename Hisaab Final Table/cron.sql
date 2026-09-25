@@ -3,6 +3,7 @@
 -- Database: PostgreSQL 14+ (requires pg_cron extension)
 -- Module: Automated Hisaab Synchronization
 -- Architecture: Decoupled Scheduled Batch Execution (Zero Table Locks)
+-- Cadence: Hourly Sync (Runs every hour at :45)
 -- ============================================================================
 
 -- Ensure pg_cron extension exists
@@ -36,13 +37,13 @@ SELECT cron.schedule(
 
 -- ----------------------------------------------------------------------------
 -- Schedule: hisaab-vehicle-weekly-sync
--- Runs every day at 03:00 AM UTC (08:30 AM IST).
--- This runs after rental-daily-calculation (02:00 AM UTC) and telemetry syncs.
--- Synchronizes all active/open settlement weeks automatically.
+-- Runs every hour at minute 45 (45 * * * *).
+-- Synchronizes active open settlement weeks with latest rent, Uber, Ola, and core_adjustments.
+-- Runs 15 minutes before the hourly app broadcast (0 * * * *).
 -- ----------------------------------------------------------------------------
 SELECT cron.schedule(
     'hisaab-vehicle-weekly-sync',
-    '0 3 * * *',
+    '45 * * * *',
     'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
 );
 
@@ -50,4 +51,3 @@ SELECT cron.schedule(
 SELECT jobid, schedule, command, nodename, active, jobname 
 FROM cron.job 
 WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync');
-

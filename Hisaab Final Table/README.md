@@ -9,15 +9,16 @@ The **LetzRyd Hisaab Engine** serves as the automated financial, operational, an
    - In accordance with production stability requirements, **all triggers attached to upstream core tables (`core_adjustments`, `core_challans`, `core_gps`, `core_ola_daily`, `core_ola_weekly`) have been permanently removed**.
    - Raw ingestion pipelines (Uber sync, Ola sync, vehicle status, adjustments) operate independently at full speed without database table locks or transaction cascades.
 2. **Automated Scheduled Batching via `pg_cron`**:
-   - The engine is driven by a scheduled PostgreSQL cron job (`hisaab-vehicle-weekly-sync`), executing daily at **03:00 AM UTC (08:30 AM IST)**.
-   - Runs immediately after the rental waterfall calculation (`rental-daily-calculation` at 02:00 AM UTC).
+   - The engine is driven by a scheduled PostgreSQL cron job (`hisaab-vehicle-weekly-sync`), executing hourly at **minute 45 (`45 * * * *`)**.
+   - Integrates newly approved adjustments from `core_adjustments` into all open settlement weeks 24 times a day without database table locks.
 3. **Strictly Scoped & Empirically Verified**:
-   - Focuses strictly on verified telemetry and core billing components:
+   - Focuses on verified telemetry, rental waterfall, and live adjustments:
      - **Onroad & Allotted Days** (with fractional day support, e.g. 6.5 days)
      - **Lease Rent** (Daily Rate, Base Rental, Indemnity Fee, Net Weekly Rent)
      - **Uber Telemetry & Revenue** (Trips, Earnings, Cash Collected, Toll, Driver Subscription, Incentive, Week O/S)
      - **Ola Telemetry & Revenue** (Trips, Revenue, Cash Collected, Toll, GST, Online Payouts, Incentive, Week O/S)
-   - Unverified items (**Current Week O/S, Adjustments, Challans, Accidents, TDS, Dead Miles, Partner Summary**) are explicitly excluded until upstream audits are finalized.
+     - **Core Adjustments (LIVE)**: Seamlessly integrates approved credits/debits from `public.core_adjustments` with full polarity support (+ Debit, - Credit).
+     - **Current Week O/S & Driver Payouts**: Real-time evaluation of `current_week_os`, `net_to_collect_from_driver`, and `net_payout_to_driver`.
 
 ---
 
@@ -71,7 +72,7 @@ $$\text{Ola Week O/S} = \text{Ola Net Revenue} - \text{Ola Cash Collection}$$
 ```sql
 SELECT cron.schedule(
     'hisaab-vehicle-weekly-sync',
-    '0 3 * * *',
+    '45 * * * *',
     'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
 );
 ```

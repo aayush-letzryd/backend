@@ -4,6 +4,7 @@
 -- ============================================================================
 
 -- 1. sp_sync_hisaab_vehicle_weekly (Sign-Resilient)
+-- 1. sp_sync_hisaab_vehicle_weekly (Integrated with core_adjustments)
 CREATE OR REPLACE PROCEDURE public.sp_sync_hisaab_vehicle_weekly(IN p_week_id character varying DEFAULT NULL::character varying)
  LANGUAGE plpgsql
 AS $procedure$
@@ -20,7 +21,7 @@ BEGIN
         ORDER BY week_start
     ) LOOP
         
-        RAISE NOTICE 'Processing Hisaab Vehicle Weekly sync for week: % (% to %)', v_week.week_id, v_week.week_start, v_week.week_end;
+        RAISE NOTICE 'Processing Hisaab Vehicle Weekly sync with core_adjustments for week: % (% to %)', v_week.week_id, v_week.week_start, v_week.week_end;
 
         SELECT COUNT(*) INTO v_uber_count FROM public.core_uber_weekly WHERE week_id = v_week.week_id;
         SELECT COUNT(*) INTO v_ola_count FROM public.core_ola_weekly WHERE week_id = v_week.week_id;
@@ -180,6 +181,41 @@ BEGIN
             WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
             GROUP BY d.vehicle_number, d.partner_id
         ),
+        adj_agg AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                c.partner_id,
+                -- Signed net adjustment: Credits are negative (reduce driver dues), Debits are positive (increase driver dues)
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_adj_signed
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
+            GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')), c.partner_id
+        ),
+        adj_veh_fallback AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_adj_signed
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
+            GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
+        ),
+        existing_hisaab AS (
+            SELECT 
+                vehicle_number,
+                partner_id,
+                COALESCE(challan_amount, 0.00) AS challan_amount,
+                COALESCE(accident_deduction, 0.00) AS accident_deduction,
+                COALESCE(tds_amount, 0.00) AS tds_amount,
+                COALESCE(gps_dead_mile_penalty, 0.00) AS gps_dead_mile_penalty
+            FROM public.hisaab_vehicle_weekly
+            WHERE week_id = v_week.week_id
+        ),
         partner_names AS (
             SELECT partner_id, driver_name FROM (
                 SELECT partner_id, driver_name, ROW_NUMBER() OVER(PARTITION BY partner_id ORDER BY created_at DESC NULLS LAST) rn
@@ -199,6 +235,7 @@ BEGIN
             daily_rent_applied, weekly_lease_rental, weekly_indemnity_fees, net_weekly_lease_rental,
             uber_trips, uber_total_earnings, uber_cash_collection, uber_toll, uber_driver_sub_charge, uber_incentive, uber_week_os,
             ola_trips, ola_net_revenue, ola_cash_collection, ola_toll, ola_gst, ola_online_payment, ola_incentive, ola_week_os,
+            adjustment_amount, challan_amount, current_week_os, net_to_collect_from_driver, net_payout_to_driver,
             settlement_status, created_at, updated_at
         )
         SELECT 
@@ -232,6 +269,39 @@ BEGIN
             COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 THEN o.ola_online_payment ELSE 0.00 END, 0.00),
             COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00),
             COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
+            -- Adjustment Amount (Signed: negative = credit/waiver, positive = debit/penalty)
+            COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00) AS adjustment_amount,
+            COALESCE(eh.challan_amount, 0.00) AS challan_amount,
+            -- Current Week O/S = Net Rent - (Uber O/S + Ola O/S) + Challans + Adjustments
+            (
+                r.net_weekly_lease_rental
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(eh.challan_amount, 0.00)
+                + COALESCE(eh.accident_deduction, 0.00)
+                + COALESCE(eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
+            ) AS current_week_os,
+            -- Net to collect from driver = max(0, current_week_os)
+            GREATEST(0.00, (
+                r.net_weekly_lease_rental
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(eh.challan_amount, 0.00)
+                + COALESCE(eh.accident_deduction, 0.00)
+                + COALESCE(eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
+            )) AS net_to_collect_from_driver,
+            -- Net payout to driver = max(0, -current_week_os)
+            GREATEST(0.00, -(
+                r.net_weekly_lease_rental
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(eh.challan_amount, 0.00)
+                + COALESCE(eh.accident_deduction, 0.00)
+                + COALESCE(eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
+            )) AS net_payout_to_driver,
             'CALCULATED',
             CURRENT_TIMESTAMP,
             CURRENT_TIMESTAMP
@@ -242,6 +312,9 @@ BEGIN
         LEFT JOIN ola_daily_partner_agg odpa ON r.vehicle_number = odpa.vehicle_number AND r.partner_id = odpa.partner_id
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
+        LEFT JOIN adj_agg adj ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = adj.vehicle_number AND r.partner_id = adj.partner_id
+        LEFT JOIN adj_veh_fallback afb ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = afb.vehicle_number
+        LEFT JOIN existing_hisaab eh ON r.vehicle_number = eh.vehicle_number AND r.partner_id = eh.partner_id
         ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
             partner_name = EXCLUDED.partner_name,
             city = EXCLUDED.city,
@@ -268,6 +341,11 @@ BEGIN
             ola_online_payment = EXCLUDED.ola_online_payment,
             ola_incentive = EXCLUDED.ola_incentive,
             ola_week_os = EXCLUDED.ola_week_os,
+            adjustment_amount = EXCLUDED.adjustment_amount,
+            challan_amount = COALESCE(public.hisaab_vehicle_weekly.challan_amount, EXCLUDED.challan_amount),
+            current_week_os = EXCLUDED.current_week_os,
+            net_to_collect_from_driver = EXCLUDED.net_to_collect_from_driver,
+            net_payout_to_driver = EXCLUDED.net_payout_to_driver,
             settlement_status = 'CALCULATED',
             updated_at = CURRENT_TIMESTAMP
         WHERE hisaab_vehicle_weekly.settlement_status <> 'LOCKED';
