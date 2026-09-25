@@ -4,98 +4,64 @@ This document details the architectural data issues, real-world anomalies, root 
 
 ---
 
-## 1. Historical 1-Day Date Shift & 14,761 Phantom Duplicate Batch
+## 1. Multiple Same-Day Adjustments & Prevention of Over-Merging
 
 ### Root Cause
-During early ingestion of the raw Google Sheet (`Adjustment-Form`), the Google Apps Script runtime used JavaScript V8 date parsing (`new Date().getUTCDate()`), which converted local Indian Standard Time (IST, UTC+05:30) timestamps into UTC. For dates at or around midnight, this shifted the adjustment date backward by exactly 1 calendar day (e.g. `2026-09-08` became `2026-09-07`).
-
-When the Apps Script parser bug was identified and fixed, the entire sheet was re-ingested with correct dates. However, the database trigger function `fn_sync_sheet_adjustments()` contained a deduplication condition:
-```sql
-WHERE adjustment_date = NEW.adjustment_date
-```
-Because the newly incoming records had the true date (`2026-09-08`) while existing rows had the shifted date (`2026-09-07`), the trigger failed to recognize them as existing records. Consequently, the trigger inserted a second copy of all 14,761 adjustments, generating `adjustment_id` values from `ADJ-SHT-14910` through `ADJ-SHT-29686`.
-
-Although `sheet_adjustments` was later purged down to its clean 14,909 rows, `core_adjustments` was never cleared, leaving 14,761 phantom duplicates lingering in production (inflating total rows to 29,679).
+In real operations, a single driver frequently has multiple genuine adjustments on the exact same date for the exact same amount (e.g. Driver `6200183742` on `2026-07-15` had ₹500 for "Car wash" and ₹500 for "AC issue"). Earlier code attempted to deduplicate by matching `(partner_phone, vehicle_number, adjustment_date, amount)`, which erroneously merged the second entry into the first, deleting 414 financial adjustments.
 
 ### Resolution
-- Created safety backup table `public.core_adjustments_backup_20260915` (29,679 rows).
-- Truncated `public.core_adjustments` and executed `public.refresh_core_adjustments()`.
-- Re-ingested from the 14,909 verified rows in `public.sheet_adjustments` and 15 rows in `public.july_partner_adjustment`.
-- Master table stabilized at **14,476 clean, deduplicated rows** (14,462 from Sheet, 13 from Portal, 1 Merged), eliminating all 14,761 phantom records.
+- Enforced 1-to-1 canonical mapping from `sheet_adjustments` (`ADJ-SHT-<id>`) and `july_partner_adjustment` (`ADJ-PORTAL-<id>`).
+- Every distinct form submission is preserved as its own line item in `core_adjustments`.
+- Total rows consolidated: **15,835 rows** (15,820 from Sheet + 15 from Portal), eliminating all data loss.
 
 ---
 
-## 2. Extreme Sequence Burning (13,464,566 IDs Consumed)
+## 2. Corrupted Approval Status (`approval_status` Storing Timestamps)
 
 ### Root Cause
-Earlier migrations declared `id BIGSERIAL PRIMARY KEY` and executed bulk `INSERT ... ON CONFLICT (adjustment_id) DO UPDATE` queries. In PostgreSQL, calling `nextval()` occurs before conflict resolution; thus, every conflicting row burns an ID. Across multiple hourly runs and backfills of 14,000-row batches, the sequence burned over **13.4 million IDs**.
+During an ingestion test on 22-Sep-2026, 100 historical sheet rows had timestamps pasted into the approval status column. The previous trigger directly assigned `COALESCE(NEW.final_status, NEW.first_level_status)` without validating against the domain of allowed statuses, leaving timestamp strings in `approval_status`.
 
 ### Resolution
-- Migrated `id` from `BIGSERIAL` to `BIGINT PRIMARY KEY`.
-- Inside `refresh_core_adjustments()`, initialized an in-memory counter:
-  ```sql
-  SELECT COALESCE(MAX(id), 0) INTO v_next_id FROM public.core_adjustments;
-  ```
-  Incremented `v_next_id := v_next_id + 1` for new inserts only, completely eliminating sequence burning.
-- Synchronized underlying sequence `core_adjustments_id_seq` to match `MAX(id)`:
-  ```sql
-  PERFORM setval('public.core_adjustments_id_seq', 14476, true);
-  ```
+- Created immutable status standardizer `fn_standardize_approval_status()` which resolves all timestamp-corrupted strings to `'Approved'` (as confirmed by clean re-submissions in rows 14925–15009).
+- All 15,835 rows now have clean statuses (`Approved`: 13,388, `Rejected`: 1,980, `Pending`: 456, `Draft`: 11).
 
 ---
 
-## 3. Concurrency Deadlocks & Advisory Locking
+## 3. String Bloat in `source_reference_id` (46KB+ Repetition)
 
 ### Root Cause
-Simultaneous webhook executions from Google Forms or multi-tab edits in Google Sheets could trigger concurrent executions of `fn_sync_sheet_adjustments()`, leading to race conditions where two processes attempt to insert the same partner adjustment simultaneously.
+The previous append logic used `NOT (NEW.id::TEXT = ANY(string_to_array(v_existing_ref, ',')))`. Because `NEW.id::TEXT` is `'3047'` while elements in `v_existing_ref` are `'ADJ-SHT-3047'`, the condition was perpetually true, appending the string hundreds of times on every refresh.
 
 ### Resolution
-- Enforced transactional advisory locking with dedicated lock key `777333444`:
-  ```sql
-  PERFORM pg_advisory_xact_lock(777333444);
-  ```
-- Any concurrent trigger invocation automatically waits until the active transaction commits, guaranteeing strict serialization and zero duplicate ID assignment.
+- Standardized `source_reference_id` to exact canonical tracking identifiers (`ADJ-SHT-<id>` and `ADJ-PORTAL-<id>`).
+- String length stabilized at 9–13 characters across the entire table.
 
 ---
 
-## 4. Timezone Datatype Inconsistency (`TIMESTAMPTZ` vs `TIMESTAMP`)
+## 4. Multi-Vehicle Fleet Operator Batches (60 Rows)
 
 ### Root Cause
-Columns `created_at`, `updated_at`, and `deleted_at` were originally declared as `TIMESTAMP WITH TIME ZONE`. This caused PostgreSQL to append UTC offsets (`+00:00` or `+05:30`), leading to day-shift display errors in frontend applications and analytics queries.
+Fleet operators managing multiple vehicles entered multiple registration plates into a single cell (e.g. `KA05AQ4793,KA05AQ4797,KA05AQ4828` or lists of 50 vehicles for fleet-wide TDS / Dead Mile adjustments).
 
 ### Resolution
-- Altered all timestamp columns to `TIMESTAMP WITHOUT TIME ZONE`:
-  ```sql
-  ALTER TABLE public.core_adjustments 
-      ALTER COLUMN created_at TYPE TIMESTAMP WITHOUT TIME ZONE USING created_at AT TIME ZONE 'Asia/Kolkata',
-      ALTER COLUMN updated_at TYPE TIMESTAMP WITHOUT TIME ZONE USING updated_at AT TIME ZONE 'Asia/Kolkata',
-      ALTER COLUMN deleted_at TYPE TIMESTAMP WITHOUT TIME ZONE USING deleted_at AT TIME ZONE 'Asia/Kolkata';
-  ```
-- Defaults set to `(CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata')`.
+- `core_adjustments.vehicle_number` is typed as `TEXT` to preserve raw multi-plate strings without truncation.
+- Downstream in Hisaab, fleet adjustments aggregate at the **Operator level (`hisaab_partner_weekly`) by `partner_id`**, ensuring 100% accurate financial settlement.
 
 ---
 
-## 5. Long String & Vehicle Number Truncation
+## 5. Downstream Hisaab Automatic Synchronization
 
 ### Root Cause
-In raw Google Sheet entries, certain operators pasted bulk lists of up to 50 concatenated license plates (e.g. `KA05AP6033KA05AP6041KA05AP7492...`, 780 characters) or descriptive strings (e.g. `1DAYRENTOFFDRIVERTAKENLEAVE`) into the vehicle number column. PL/pgSQL variables typed as `VARCHAR(20)` crashed with `StringDataRightTruncation` (SQLSTATE 22001).
+`hisaab_adjustments_ledger` was missing approved adjustments because no trigger existed on `core_adjustments`.
 
 ### Resolution
-- Declared all string and vehicle variables in trigger and refresh functions as `TEXT`:
-  ```sql
-  v_clean_phone TEXT;
-  v_clean_veh TEXT;
-  v_clean_city TEXT;
-  ```
-- Preserved complete raw concatenated strings in `core_adjustments.vehicle_number` (`TEXT`) without truncation.
+- Created `trg_core_to_hisaab_adjustments` on `core_adjustments` executing `fn_sync_core_to_hisaab_adjustments()`.
+- Automatically populates `hisaab_adjustments_ledger` for all active `Approved` adjustments, keeping Hisaab calculations in continuous real-time sync.
 
 ---
 
-## 6. Financial Ledger Polarity & Negative Amounts
-
-### Root Cause
-Certain sheet entries had negative amounts entered as `-100.00` to denote deductions, while others relied on `adjustment_type = 'Debit'` with positive numbers.
+## 6. Background Automation via `pg_cron`
 
 ### Resolution
-- Enforced check constraint `CONSTRAINT chk_core_adjustments_amount CHECK (amount >= 0.00)`.
-- Financial polarity is captured explicitly by `adjustment_type` (`Credit` vs `Debit` vs `Deposit Conversion`), while `amount` represents the absolute magnitude.
+- Configured `pg_cron` schedule `sync_core_adjustments_cron` running every 15 minutes (`*/15 * * * *`) executing `SELECT public.refresh_core_adjustments();`.
+- Guaranteed continuous reconciliation under transactional advisory locks (`777333444`).

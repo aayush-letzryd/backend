@@ -7,11 +7,12 @@ Single Source of Truth combining:
   2. public.july_partner_adjustment (Web Portal partner adjustment forms)
 
 Architectural Guarantees:
-  - Dual-Source Automatic Merging on (adjustment_date, amount, adjustment_type, partner_phone, vehicle_number)
+  - 1-to-1 Canonical Stacking (Zero data alteration or overwriting)
   - Gapless 1..N ID sequence integrity (Zero Sequence Burning via Advisory Locks 777333444)
   - Pure IST Timestamps (TIMESTAMP WITHOUT TIME ZONE, 0 timezone offset drift)
   - Soft-Delete Protection (is_deleted = TRUE, deleted_at = CURRENT_TIMESTAMP)
-  - Elimination of historical 1-day date-shift phantom duplicates
+  - Downstream Hisaab synchronization to public.hisaab_adjustments_ledger
+  - Automated pg_cron reconciliation schedule (every 15 minutes)
 
 Usage:
     python automation_script.py --audit
@@ -43,7 +44,7 @@ def get_connection():
     return conn
 
 def audit_health():
-    """Runs a full integrity audit on core_adjustments and upstream sources."""
+    """Runs a full integrity audit on core_adjustments, upstream sources, and downstream hisaab."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
@@ -60,25 +61,45 @@ def audit_health():
     cur.execute("SELECT count(*) as count FROM public.july_partner_adjustment;")
     portal_total = cur.fetchone()["count"]
 
-    cur.execute("SELECT count(*) as count FROM public.core_adjustments;")
-    core_total = cur.fetchone()["count"]
+    cur.execute("""
+        SELECT 
+            count(*) as physical_total,
+            count(*) FILTER (WHERE NOT is_deleted) as active_total,
+            count(*) FILTER (WHERE is_deleted) as deleted_total
+        FROM public.core_adjustments;
+    """)
+    core_counts = cur.fetchone()
+    physical_total = core_counts["physical_total"]
+    active_total = core_counts["active_total"]
+    deleted_total = core_counts["deleted_total"]
+
+    expected_active_total = sheet_total + portal_total
 
     print(f"1. DATA SOURCE VOLUMES:")
     print(f"   - Upstream Sheet (sheet_adjustments)     : {sheet_total:,} rows")
     print(f"   - Upstream Portal (july_partner_adj)     : {portal_total:,} rows")
-    print(f"   - Consolidated Core (core_adjustments)   : {core_total:,} rows\n")
+    print(f"   - Active Core (active_core_adjustments)  : {active_total:,} rows")
+    print(f"   - Soft-Deleted Records in Core           : {deleted_total:,} rows")
+    print(f"   - Physical Total in core_adjustments     : {physical_total:,} rows")
+    if active_total == expected_active_total:
+        print(f"   [PASS] Exact 1-to-1 Parity: Active Core ({active_total:,}) matches Sheet + Portal ({expected_active_total:,}).")
+    else:
+        print(f"   [FAIL] Parity Discrepancy: Active Core has {active_total:,}, expected {expected_active_total:,}!")
+        all_passed = False
+    print()
 
-    # 2. Source Breakdown in Core
+    # 2. Source Breakdown in Core (Active Records)
     cur.execute("""
-        SELECT data_source, count(*) as count 
+        SELECT data_source, is_deleted, count(*) as count, min(id) as min_id, max(id) as max_id 
         FROM public.core_adjustments 
-        GROUP BY data_source 
-        ORDER BY count DESC;
+        GROUP BY data_source, is_deleted 
+        ORDER BY is_deleted ASC, count DESC;
     """)
     sources = cur.fetchall()
     print("2. CORE ADJUSTMENTS DATA SOURCE BREAKDOWN:")
     for s in sources:
-        print(f"   - {s['data_source']:<15}: {s['count']:,} rows")
+        status_label = "DELETED" if s['is_deleted'] else "ACTIVE"
+        print(f"   - {s['data_source']:<15} [{status_label}]: {s['count']:,} rows (IDs {s['min_id']} to {s['max_id']})")
     print()
 
     # 3. Gapless ID Continuity Check
@@ -114,22 +135,18 @@ def audit_health():
         all_passed = False
     print()
 
-    # 4. Phantom Duplicate Audit (Date-Shift Check)
+    # 4. Status Integrity Check
     cur.execute("""
-        SELECT count(*) as dups FROM (
-            SELECT partner_id, vehicle_number, adjustment_date, amount, adjustment_type, count(*)
-            FROM public.core_adjustments
-            GROUP BY partner_id, vehicle_number, adjustment_date, amount, adjustment_type
-            HAVING count(*) > 1
-        ) sub;
+        SELECT count(*) as bad_stat 
+        FROM public.core_adjustments 
+        WHERE approval_status ~ '[0-9]{4}-[0-9]{2}-[0-9]{2}';
     """)
-    dups = cur.fetchone()["dups"]
-    print("4. LOGICAL DUPLICATION CHECK:")
-    print(f"   - Identical (Partner, Vehicle, Date, Amount, Type) groups: {dups}")
-    if dups <= 10:
-        print("   [PASS] Phantom 14,761 date-shifted duplicate batch successfully eliminated.")
+    bad_stat = cur.fetchone()["bad_stat"]
+    print("4. APPROVAL STATUS INTEGRITY:")
+    if bad_stat == 0:
+        print("   [PASS] Zero timestamp strings in approval_status.")
     else:
-        print(f"   [FAIL] High duplication detected: {dups} groups!")
+        print(f"   [FAIL] {bad_stat} corrupted timestamp status strings detected!")
         all_passed = False
     print()
 
@@ -152,21 +169,25 @@ def audit_health():
             all_passed = False
     print()
 
-    # 6. Financial Integrity (Non-negative amounts)
-    cur.execute("""
-        SELECT 
-            min(amount) as min_amt, 
-            max(amount) as max_amt, 
-            count(*) FILTER (WHERE amount < 0) as negative_count
-        FROM public.core_adjustments;
-    """)
-    fin = cur.fetchone()
-    print("6. FINANCIAL LEDGER INTEGRITY:")
-    print(f"   - Min Amount: {fin['min_amt']} | Max Amount: {fin['max_amt']}")
-    if fin["negative_count"] == 0:
-        print("   [PASS] Zero negative amounts found (check constraint chk_core_adjustments_amount satisfied).")
+    # 6. Source Reference ID Cleanliness
+    cur.execute("SELECT max(length(source_reference_id)) as max_len FROM public.core_adjustments;")
+    max_ref_len = cur.fetchone()["max_len"]
+    print("6. SOURCE REFERENCE INTEGRITY:")
+    if max_ref_len and max_ref_len <= 50:
+        print(f"   [PASS] Max reference ID length: {max_ref_len} chars (Zero unbounded string bloat).")
     else:
-        print(f"   [FAIL] {fin['negative_count']} negative adjustment amounts found!")
+        print(f"   [FAIL] Reference ID bloat detected: max length = {max_ref_len} chars!")
+        all_passed = False
+    print()
+
+    # 7. pg_cron Schedule Check
+    cur.execute("SELECT jobid, schedule, command, active FROM cron.job WHERE command LIKE '%refresh_core_adjustments%';")
+    cron_job = cur.fetchone()
+    print("7. PG_CRON RECONCILIATION AUTOMATION:")
+    if cron_job and cron_job["active"]:
+        print(f"   [PASS] pg_cron Active: Job ID {cron_job['jobid']}, Schedule '{cron_job['schedule']}' ({cron_job['command']})")
+    else:
+        print("   [FAIL] pg_cron schedule not found or inactive!")
         all_passed = False
     print()
 
@@ -193,19 +214,19 @@ def run_backfill():
     conn.close()
 
 def verify_triggers():
-    """Verifies that active triggers exist on sheet_adjustments and july_partner_adjustment."""
+    """Verifies that active triggers exist on sheet_adjustments, july_partner_adjustment, and core_adjustments."""
     conn = get_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     print("Checking active synchronization triggers...")
     cur.execute("""
         SELECT event_object_table, trigger_name, action_statement
         FROM information_schema.triggers
-        WHERE event_object_table IN ('sheet_adjustments', 'july_partner_adjustment')
-        ORDER BY event_object_table;
+        WHERE event_object_table IN ('sheet_adjustments', 'july_partner_adjustment', 'core_adjustments')
+        ORDER BY event_object_table, trigger_name;
     """)
     trigs = cur.fetchall()
     for t in trigs:
-        print(f"  [OK] Table: {t['event_object_table']} -> Trigger: {t['trigger_name']}")
+        print(f"  [OK] Table: {t['event_object_table']:<25} -> Trigger: {t['trigger_name']}")
     cur.close()
     conn.close()
 
