@@ -8,17 +8,21 @@ The **LetzRyd Hisaab Engine** serves as the automated financial, operational, an
 1. **100% Downstream Decoupling (Zero Triggers)**:
    - In accordance with production stability requirements, **all triggers attached to upstream core tables (`core_adjustments`, `core_challans`, `core_gps`, `core_ola_daily`, `core_ola_weekly`) have been permanently removed**.
    - Raw ingestion pipelines (Uber sync, Ola sync, vehicle status, adjustments) operate independently at full speed without database table locks or transaction cascades.
-2. **Automated Scheduled Batching via `pg_cron`**:
-   - The engine is driven by a scheduled PostgreSQL cron job (`hisaab-vehicle-weekly-sync`), executing hourly at **minute 45 (`45 * * * *`)**.
-   - Integrates newly approved adjustments from `core_adjustments` into all open settlement weeks 24 times a day without database table locks.
-3. **Strictly Scoped & Empirically Verified**:
+2. **Dual-Table Architecture (Audit Truth Ledger vs. Operational Payout Ledger)**:
+   - **`public.hisaab_vehicle_weekly` (Audit / Calendar Truth Ledger)**: Preserves 100% calendar ground truth without cutoffs. All rent, trips, core adjustments, and unpaid challans (`TRAFFIC_FINE` & `STICKER_FINE`) are booked strictly to the exact week of their occurrence / violation date.
+   - **`public.hisaab_vehicle_payout_weekly` (Operational Payout Ledger)**: Enforces an immutable weekly settlement freeze on the prior week every **Monday at 11:00 AM IST (`lock_cutoff_at`)**. Any late-arriving data (e.g. challans scraped after Monday 11 AM, adjustments approved late) cannot alter the frozen prior week and are systematically rolled forward into the next active week as adjustments (`challan_adjustment_amount`, `prior_period_adjustment_amount`).
+3. **Automated Scheduled Batching via `pg_cron`**:
+   - The audit engine executes hourly at **minute 45 (`45 * * * *`)** via `sp_sync_hisaab_vehicle_weekly(NULL)`.
+   - The operational payout engine executes hourly at **minute 50 (`50 * * * *`)** via `sp_sync_hisaab_vehicle_payout_weekly(NULL)`.
+   - The app tables sync executes at **minute 00 (`0 * * * *`)** via `fn_sync_hisaab_to_app_tables()`.
+4. **Strictly Scoped & Empirically Verified**:
    - Focuses on verified telemetry, rental waterfall, and live adjustments:
      - **Onroad & Allotted Days** (with fractional day support, e.g. 6.5 days)
      - **Lease Rent** (Daily Rate, Base Rental, Indemnity Fee, Net Weekly Rent)
      - **Uber Telemetry & Revenue** (Trips, Earnings, Cash Collected, Toll, Driver Subscription, Incentive, Week O/S)
      - **Ola Telemetry & Revenue** (Trips, Revenue, Cash Collected, Toll, GST, Online Payouts, Incentive, Week O/S)
-     - **Core Adjustments (LIVE)**: Seamlessly integrates approved credits/debits from `public.core_adjustments` with full polarity support (+ Debit, - Credit).
-     - **Traffic & Sticker Challans (LIVE)**: Seamlessly integrates unpaid fines from `public.core_challans` (`TRAFFIC_FINE` and `STICKER_FINE`) attributed to driver custody on `violation_date` via `daily_rent_log`. Fines marked `PAID` are strictly excluded.
+     - **Core Adjustments (LIVE)**: Integrates approved credits/debits from `public.core_adjustments` with full polarity support (+ Debit, - Credit).
+     - **Traffic & Sticker Challans (LIVE)**: Integrates unpaid fines from `public.core_challans` (`TRAFFIC_FINE` and `STICKER_FINE`) attributed to driver custody on `violation_date` via `daily_rent_log`. Fines marked `PAID` are strictly excluded.
      - **Current Week O/S & Driver Payouts**: Real-time evaluation of `current_week_os`, `net_to_collect_from_driver`, and `net_payout_to_driver`.
 
 ---
@@ -30,19 +34,23 @@ Master settlement calendar managing weekly billing cycle boundaries and lock gua
 - **Grain**: One record per settlement week (`week_id`, e.g. `'CY26WK26'`).
 - **Columns**: `week_id`, `settlement_year`, `settlement_week`, `week_start`, `week_end`, `lock_cutoff_at`, `is_locked`, `locked_at`, `locked_by`, `notes`.
 
-### B. `public.hisaab_vehicle_weekly`
-Core weekly settlement table matching the verified fields of the weekly Hisaab workbooks (`Uber + OLA Final Hisaab`).
+### B. `public.hisaab_vehicle_weekly` (Audit Truth Ledger)
+Calendar violation-date settlement table matching verified fields of weekly workbooks without cutoffs.
 - **Primary Key**: `id BIGSERIAL`
 - **Unique Constraint**: `(week_id, vehicle_number)`
-- **Schema**:
-  | Column Group | Columns | Data Type | Notes |
-  | :--- | :--- | :--- | :--- |
-  | **Identity** | `week_id`, `week_start`, `week_end`, `vehicle_number`, `partner_id`, `partner_name`, `city`, `vehicle_model`, `rental_plan` | `VARCHAR`, `DATE` | Resolved from `daily_rent_log`, `core_partner_onboarding`, and `rental_custom_partner_plans` |
-  | **Attendance** | `allotted_days`, `onroad_days` | `NUMERIC(4, 1)` | Supports fractional days (e.g. 6.5) |
-  | **Lease Rent** | `daily_rent_applied`, `weekly_lease_rental`, `weekly_indemnity_fees`, `net_weekly_lease_rental` | `NUMERIC(10/12, 2)` | Aggregated from 5-tier waterfall in `daily_rent_log` |
-  | **Uber** | `uber_trips`, `uber_total_earnings`, `uber_cash_collection`, `uber_toll`, `uber_driver_sub_charge`, `uber_incentive`, `uber_week_os` | `INT`, `NUMERIC(12, 2)` | Pre-aggregated from `core_uber_weekly` (fallback: `core_uber_daily`) |
-  | **Ola** | `ola_trips`, `ola_net_revenue`, `ola_cash_collection`, `ola_toll`, `ola_gst`, `ola_online_payment`, `ola_incentive`, `ola_week_os` | `INT`, `NUMERIC(12, 2)` | Pre-aggregated from `core_ola_weekly` (fallback: `core_ola_daily`) |
-  | **Audit** | `settlement_status`, `created_at`, `updated_at` | `VARCHAR`, `TIMESTAMPTZ` | `'CALCULATED'`, `'VERIFIED'`, `'LOCKED'` |
+- **Behavior**: Strictly reflects all trips, rents, adjustments, and challans on their actual calendar dates.
+
+### C. `public.hisaab_vehicle_payout_weekly` (Operational Payout Ledger)
+Driver payout table enforcing the Monday 11:00 AM IST cutoff freeze.
+- **Primary Key**: `id BIGSERIAL`
+- **Unique Constraint**: `(week_id, vehicle_number, partner_id)`
+- **Behavior**:
+  - Automatically transitions to `'FROZEN'` once `CURRENT_TIMESTAMP >= lock_cutoff_at` (Monday 11:00 AM IST).
+  - Frozen weeks are immutable and protected against updates.
+  - In-week challans created $\le$ Monday 11:00 AM IST are billed in `challan_amount`.
+  - Late challans scraped after Monday 11:00 AM IST for prior weeks roll into the next active week's `challan_adjustment_amount`.
+  - In-week approved adjustments created $\le$ Monday 11:00 AM IST are booked in `adjustment_amount`.
+  - Late approved adjustments for prior weeks roll into `prior_period_adjustment_amount`.
 
 ---
 
@@ -63,7 +71,11 @@ $$\text{Challan Amount} = \sum \text{Pending Fine Amount} \quad (\text{where } \
 *Attributed strictly to driver custody on `violation_date` via `daily_rent_log`.*
 
 ### Current Week Outstanding (O/S) & Payouts:
-$$\text{Current Week O/S} = \text{Net Weekly Lease Rental} - (\text{Uber Week O/S} + \text{Ola Week O/S}) + \text{Challan Amount} + \text{Adjustment Amount}$$
+#### For Audit Ledger (`hisaab_vehicle_weekly`):
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \text{Adjustment Amount}$$
+
+#### For Payout Ledger (`hisaab_vehicle_payout_weekly`):
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \mathbf{challan\_adjustment\_amount} + \text{Adjustment Amount} + \mathbf{prior\_period\_adjustment\_amount}$$
 $$\text{Net to Collect from Driver} = \max(0, \text{Current Week O/S})$$
 $$\text{Net Payout to Driver} = \max(0, -\text{Current Week O/S})$$
 
@@ -71,19 +83,29 @@ $$\text{Net Payout to Driver} = \max(0, -\text{Current Week O/S})$$
 
 ## 4. Automation & Stored Procedures
 
-### Stored Procedure:
-`public.sp_sync_hisaab_vehicle_weekly(p_week_id VARCHAR DEFAULT NULL)`
-- If `p_week_id` is specified, recalculates and upserts that specific week.
-- If `NULL`, recalculates all unlocked settlement weeks where `week_start <= CURRENT_DATE`.
-- Handles multiple partner assignments in a single week by selecting the primary partner by billable days and latest timestamp.
-- Automatically leverages `core_uber_weekly` / `core_ola_weekly` if present, with transparent fallback to daily ingestion tables (`core_uber_daily` / `core_ola_daily`).
+### Stored Procedures:
+1. `public.sp_sync_hisaab_vehicle_weekly(p_week_id VARCHAR DEFAULT NULL)`:
+   - Synchronizes `hisaab_vehicle_weekly` (Audit Ledger).
+   - Driven by `pg_cron` at **`:45`** hourly.
+2. `public.sp_sync_hisaab_vehicle_payout_weekly(p_week_id VARCHAR DEFAULT NULL)`:
+   - Synchronizes `hisaab_vehicle_payout_weekly` (Payout Ledger).
+   - Freezes weeks past Monday 11:00 AM IST and rolls late challans/adjustments forward.
+   - Driven by `pg_cron` at **`:50`** hourly.
 
 ### `pg_cron` Scheduling:
 ```sql
+-- Audit Ledger Sync (Minute 45)
 SELECT cron.schedule(
     'hisaab-vehicle-weekly-sync',
     '45 * * * *',
     'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
+);
+
+-- Operational Payout Sync (Minute 50)
+SELECT cron.schedule(
+    'hisaab-vehicle-payout-sync',
+    '50 * * * *',
+    'CALL public.sp_sync_hisaab_vehicle_payout_weekly(NULL);'
 );
 ```
 

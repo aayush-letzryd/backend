@@ -47,7 +47,20 @@ SELECT cron.schedule(
     'CALL public.sp_sync_hisaab_vehicle_weekly(NULL);'
 );
 
+-- ----------------------------------------------------------------------------
+-- Schedule: hisaab-vehicle-payout-sync
+-- Runs every hour at minute 50 (50 * * * *).
+-- Synchronizes operational payout table (public.hisaab_vehicle_payout_weekly)
+-- enforcing Monday 11:00 AM IST cutoff freeze and rolling late challans/adjustments forward.
+-- Runs 5 minutes after audit table sync (:45) and 10 minutes before app broadcast (:00).
+-- ----------------------------------------------------------------------------
+SELECT cron.schedule(
+    'hisaab-vehicle-payout-sync',
+    '50 * * * *',
+    'CALL public.sp_sync_hisaab_vehicle_payout_weekly(NULL);'
+);
+
 -- Verification query to inspect scheduled jobs
 SELECT jobid, schedule, command, nodename, active, jobname 
 FROM cron.job 
-WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync');
+WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync', 'hisaab-vehicle-payout-sync');

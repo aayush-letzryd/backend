@@ -716,3 +716,442 @@ SELECT
     (h.net_weekly_lease_rental - (h.uber_week_os + h.ola_week_os)) AS net_driver_balance_due,
     ((h.uber_week_os + h.ola_week_os) - h.net_weekly_lease_rental) AS net_payout_to_driver
 FROM public.hisaab_vehicle_weekly h;
+
+-- ----------------------------------------------------------------------------
+-- 5. sp_sync_hisaab_vehicle_payout_weekly
+-- Operational Payout Settlement Procedure with strict Monday 11:00 AM IST cutoff freeze.
+-- - Respects lock_cutoff_at (Monday 11:00 AM IST)
+-- - Freezes past week settlements once cutoff timestamp passes
+-- - Any late data (scraped challans or adjustments approved after cutoff) for past weeks
+--   is rolled forward into the next active week as adjustments:
+--   `challan_adjustment_amount` and `prior_period_adjustment_amount`
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE public.sp_sync_hisaab_vehicle_payout_weekly(IN p_week_id character varying DEFAULT NULL::character varying)
+ LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    v_week RECORD;
+    v_prev_cutoff TIMESTAMPTZ;
+    v_curr_cutoff TIMESTAMPTZ;
+    v_uber_count INT;
+    v_ola_count INT;
+BEGIN
+    FOR v_week IN (
+        SELECT week_id, week_start, week_end, lock_cutoff_at, is_locked
+        FROM public.hisaab_settlement_weeks
+        WHERE (p_week_id IS NOT NULL AND week_id = p_week_id)
+           OR (p_week_id IS NULL AND week_start <= CURRENT_DATE)
+        ORDER BY week_start
+    ) LOOP
+        
+        v_curr_cutoff := COALESCE(v_week.lock_cutoff_at, (v_week.week_end + INTERVAL '1 day 5 hours 30 minutes'));
+        v_prev_cutoff := (v_week.week_start::timestamptz + INTERVAL '5 hours 30 minutes');
+
+        RAISE NOTICE 'Processing Hisaab Vehicle Payout Weekly for week: % (Range: % to %, Cutoff: %)', 
+            v_week.week_id, v_week.week_start, v_week.week_end, v_curr_cutoff;
+
+        SELECT COUNT(*) INTO v_uber_count FROM public.core_uber_weekly WHERE week_id = v_week.week_id;
+        SELECT COUNT(*) INTO v_ola_count FROM public.core_ola_weekly WHERE week_id = v_week.week_id;
+
+        WITH rent_agg AS (
+            SELECT 
+                d.vehicle_number,
+                COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                (ARRAY_AGG(d.city ORDER BY d.log_date DESC))[1] AS city,
+                (ARRAY_AGG(d.vehicle_model ORDER BY d.log_date DESC))[1] AS vehicle_model,
+                (ARRAY_AGG(p.plan_name ORDER BY d.log_date DESC))[1] AS rental_plan,
+                COUNT(d.log_date) AS allotted_days,
+                COUNT(CASE WHEN d.attendance_status IN ('Active', 'Allocation', 'Same Day D&A') AND d.is_billable_day = TRUE THEN 1 END) AS onroad_days,
+                ROUND(AVG(d.applied_daily_rent), 2) AS daily_rent_applied,
+                SUM(d.applied_daily_rent) AS weekly_lease_rental,
+                SUM(d.applied_daily_indemnity) AS weekly_indemnity_fees,
+                SUM(d.net_daily_rent) AS net_weekly_lease_rental
+            FROM public.daily_rent_log d
+            LEFT JOIN public.core_rental_plans p ON d.matched_plan_id = p.plan_id
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+              AND NOT (
+                  COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') = 'SYSTEM_ONBOARDED'
+                  AND EXISTS (
+                      SELECT 1 FROM public.daily_rent_log d2
+                      WHERE d2.log_date BETWEEN v_week.week_start AND v_week.week_end
+                        AND d2.vehicle_number = d.vehicle_number
+                        AND COALESCE(NULLIF(TRIM(d2.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED'
+                  )
+              )
+            GROUP BY d.vehicle_number, COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED')
+        ),
+        rent_ranked AS (
+            SELECT 
+                ra.*,
+                ROW_NUMBER() OVER(
+                    PARTITION BY UPPER(REPLACE(REPLACE(ra.vehicle_number, ' ', ''), '-', '')) 
+                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC
+                ) as partner_rank
+            FROM rent_agg ra
+        ),
+        uber_agg AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
+                COALESCE(SUM(ABS(u.uber_total_earnings)), 0.00) AS uber_total_earnings,
+                COALESCE(SUM(ABS(u.uber_cash_collection)), 0.00) AS uber_cash_collection,
+                COALESCE(SUM(ABS(u.uber_toll)), 0.00) AS uber_toll,
+                COALESCE(SUM(ABS(u.uber_driver_sub_charge)), 0.00) AS uber_driver_sub_charge,
+                COALESCE(SUM(ABS(u.uber_vehicle_incentive)), 0.00) AS uber_incentive,
+                COALESCE(SUM(
+                    ABS(u.uber_total_earnings) + ABS(u.uber_vehicle_incentive) + ABS(u.uber_toll)
+                    - ABS(u.uber_cash_collection) - ABS(u.uber_driver_sub_charge)
+                ), 0.00) AS uber_week_os
+            FROM public.core_uber_weekly u
+            WHERE u.week_id = v_week.week_id
+              AND v_uber_count > 0
+            GROUP BY UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', ''))
+            
+            UNION ALL
+            
+            SELECT 
+                UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
+                COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
+                COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
+                COALESCE(SUM(ABS(u.tolls_refunded)), 0.00) AS uber_toll,
+                COALESCE(SUM(ABS(u.driver_subscription_charge)), 0.00) AS uber_driver_sub_charge,
+                0.00 AS uber_incentive,
+                COALESCE(SUM(
+                    ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
+                    - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
+                ), 0.00) AS uber_week_os
+            FROM public.core_uber_daily u
+            WHERE u.operational_date BETWEEN v_week.week_start AND v_week.week_end
+              AND v_uber_count = 0
+            GROUP BY UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', ''))
+        ),
+        ola_agg AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
+                COALESCE(SUM(ABS(o.ola_net_revenue)), 0.00) AS ola_net_revenue,
+                COALESCE(SUM(ABS(o.ola_cash_collection)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.ola_toll)), 0.00) AS ola_toll,
+                0.00 AS ola_gst,
+                COALESCE(SUM(ABS(o.ola_online_payment_deductions)), 0.00) AS ola_online_payment,
+                COALESCE(SUM(ABS(o.ola_portal_incentive)), 0.00) AS ola_incentive,
+                COALESCE(SUM(
+                    ABS(o.ola_net_revenue) + ABS(o.ola_portal_incentive) + ABS(o.ola_toll)
+                    - ABS(o.ola_cash_collected)
+                ), 0.00) AS ola_week_os
+            FROM public.core_ola_weekly o
+            WHERE o.week_id = v_week.week_id
+              AND v_ola_count > 0
+            GROUP BY UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
+            
+            UNION ALL
+            
+            SELECT 
+                UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
+                COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
+                COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.toll_and_parking)), 0.00) AS ola_toll,
+                0.00 AS ola_gst,
+                COALESCE(SUM(ABS(o.online_payouts)), 0.00) AS ola_online_payment,
+                COALESCE(SUM(ABS(o.portal_incentive)), 0.00) AS ola_incentive,
+                COALESCE(SUM(
+                    ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
+                    - ABS(o.cash_collected)
+                ), 0.00) AS ola_week_os
+            FROM public.core_ola_daily o
+            WHERE o.service_date BETWEEN v_week.week_start AND v_week.week_end
+              AND v_ola_count = 0
+            GROUP BY UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
+        ),
+        uber_daily_partner_agg AS (
+            SELECT 
+                d.vehicle_number,
+                d.partner_id,
+                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
+                COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
+                COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
+                COALESCE(SUM(ABS(u.tolls_refunded)), 0.00) AS uber_toll,
+                COALESCE(SUM(ABS(u.driver_subscription_charge)), 0.00) AS uber_driver_sub_charge,
+                COALESCE(SUM(
+                    ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
+                    - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
+                ), 0.00) AS uber_week_os
+            FROM public.daily_rent_log d
+            JOIN public.core_uber_daily u
+              ON u.operational_date = d.log_date
+             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.vehicle_number, d.partner_id
+        ),
+        ola_daily_partner_agg AS (
+            SELECT 
+                d.vehicle_number,
+                d.partner_id,
+                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
+                COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
+                COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.toll_and_parking)), 0.00) AS ola_toll,
+                0.00 AS ola_gst,
+                COALESCE(SUM(ABS(o.online_payouts)), 0.00) AS ola_online_payment,
+                COALESCE(SUM(ABS(o.portal_incentive)), 0.00) AS ola_incentive,
+                COALESCE(SUM(
+                    ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
+                    - ABS(o.cash_collected)
+                ), 0.00) AS ola_week_os
+            FROM public.daily_rent_log d
+            JOIN public.core_ola_daily o
+              ON o.service_date = d.log_date
+             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.vehicle_number, d.partner_id
+        ),
+        all_daily_custody AS (
+            SELECT 
+                d.log_date,
+                d.vehicle_number,
+                d.partner_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY d.log_date, d.vehicle_number
+                    ORDER BY 
+                        CASE WHEN COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED' THEN 0 ELSE 1 END,
+                        d.net_daily_rent DESC,
+                        d.id DESC
+                ) AS custody_rank
+            FROM public.daily_rent_log d
+        ),
+        -- 1. On-Time In-Week Challans (Violation in week AND created <= Monday 11:00 AM)
+        challan_ontime_agg AS (
+            SELECT 
+                c.vehicle_number,
+                COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                COALESCE(SUM(c.challan_amount), 0.00) AS challan_amount
+            FROM (
+                SELECT 
+                    UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
+                    c.violation_date,
+                    COALESCE(NULLIF(c.net_pending_amount, 0.00), c.total_fine_amount) AS challan_amount,
+                    dc.partner_id
+                FROM public.core_challans c
+                LEFT JOIN all_daily_custody dc
+                  ON c.violation_date = dc.log_date
+                 AND UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) = dc.vehicle_number
+                 AND dc.custody_rank = 1
+                WHERE c.violation_date BETWEEN v_week.week_start AND v_week.week_end
+                  AND (c.created_at <= v_curr_cutoff OR v_week.week_start < '2026-09-21')
+                  AND c.is_deleted = FALSE
+                  AND c.payment_status = 'UNPAID'
+                  AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
+            ) c
+            GROUP BY c.vehicle_number, COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED')
+        ),
+        -- 2. Late Past Challans (Violation < week_start AND created after prev_cutoff AND <= curr_cutoff)
+        -- Active starting from Week 40 onwards
+        challan_late_agg AS (
+            SELECT 
+                c.vehicle_number,
+                COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
+                COALESCE(SUM(c.challan_amount), 0.00) AS challan_adjustment_amount
+            FROM (
+                SELECT 
+                    UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
+                    c.violation_date,
+                    COALESCE(NULLIF(c.net_pending_amount, 0.00), c.total_fine_amount) AS challan_amount,
+                    dc.partner_id
+                FROM public.core_challans c
+                LEFT JOIN all_daily_custody dc
+                  ON c.violation_date = dc.log_date
+                 AND UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) = dc.vehicle_number
+                 AND dc.custody_rank = 1
+                WHERE c.violation_date < v_week.week_start
+                  AND c.created_at > v_prev_cutoff
+                  AND c.created_at <= v_curr_cutoff
+                  AND v_week.week_start >= '2026-09-28'
+                  AND c.is_deleted = FALSE
+                  AND c.payment_status = 'UNPAID'
+                  AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
+            ) c
+            GROUP BY c.vehicle_number, COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED')
+        ),
+        -- 3. On-Time In-Week Adjustments
+        adj_ontime_agg AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                c.partner_id,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_adj_signed
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND (c.created_at <= v_curr_cutoff OR v_week.week_start < '2026-09-21')
+              AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
+            GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')), c.partner_id
+        ),
+        -- 4. Late Past Adjustments (Adjustment date < week_start AND created in this cycle)
+        adj_late_agg AS (
+            SELECT 
+                UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
+                c.partner_id,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_late_adj_signed
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date < v_week.week_start
+              AND c.created_at > v_prev_cutoff
+              AND c.created_at <= v_curr_cutoff
+              AND v_week.week_start >= '2026-09-28'
+              AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
+            GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')), c.partner_id
+        ),
+        target_keys AS (
+            SELECT vehicle_number, partner_id FROM rent_ranked
+            UNION
+            SELECT vehicle_number, partner_id FROM challan_late_agg WHERE partner_id <> 'SYSTEM_ONBOARDED'
+            UNION
+            SELECT vehicle_number, partner_id FROM adj_late_agg WHERE partner_id <> 'SYSTEM_ONBOARDED'
+        ),
+        partner_names AS (
+            SELECT partner_id, driver_name FROM (
+                SELECT partner_id, driver_name, ROW_NUMBER() OVER(PARTITION BY partner_id ORDER BY created_at DESC NULLS LAST) rn
+                FROM public.core_partner_onboarding
+            ) sub WHERE rn = 1
+        )
+        INSERT INTO public.hisaab_vehicle_payout_weekly (
+            week_id, week_start, week_end, lock_cutoff_at, vehicle_number, partner_id, partner_name,
+            city, vehicle_model, rental_plan, allotted_days, onroad_days,
+            daily_rent_applied, weekly_lease_rental, weekly_indemnity_fees, net_weekly_lease_rental,
+            uber_trips, uber_total_earnings, uber_cash_collection, uber_toll, uber_driver_sub_charge, uber_incentive, uber_week_os,
+            ola_trips, ola_net_revenue, ola_cash_collection, ola_toll, ola_gst, ola_online_payment, ola_incentive, ola_week_os,
+            adjustment_amount, prior_period_adjustment_amount, challan_amount, challan_adjustment_amount,
+            accident_deduction, tds_amount, gps_dead_km, gps_dead_mile_penalty,
+            current_week_os, net_to_collect_from_driver, net_payout_to_driver,
+            settlement_status, created_at, updated_at
+        )
+        SELECT 
+            v_week.week_id,
+            v_week.week_start,
+            v_week.week_end,
+            v_curr_cutoff,
+            tk.vehicle_number,
+            tk.partner_id,
+            COALESCE(pn.driver_name, tk.partner_id) AS partner_name,
+            COALESCE(r.city, 'HYD') AS city,
+            COALESCE(r.vehicle_model, 'Fleet Vehicle') AS vehicle_model,
+            r.rental_plan,
+            COALESCE(r.allotted_days, 0.0) AS allotted_days,
+            COALESCE(r.onroad_days, 0.0) AS onroad_days,
+            COALESCE(r.daily_rent_applied, 0.00) AS daily_rent_applied,
+            COALESCE(r.weekly_lease_rental, 0.00) AS weekly_lease_rental,
+            COALESCE(r.weekly_indemnity_fees, 0.00) AS weekly_indemnity_fees,
+            COALESCE(r.net_weekly_lease_rental, 0.00) AS net_weekly_lease_rental,
+            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 THEN u.uber_trips ELSE 0 END, 0),
+            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
+            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
+            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 THEN o.ola_trips ELSE 0 END, 0),
+            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00),
+            0.00,
+            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 THEN o.ola_online_payment ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
+            -- On-time adjustments
+            COALESCE(adj_on.net_adj_signed, 0.00) AS adjustment_amount,
+            -- Late past adjustments routed to this week
+            COALESCE(adj_lt.net_late_adj_signed, 0.00) AS prior_period_adjustment_amount,
+            -- On-time in-week challans
+            COALESCE(ch_on.challan_amount, 0.00) AS challan_amount,
+            -- Late past challans routed to this week as adjustment
+            COALESCE(ch_lt.challan_adjustment_amount, 0.00) AS challan_adjustment_amount,
+            0.00 AS accident_deduction,
+            0.00 AS tds_amount,
+            0.00 AS gps_dead_km,
+            0.00 AS gps_dead_mile_penalty,
+            -- Current Week O/S Formula
+            (
+                COALESCE(r.net_weekly_lease_rental, 0.00)
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(ch_on.challan_amount, 0.00)
+                + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
+                + COALESCE(adj_on.net_adj_signed, 0.00)
+                + COALESCE(adj_lt.net_late_adj_signed, 0.00)
+            ) AS current_week_os,
+            GREATEST(0.00, (
+                COALESCE(r.net_weekly_lease_rental, 0.00)
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(ch_on.challan_amount, 0.00)
+                + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
+                + COALESCE(adj_on.net_adj_signed, 0.00)
+                + COALESCE(adj_lt.net_late_adj_signed, 0.00)
+            )) AS net_to_collect_from_driver,
+            GREATEST(0.00, -(
+                COALESCE(r.net_weekly_lease_rental, 0.00)
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                + COALESCE(ch_on.challan_amount, 0.00)
+                + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
+                + COALESCE(adj_on.net_adj_signed, 0.00)
+                + COALESCE(adj_lt.net_late_adj_signed, 0.00)
+            )) AS net_payout_to_driver,
+            CASE WHEN CURRENT_TIMESTAMP >= v_curr_cutoff THEN 'FROZEN' ELSE 'CALCULATED' END AS settlement_status,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        FROM target_keys tk
+        LEFT JOIN rent_ranked r ON tk.vehicle_number = r.vehicle_number AND tk.partner_id = r.partner_id
+        LEFT JOIN partner_names pn ON tk.partner_id = pn.partner_id
+        LEFT JOIN uber_daily_partner_agg udpa ON tk.vehicle_number = udpa.vehicle_number AND tk.partner_id = udpa.partner_id
+        LEFT JOIN ola_daily_partner_agg odpa ON tk.vehicle_number = odpa.vehicle_number AND tk.partner_id = odpa.partner_id
+        LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
+        LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
+        LEFT JOIN challan_ontime_agg ch_on ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = ch_on.vehicle_number AND tk.partner_id = ch_on.partner_id
+        LEFT JOIN challan_late_agg ch_lt ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = ch_lt.vehicle_number AND tk.partner_id = ch_lt.partner_id
+        LEFT JOIN adj_ontime_agg adj_on ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = adj_on.vehicle_number AND tk.partner_id = adj_on.partner_id
+        LEFT JOIN adj_late_agg adj_lt ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = adj_lt.vehicle_number AND tk.partner_id = adj_lt.partner_id
+        ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
+            partner_name = EXCLUDED.partner_name,
+            city = EXCLUDED.city,
+            vehicle_model = EXCLUDED.vehicle_model,
+            rental_plan = EXCLUDED.rental_plan,
+            allotted_days = EXCLUDED.allotted_days,
+            onroad_days = EXCLUDED.onroad_days,
+            daily_rent_applied = EXCLUDED.daily_rent_applied,
+            weekly_lease_rental = EXCLUDED.weekly_lease_rental,
+            weekly_indemnity_fees = EXCLUDED.weekly_indemnity_fees,
+            net_weekly_lease_rental = EXCLUDED.net_weekly_lease_rental,
+            uber_trips = EXCLUDED.uber_trips,
+            uber_total_earnings = EXCLUDED.uber_total_earnings,
+            uber_cash_collection = EXCLUDED.uber_cash_collection,
+            uber_toll = EXCLUDED.uber_toll,
+            uber_driver_sub_charge = EXCLUDED.uber_driver_sub_charge,
+            uber_incentive = EXCLUDED.uber_incentive,
+            uber_week_os = EXCLUDED.uber_week_os,
+            ola_trips = EXCLUDED.ola_trips,
+            ola_net_revenue = EXCLUDED.ola_net_revenue,
+            ola_cash_collection = EXCLUDED.ola_cash_collection,
+            ola_toll = EXCLUDED.ola_toll,
+            ola_gst = EXCLUDED.ola_gst,
+            ola_online_payment = EXCLUDED.ola_online_payment,
+            ola_incentive = EXCLUDED.ola_incentive,
+            ola_week_os = EXCLUDED.ola_week_os,
+            adjustment_amount = EXCLUDED.adjustment_amount,
+            prior_period_adjustment_amount = EXCLUDED.prior_period_adjustment_amount,
+            challan_amount = EXCLUDED.challan_amount,
+            challan_adjustment_amount = EXCLUDED.challan_adjustment_amount,
+            current_week_os = EXCLUDED.current_week_os,
+            net_to_collect_from_driver = EXCLUDED.net_to_collect_from_driver,
+            net_payout_to_driver = EXCLUDED.net_payout_to_driver,
+            settlement_status = EXCLUDED.settlement_status,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE hisaab_vehicle_payout_weekly.settlement_status <> 'FROZEN';
+
+        RAISE NOTICE 'Completed payout sync for week %', v_week.week_id;
+    END LOOP;
+END;
+$procedure$;
