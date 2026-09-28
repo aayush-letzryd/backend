@@ -18,6 +18,7 @@ The **LetzRyd Hisaab Engine** serves as the automated financial, operational, an
      - **Uber Telemetry & Revenue** (Trips, Earnings, Cash Collected, Toll, Driver Subscription, Incentive, Week O/S)
      - **Ola Telemetry & Revenue** (Trips, Revenue, Cash Collected, Toll, GST, Online Payouts, Incentive, Week O/S)
      - **Core Adjustments (LIVE)**: Seamlessly integrates approved credits/debits from `public.core_adjustments` with full polarity support (+ Debit, - Credit).
+     - **Traffic & Sticker Challans (LIVE)**: Seamlessly integrates unpaid fines from `public.core_challans` (`TRAFFIC_FINE` and `STICKER_FINE`) attributed to driver custody on `violation_date` via `daily_rent_log`. Fines marked `PAID` are strictly excluded.
      - **Current Week O/S & Driver Payouts**: Real-time evaluation of `current_week_os`, `net_to_collect_from_driver`, and `net_payout_to_driver`.
 
 ---
@@ -56,6 +57,15 @@ $$\text{Uber Week O/S} = \text{Uber Total Earnings} - \text{Uber Cash Collection
 
 ### Ola Week Outstanding (O/S):
 $$\text{Ola Week O/S} = \text{Ola Net Revenue} - \text{Ola Cash Collection}$$
+
+### Challan Deductions:
+$$\text{Challan Amount} = \sum \text{Pending Fine Amount} \quad (\text{where } \text{status} = \text{'UNPAID'} \land \text{liability} \in \{\text{'TRAFFIC\_FINE'}, \text{'STICKER\_FINE'}\})$$
+*Attributed strictly to driver custody on `violation_date` via `daily_rent_log`.*
+
+### Current Week Outstanding (O/S) & Payouts:
+$$\text{Current Week O/S} = \text{Net Weekly Lease Rental} - (\text{Uber Week O/S} + \text{Ola Week O/S}) + \text{Challan Amount} + \text{Adjustment Amount}$$
+$$\text{Net to Collect from Driver} = \max(0, \text{Current Week O/S})$$
+$$\text{Net Payout to Driver} = \max(0, -\text{Current Week O/S})$$
 
 ---
 
