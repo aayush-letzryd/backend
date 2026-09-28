@@ -138,10 +138,37 @@ BEGIN
               AND v_ola_count = 0
             GROUP BY UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
         ),
-        uber_daily_partner_agg AS (
+        -- daily_driver_custody must be defined before uber_daily_partner_agg and
+        -- ola_daily_partner_agg which reference it. Picks exactly one primary partner
+        -- per (vehicle, date): (1) non-SYSTEM_ONBOARDED first, (2) highest net_daily_rent,
+        -- (3) latest id to break ties.
+        daily_driver_custody AS (
             SELECT 
+                d.log_date,
                 d.vehicle_number,
                 d.partner_id,
+                ROW_NUMBER() OVER (
+                    PARTITION BY d.log_date, d.vehicle_number
+                    ORDER BY 
+                        CASE WHEN COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED' THEN 0 ELSE 1 END,
+                        d.net_daily_rent DESC,
+                        d.id DESC
+                ) AS custody_rank
+            FROM public.daily_rent_log d
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+        ),
+        -- FIX (2026-09-28): Use daily_driver_custody (rank=1) to ensure each day's
+        -- Uber/Ola trips are attributed to exactly ONE partner — the primary custodian
+        -- for that day. Previously, joining raw daily_rent_log meant a vehicle with
+        -- partner mismatch (DRL partner != Hisaab partner) caused trips to land on the
+        -- wrong hisaab row. The correct partner row then got udpa=NULL but COALESCE
+        -- could not fall back to weekly because another partner's udpa had already
+        -- consumed the weekly total. Fix: use custody_rank=1 from daily_driver_custody
+        -- (already computed above) so trips are uniquely attributed per vehicle per day.
+        uber_daily_partner_agg AS (
+            SELECT 
+                dc.vehicle_number,
+                dc.partner_id,
                 COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
                 COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
                 COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
@@ -151,17 +178,17 @@ BEGIN
                     ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
                     - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
                 ), 0.00) AS uber_week_os
-            FROM public.daily_rent_log d
+            FROM daily_driver_custody dc
             JOIN public.core_uber_daily u
-              ON u.operational_date = d.log_date
-             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
-            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
-            GROUP BY d.vehicle_number, d.partner_id
+              ON u.operational_date = dc.log_date
+             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = dc.vehicle_number
+            WHERE dc.custody_rank = 1
+            GROUP BY dc.vehicle_number, dc.partner_id
         ),
         ola_daily_partner_agg AS (
             SELECT 
-                d.vehicle_number,
-                d.partner_id,
+                dc.vehicle_number,
+                dc.partner_id,
                 COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
                 COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
                 COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
@@ -173,12 +200,12 @@ BEGIN
                     ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
                     - ABS(o.cash_collected)
                 ), 0.00) AS ola_week_os
-            FROM public.daily_rent_log d
+            FROM daily_driver_custody dc
             JOIN public.core_ola_daily o
-              ON o.service_date = d.log_date
-             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
-            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
-            GROUP BY d.vehicle_number, d.partner_id
+              ON o.service_date = dc.log_date
+             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = dc.vehicle_number
+            WHERE dc.custody_rank = 1
+            GROUP BY dc.vehicle_number, dc.partner_id
         ),
         adj_agg AS (
             SELECT 
@@ -203,21 +230,6 @@ BEGIN
               AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
-        ),
-        daily_driver_custody AS (
-            SELECT 
-                d.log_date,
-                d.vehicle_number,
-                d.partner_id,
-                ROW_NUMBER() OVER (
-                    PARTITION BY d.log_date, d.vehicle_number
-                    ORDER BY 
-                        CASE WHEN COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED' THEN 0 ELSE 1 END,
-                        d.net_daily_rent DESC,
-                        d.id DESC
-                ) AS custody_rank
-            FROM public.daily_rent_log d
-            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
         ),
         challan_daily_partner_agg AS (
             SELECT 
@@ -831,7 +843,7 @@ BEGIN
                 UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
                 COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
                 COALESCE(SUM(ABS(o.ola_net_revenue)), 0.00) AS ola_net_revenue,
-                COALESCE(SUM(ABS(o.ola_cash_collection)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.ola_cash_collected)), 0.00) AS ola_cash_collection,
                 COALESCE(SUM(ABS(o.ola_toll)), 0.00) AS ola_toll,
                 0.00 AS ola_gst,
                 COALESCE(SUM(ABS(o.ola_online_payment_deductions)), 0.00) AS ola_online_payment,
@@ -865,48 +877,6 @@ BEGIN
               AND v_ola_count = 0
             GROUP BY UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
         ),
-        uber_daily_partner_agg AS (
-            SELECT 
-                d.vehicle_number,
-                d.partner_id,
-                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
-                COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
-                COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
-                COALESCE(SUM(ABS(u.tolls_refunded)), 0.00) AS uber_toll,
-                COALESCE(SUM(ABS(u.driver_subscription_charge)), 0.00) AS uber_driver_sub_charge,
-                COALESCE(SUM(
-                    ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
-                    - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
-                ), 0.00) AS uber_week_os
-            FROM public.daily_rent_log d
-            JOIN public.core_uber_daily u
-              ON u.operational_date = d.log_date
-             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
-            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
-            GROUP BY d.vehicle_number, d.partner_id
-        ),
-        ola_daily_partner_agg AS (
-            SELECT 
-                d.vehicle_number,
-                d.partner_id,
-                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
-                COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
-                COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
-                COALESCE(SUM(ABS(o.toll_and_parking)), 0.00) AS ola_toll,
-                0.00 AS ola_gst,
-                COALESCE(SUM(ABS(o.online_payouts)), 0.00) AS ola_online_payment,
-                COALESCE(SUM(ABS(o.portal_incentive)), 0.00) AS ola_incentive,
-                COALESCE(SUM(
-                    ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
-                    - ABS(o.cash_collected)
-                ), 0.00) AS ola_week_os
-            FROM public.daily_rent_log d
-            JOIN public.core_ola_daily o
-              ON o.service_date = d.log_date
-             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = d.vehicle_number
-            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
-            GROUP BY d.vehicle_number, d.partner_id
-        ),
         all_daily_custody AS (
             SELECT 
                 d.log_date,
@@ -920,6 +890,50 @@ BEGIN
                         d.id DESC
                 ) AS custody_rank
             FROM public.daily_rent_log d
+        ),
+        uber_daily_partner_agg AS (
+            SELECT 
+                dc.vehicle_number,
+                dc.partner_id,
+                COALESCE(SUM(u.completed_trips), 0) AS uber_trips,
+                COALESCE(SUM(ABS(u.net_fare_earnings)), 0.00) AS uber_total_earnings,
+                COALESCE(SUM(ABS(u.cash_collected)), 0.00) AS uber_cash_collection,
+                COALESCE(SUM(ABS(u.tolls_refunded)), 0.00) AS uber_toll,
+                COALESCE(SUM(ABS(u.driver_subscription_charge)), 0.00) AS uber_driver_sub_charge,
+                COALESCE(SUM(
+                    ABS(u.net_fare_earnings) + ABS(u.tolls_refunded)
+                    - ABS(u.cash_collected) - ABS(u.driver_subscription_charge)
+                ), 0.00) AS uber_week_os
+            FROM all_daily_custody dc
+            JOIN public.core_uber_daily u
+              ON u.operational_date = dc.log_date
+             AND UPPER(REPLACE(REPLACE(u.vehicle_number, ' ', ''), '-', '')) = dc.vehicle_number
+            WHERE dc.custody_rank = 1
+              AND dc.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY dc.vehicle_number, dc.partner_id
+        ),
+        ola_daily_partner_agg AS (
+            SELECT 
+                dc.vehicle_number,
+                dc.partner_id,
+                COALESCE(SUM(o.completed_trips), 0) AS ola_trips,
+                COALESCE(SUM(ABS(o.operator_bill)), 0.00) AS ola_net_revenue,
+                COALESCE(SUM(ABS(o.cash_collected)), 0.00) AS ola_cash_collection,
+                COALESCE(SUM(ABS(o.toll_and_parking)), 0.00) AS ola_toll,
+                0.00 AS ola_gst,
+                COALESCE(SUM(ABS(o.online_payouts)), 0.00) AS ola_online_payment,
+                COALESCE(SUM(ABS(o.portal_incentive)), 0.00) AS ola_incentive,
+                COALESCE(SUM(
+                    ABS(o.operator_bill) + ABS(o.portal_incentive) + ABS(o.toll_and_parking)
+                    - ABS(o.cash_collected)
+                ), 0.00) AS ola_week_os
+            FROM all_daily_custody dc
+            JOIN public.core_ola_daily o
+              ON o.service_date = dc.log_date
+             AND UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', '')) = dc.vehicle_number
+            WHERE dc.custody_rank = 1
+              AND dc.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY dc.vehicle_number, dc.partner_id
         ),
         -- 1. On-Time In-Week Challans (Violation in week AND created <= Monday 11:00 AM)
         challan_ontime_agg AS (
