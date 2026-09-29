@@ -13,7 +13,11 @@
 --     (vehicle_reg_no, violation_date, challan_amount) to enrich remarks/tab metadata without duplicates.
 --     Historical/unscraped Bangalore sheet records are preserved as fallback.
 --   - Mumbai & Hyderabad: sheet_challans is primary source for all active violations.
---   - Zero-Fine Routine Audits: 54,000+ weekly balance checks (challan_amount = 0) are excluded.
+--   - Ledger Reconciliation Anchor: For all cities, the latest weekly sheet tab serves as the
+--     authoritative ledger of true net pending dues per vehicle (Column K: total_pending).
+--     Active dues are allocated LIFO across the most recent itemized notices, while fully cleared
+--     vehicles (total_pending = 0) have historical notices marked PAID. Carried-forward balances
+--     without itemized rows are held on the vehicle's latest balance record (PREVIOUS_PENDING).
 --
 -- Architectural Guarantees:
 --   - 100% Downstream: Source tables (vehicle_challans, sheet_challans) are NEVER modified or locked.
@@ -45,7 +49,7 @@ CREATE TABLE IF NOT EXISTS public.core_challans (
     offence_description TEXT,               -- Official police offence (e.g. 'JUMPING TRAFFIC SIGNALS')
     police_station VARCHAR(255),            -- Police station or ITMS camera junction
     violation_location TEXT,                -- Full junction/road description
-    liability_type VARCHAR(50) NOT NULL DEFAULT 'TRAFFIC_FINE', -- 'TRAFFIC_FINE', 'STICKER_FINE'
+    liability_type VARCHAR(50) NOT NULL DEFAULT 'TRAFFIC_FINE', -- 'TRAFFIC_FINE', 'STICKER_FINE', 'PREVIOUS_PENDING'
     
     -- Financial Breakdown (Money to Ask For)
     challan_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00,      -- Official government fine
@@ -121,9 +125,9 @@ BEGIN
         COALESCE(v.fine_amount, 0.00),
         0.00,
         COALESCE(v.fine_amount, 0.00),
-        CASE WHEN v.payment_status = 'PAID' THEN COALESCE(v.fine_amount, 0.00) ELSE 0.00 END,
-        CASE WHEN v.payment_status = 'PAID' THEN 0.00 ELSE COALESCE(v.fine_amount, 0.00) END,
-        COALESCE(v.payment_status, 'UNPAID'),
+        0.00,
+        COALESCE(v.fine_amount, 0.00),
+        'UNPAID',
         v.last_scraped_at,
         FALSE,
         CURRENT_TIMESTAMP,
@@ -134,9 +138,8 @@ BEGIN
       AND v.violation_date IS NOT NULL AND v.violation_date <> 'N/A'
       AND v.violation_date ~ '^[0-9]{2}-[0-9]{2}-[0-9]{4}'
     ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
-    SET payment_status = EXCLUDED.payment_status,
-        amount_paid = EXCLUDED.amount_paid,
-        net_pending_amount = EXCLUDED.net_pending_amount,
+    SET challan_amount = EXCLUDED.challan_amount,
+        total_fine_amount = EXCLUDED.total_fine_amount,
         scraped_at = EXCLUDED.scraped_at,
         updated_at = CURRENT_TIMESTAMP;
 
@@ -174,8 +177,6 @@ BEGIN
             sheet_row_number = d.sheet_row_number,
             sticker_fine = COALESCE(d.sticker_fine, c.sticker_fine),
             total_fine_amount = c.challan_amount + COALESCE(d.sticker_fine, 0.00),
-            amount_paid = GREATEST(c.amount_paid, COALESCE(d.amount_paid, 0.00)),
-            net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(d.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(d.amount_paid, 0.00))),
             remarks = COALESCE(d.remarks, c.remarks),
             updated_at = CURRENT_TIMESTAMP
         FROM duplicate_fallbacks d
@@ -215,46 +216,13 @@ BEGIN
         sheet_row_number = m.sheet_row_number,
         sticker_fine = COALESCE(m.sticker_fine, c.sticker_fine),
         total_fine_amount = c.challan_amount + COALESCE(m.sticker_fine, 0.00),
-        amount_paid = GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00)),
-        net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(m.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00))),
-        payment_status = CASE 
-            WHEN c.payment_status = 'PAID' THEN 'PAID'
-            WHEN GREATEST(0.00, c.challan_amount + COALESCE(m.sticker_fine, 0.00) - GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00))) <= 0 THEN 'PAID'
-            WHEN GREATEST(c.amount_paid, COALESCE(m.amount_paid, 0.00)) > 0 THEN 'PARTIALLY_PAID'
-            ELSE 'UNPAID'
-        END,
         remarks = COALESCE(NULLIF(TRIM(m.remarks), ''), c.remarks),
         updated_at = CURRENT_TIMESTAMP
     FROM ranked_sheet_matches m
     WHERE c.id = m.core_id AND m.rn = 1;
 
     -- -------------------------------------------------------------------------
-    -- 4. Update Existing Bangalore SHEET_FALLBACK Records on Sheet Changes
-    -- -------------------------------------------------------------------------
-    UPDATE core_challans c
-    SET amount_paid = COALESCE(s.amount_paid, 0.00),
-        sticker_fine = COALESCE(s.sticker_fine, 0.00),
-        total_fine_amount = c.challan_amount + COALESCE(s.sticker_fine, 0.00),
-        net_pending_amount = GREATEST(0.00, c.challan_amount + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
-        payment_status = CASE 
-            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
-            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
-            ELSE 'UNPAID'
-        END,
-        remarks = COALESCE(NULLIF(TRIM(s.remarks), ''), c.remarks),
-        updated_at = CURRENT_TIMESTAMP
-    FROM sheet_challans s
-    WHERE c.sheet_challan_id = s.id 
-      AND c.source_priority = 'SHEET_FALLBACK'
-      AND c.city = 'Bangalore'
-      AND (
-          c.amount_paid IS DISTINCT FROM COALESCE(s.amount_paid, 0.00) OR
-          c.sticker_fine IS DISTINCT FROM COALESCE(s.sticker_fine, 0.00) OR
-          c.remarks IS DISTINCT FROM NULLIF(TRIM(s.remarks), '')
-      );
-
-    -- -------------------------------------------------------------------------
-    -- 5. Ingest New Unmatched Bangalore Historical Records (SHEET_FALLBACK)
+    -- 4. Ingest New Unmatched Bangalore Historical Records (SHEET_FALLBACK)
     -- -------------------------------------------------------------------------
     INSERT INTO public.core_challans (
         source_system, source_priority, sheet_challan_id,
@@ -279,13 +247,9 @@ BEGIN
         COALESCE(s.challan_amount, 0.00),
         COALESCE(s.sticker_fine, 0.00),
         COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
-        COALESCE(s.amount_paid, 0.00),
-        GREATEST(0.00, COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
-        CASE 
-            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
-            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
-            ELSE 'UNPAID'
-        END,
+        0.00,
+        COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
+        'UNPAID',
         s.source_tab,
         s.sheet_row_number,
         NULLIF(TRIM(s.remarks), ''),
@@ -298,14 +262,12 @@ BEGIN
       AND (s.challan_amount > 0 OR s.sticker_fine > 0)
       AND c.id IS NULL
     ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
-    SET amount_paid = EXCLUDED.amount_paid,
-        net_pending_amount = EXCLUDED.net_pending_amount,
-        payment_status = EXCLUDED.payment_status,
+    SET total_fine_amount = EXCLUDED.total_fine_amount,
         remarks = EXCLUDED.remarks,
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 6. Ingest / Update Mumbai and Hyderabad Active Fines (SHEET_PRIMARY)
+    -- 5. Ingest / Update Mumbai and Hyderabad Active Fines (SHEET_PRIMARY)
     -- -------------------------------------------------------------------------
     INSERT INTO public.core_challans (
         source_system, source_priority, sheet_challan_id,
@@ -330,13 +292,9 @@ BEGIN
         COALESCE(s.challan_amount, 0.00),
         COALESCE(s.sticker_fine, 0.00),
         COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
-        COALESCE(s.amount_paid, 0.00),
-        GREATEST(0.00, COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00) - COALESCE(s.amount_paid, 0.00)),
-        CASE 
-            WHEN COALESCE(s.total_pending, 0.00) <= 0 AND (COALESCE(s.challan_amount, 0) > 0 OR COALESCE(s.sticker_fine, 0) > 0) THEN 'PAID'
-            WHEN COALESCE(s.amount_paid, 0.00) > 0 AND COALESCE(s.total_pending, 0.00) > 0 THEN 'PARTIALLY_PAID'
-            ELSE 'UNPAID'
-        END,
+        0.00,
+        COALESCE(s.challan_amount, 0.00) + COALESCE(s.sticker_fine, 0.00),
+        'UNPAID',
         s.source_tab,
         s.sheet_row_number,
         NULLIF(TRIM(s.remarks), ''),
@@ -347,31 +305,167 @@ BEGIN
     WHERE s.city IN ('Hyderabad', 'Mumbai')
       AND (s.challan_amount > 0 OR s.sticker_fine > 0)
     ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
-    SET amount_paid = EXCLUDED.amount_paid,
-        net_pending_amount = EXCLUDED.net_pending_amount,
-        payment_status = EXCLUDED.payment_status,
+    SET total_fine_amount = EXCLUDED.total_fine_amount,
         remarks = EXCLUDED.remarks,
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 7. Bangalore Scraper Authority Reconciliation (Auto-Clear Rule)
-    --    If Karnataka One scraper has checked a vehicle and confirmed it has
-    --    NO_FINES / zero pending, or if all notices on Karnataka One are PAID,
-    --    mark older synthetic traffic fines for that vehicle as PAID.
+    -- 6. Operational Ledger Reconciliation (FIFO/LIFO Fine Settlement Engine)
+    --    Uses the latest weekly sheet tab as the authoritative pending balance.
+    --    Allocates target_pending across the most recent itemized notices.
     -- -------------------------------------------------------------------------
-    WITH latest_scraper AS (
-        SELECT DISTINCT ON (vehicle_reg_no)
-            vehicle_reg_no, status, total_amount_pending, last_scraped_at
-        FROM public.vehicle_challans
-        ORDER BY vehicle_reg_no, last_scraped_at DESC
+    WITH latest_sheet_tab AS (
+        SELECT source_tab
+        FROM public.sheet_challans
+        ORDER BY id DESC
+        LIMIT 1
     ),
-    unpaid_scraper_notices AS (
-        SELECT vehicle_reg_no, count(*) as num_unpaid
-        FROM public.vehicle_challans
-        WHERE status = 'HAS_FINES' AND payment_status = 'UNPAID'
+    tab_target AS (
+        SELECT 
+            city,
+            vehicle_reg_no,
+            MAX(total_pending) as target_pending
+        FROM sheet_challans
+        WHERE source_tab = (SELECT source_tab FROM latest_sheet_tab)
+        GROUP BY city, vehicle_reg_no
+    ),
+    core_notices AS (
+        SELECT 
+            c.id,
+            c.vehicle_reg_no,
+            c.total_fine_amount,
+            COALESCE(t.target_pending, 0.0) as target_pending,
+            SUM(c.total_fine_amount) OVER(
+                PARTITION BY c.vehicle_reg_no 
+                ORDER BY c.violation_date DESC, c.id DESC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) as running_fine_sum,
+            COALESCE(SUM(c.total_fine_amount) OVER(
+                PARTITION BY c.vehicle_reg_no 
+                ORDER BY c.violation_date DESC, c.id DESC
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ), 0.0) as prev_running_fine_sum
+        FROM core_challans c
+        LEFT JOIN tab_target t ON c.vehicle_reg_no = t.vehicle_reg_no
+        WHERE c.is_deleted = FALSE AND c.notice_no NOT LIKE 'BAL-%'
+    ),
+    itemized_allocated AS (
+        SELECT 
+            id,
+            CASE 
+                WHEN target_pending <= 0 THEN 0.0
+                WHEN target_pending <= prev_running_fine_sum THEN 0.0
+                WHEN target_pending >= running_fine_sum THEN total_fine_amount
+                ELSE target_pending - prev_running_fine_sum
+            END as computed_pending,
+            CASE 
+                WHEN target_pending <= 0 THEN 'PAID'
+                WHEN target_pending <= prev_running_fine_sum THEN 'PAID'
+                WHEN target_pending >= running_fine_sum THEN 'UNPAID'
+                ELSE 'PARTIALLY_PAID'
+            END as computed_status
+        FROM core_notices
+    )
+    UPDATE core_challans c
+    SET net_pending_amount = a.computed_pending,
+        amount_paid = GREATEST(0.00, c.total_fine_amount - a.computed_pending),
+        payment_status = a.computed_status,
+        updated_at = CURRENT_TIMESTAMP
+    FROM itemized_allocated a
+    WHERE c.id = a.id
+      AND (c.net_pending_amount IS DISTINCT FROM a.computed_pending 
+           OR c.payment_status IS DISTINCT FROM a.computed_status);
+
+    -- -------------------------------------------------------------------------
+    -- 7. Ingest / Reconcile Carried Forward Balance Deficits (PREVIOUS_PENDING)
+    --    If a vehicle has un-itemized opening dues in the ops sheet that exceed
+    --    its itemized notices, hold the remaining balance on its latest BAL- record.
+    -- -------------------------------------------------------------------------
+    WITH latest_sheet_tab AS (
+        SELECT source_tab
+        FROM public.sheet_challans
+        ORDER BY id DESC
+        LIMIT 1
+    ),
+    tab_target AS (
+        SELECT 
+            city,
+            vehicle_reg_no,
+            MAX(total_pending) as target_pending
+        FROM sheet_challans
+        WHERE source_tab = (SELECT source_tab FROM latest_sheet_tab)
+        GROUP BY city, vehicle_reg_no
+    ),
+    active_itemized_sums AS (
+        SELECT 
+            vehicle_reg_no,
+            SUM(net_pending_amount) as itemized_pending
+        FROM core_challans
+        WHERE is_deleted = FALSE 
+          AND notice_no NOT LIKE 'BAL-%'
+          AND payment_status IN ('UNPAID', 'PARTIALLY_PAID')
         GROUP BY vehicle_reg_no
     ),
-    latest_sheet_tab AS (
+    latest_bal_sheet_rows AS (
+        SELECT DISTINCT ON (s.vehicle_reg_no)
+            s.id as sheet_id,
+            s.vehicle_reg_no,
+            s.city,
+            s.notice_no,
+            COALESCE(s.violation_date, s.audit_date, s.notice_date, '2026-09-21'::date) as violation_date,
+            s.source_tab,
+            s.sheet_row_number,
+            GREATEST(0.00, t.target_pending - COALESCE(i.itemized_pending, 0.00)) as deficit_pending
+        FROM sheet_challans s
+        JOIN tab_target t ON s.vehicle_reg_no = t.vehicle_reg_no
+        LEFT JOIN active_itemized_sums i ON s.vehicle_reg_no = i.vehicle_reg_no
+        WHERE s.source_tab = (SELECT source_tab FROM latest_sheet_tab)
+          AND s.notice_no LIKE 'BAL-%'
+        ORDER BY s.vehicle_reg_no, s.id DESC
+    )
+    INSERT INTO public.core_challans (
+        source_system, source_priority, sheet_challan_id,
+        vehicle_reg_no, city,
+        notice_no, violation_date, violation_time, notice_date, audit_date,
+        liability_type, challan_amount, sticker_fine, total_fine_amount, amount_paid, net_pending_amount,
+        payment_status, source_tab, sheet_row_number, remarks,
+        is_deleted, created_at, updated_at
+    )
+    SELECT 
+        'GOOGLE_SHEET',
+        'SHEET_PRIMARY',
+        b.sheet_id,
+        b.vehicle_reg_no,
+        b.city,
+        b.notice_no,
+        b.violation_date,
+        NULL,
+        NULL,
+        b.violation_date,
+        'PREVIOUS_PENDING',
+        b.deficit_pending,
+        0.00,
+        b.deficit_pending,
+        0.00,
+        b.deficit_pending,
+        CASE WHEN b.deficit_pending > 0 THEN 'UNPAID' ELSE 'PAID' END,
+        b.source_tab,
+        b.sheet_row_number,
+        'Carried forward opening balance from ops ledger',
+        FALSE,
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+    FROM latest_bal_sheet_rows b
+    ON CONFLICT (vehicle_reg_no, notice_no) DO UPDATE
+    SET challan_amount = EXCLUDED.challan_amount,
+        total_fine_amount = EXCLUDED.total_fine_amount,
+        amount_paid = EXCLUDED.amount_paid,
+        net_pending_amount = EXCLUDED.net_pending_amount,
+        payment_status = EXCLUDED.payment_status,
+        updated_at = CURRENT_TIMESTAMP;
+
+    -- Expire any older BAL- records from earlier sheets so only the latest tab deficit is active
+    WITH latest_sheet_tab AS (
         SELECT source_tab
         FROM public.sheet_challans
         ORDER BY id DESC
@@ -379,45 +473,14 @@ BEGIN
     )
     UPDATE public.core_challans c
     SET payment_status = 'PAID',
-        amount_paid = c.total_fine_amount,
         net_pending_amount = 0.00,
         updated_at = CURRENT_TIMESTAMP
-    FROM latest_scraper s
-    LEFT JOIN unpaid_scraper_notices u ON u.vehicle_reg_no = s.vehicle_reg_no
-    WHERE c.city = 'Bangalore'
-      AND c.vehicle_reg_no = s.vehicle_reg_no
-      AND c.payment_status = 'UNPAID'
-      AND c.liability_type = 'TRAFFIC_FINE'
-      AND (
-          s.status = 'NO_FINES'
-          OR s.total_amount_pending = 0.00
-          OR (s.status = 'HAS_FINES' AND COALESCE(u.num_unpaid, 0) = 0 AND c.source_tab <> (SELECT source_tab FROM latest_sheet_tab))
-      );
+    WHERE c.notice_no LIKE 'BAL-%'
+      AND c.source_tab <> (SELECT source_tab FROM latest_sheet_tab)
+      AND c.payment_status <> 'PAID';
 
     -- -------------------------------------------------------------------------
-    -- 8. Mumbai & Hyderabad Sheet Balance Auto-Clear Rule
-    --    If the ops team's latest weekly tab shows total_pending = 0 for a vehicle,
-    --    all its historical fines in core_challans are marked PAID.
-    -- -------------------------------------------------------------------------
-    WITH latest_sheet_per_veh AS (
-        SELECT DISTINCT ON (vehicle_reg_no)
-            vehicle_reg_no, city, source_tab, total_pending, id
-        FROM public.sheet_challans
-        ORDER BY vehicle_reg_no, id DESC
-    )
-    UPDATE public.core_challans c
-    SET payment_status = 'PAID',
-        amount_paid = c.total_fine_amount,
-        net_pending_amount = 0.00,
-        updated_at = CURRENT_TIMESTAMP
-    FROM latest_sheet_per_veh s
-    WHERE c.city IN ('Mumbai', 'Hyderabad')
-      AND c.vehicle_reg_no = s.vehicle_reg_no
-      AND c.payment_status = 'UNPAID'
-      AND s.total_pending = 0.00;
-
-    -- -------------------------------------------------------------------------
-    -- 9. Soft Delete Mirroring
+    -- 8. Soft Delete Mirroring
     -- -------------------------------------------------------------------------
     UPDATE core_challans c
     SET is_deleted = TRUE,
@@ -437,12 +500,12 @@ SELECT
     vehicle_reg_no,
     city,
     COUNT(*) AS total_violations_incurred,
-    COUNT(CASE WHEN payment_status = 'UNPAID' THEN 1 END) AS pending_challans_count,
+    COUNT(CASE WHEN payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN 1 END) AS pending_challans_count,
     SUM(challan_amount) AS total_police_fines,
     SUM(sticker_fine) AS total_sticker_fines,
-    SUM(CASE WHEN payment_status = 'UNPAID' THEN net_pending_amount ELSE 0.00 END) AS total_pending_amount,
-    MIN(CASE WHEN payment_status = 'UNPAID' THEN violation_date END) AS earliest_pending_date,
-    MAX(CASE WHEN payment_status = 'UNPAID' THEN violation_date END) AS latest_pending_date
+    SUM(CASE WHEN payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN net_pending_amount ELSE 0.00 END) AS total_pending_amount,
+    MIN(CASE WHEN payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN violation_date END) AS earliest_pending_date,
+    MAX(CASE WHEN payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN violation_date END) AS latest_pending_date
 FROM public.core_challans
 WHERE is_deleted = FALSE
 GROUP BY vehicle_reg_no, city;
@@ -455,10 +518,10 @@ SELECT
     c.vehicle_reg_no,
     c.city,
     COUNT(*) AS total_violations,
-    COUNT(CASE WHEN c.payment_status = 'UNPAID' THEN 1 END) AS pending_count,
+    COUNT(CASE WHEN c.payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN 1 END) AS pending_count,
     SUM(c.challan_amount) AS week_police_fine,
     SUM(c.sticker_fine) AS week_sticker_fine,
-    SUM(CASE WHEN c.payment_status = 'UNPAID' THEN c.net_pending_amount ELSE 0.00 END) AS week_pending_amount,
+    SUM(CASE WHEN c.payment_status IN ('UNPAID', 'PARTIALLY_PAID') THEN c.net_pending_amount ELSE 0.00 END) AS week_pending_amount,
     STRING_AGG(c.notice_no, ', ' ORDER BY c.violation_date) AS notice_numbers
 FROM public.core_challans c
 LEFT JOIN public.hisaab_settlement_weeks w 
