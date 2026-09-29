@@ -2031,10 +2031,13 @@ BEGIN
         COALESCE(w.vehicle_model, ''),
         UPPER(TRIM(COALESCE(w.partner_id, ''))) AS partner_id,
         COALESCE(w.partner_name, ''),
-        CASE 
-            WHEN w.partner_id ILIKE '%IP%' OR w.partner_id ILIKE '%OP%' THEN 'Operator' 
-            ELSE 'Individual' 
-        END AS partner_type,
+        COALESCE(
+            (SELECT pw.partner_type FROM public.hisaab_partner_weekly pw WHERE pw.week_id = w.week_id AND pw.partner_id = w.partner_id LIMIT 1),
+            CASE 
+                WHEN w.partner_id ILIKE '%IP%' OR w.partner_id ILIKE '%OP%' OR w.partner_id = 'SYSTEM_ONBOARDED' THEN 'Operator' 
+                ELSE 'Individual' 
+            END
+        ) AS partner_type,
         COALESCE(w.rental_plan, ''),
         
         COALESCE(w.allotted_days, 7)::INT,
