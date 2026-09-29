@@ -103,8 +103,12 @@ BEGIN
                 ra.*,
                 ROW_NUMBER() OVER(
                     PARTITION BY UPPER(REPLACE(REPLACE(ra.vehicle_number, ' ', ''), '-', '')) 
-                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC
-                ) as partner_rank
+                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC, ra.partner_id DESC
+                ) as partner_rank,
+                ROW_NUMBER() OVER(
+                    PARTITION BY ra.partner_id 
+                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC, ra.vehicle_number DESC
+                ) as partner_veh_rank
             FROM rent_agg ra
         ),
         uber_agg AS (
@@ -370,11 +374,49 @@ BEGIN
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
+        -- Adjustments where vehicle number is null/blank or not in active fleet
+        adj_unmapped_partner AS (
+            SELECT 
+                c.partner_id,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_unmapped_adj
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND (
+                  c.vehicle_number IS NULL 
+                  OR TRIM(c.vehicle_number) = '' 
+                  OR UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) NOT IN (
+                      SELECT UPPER(REPLACE(REPLACE(vehicle_number, ' ', ''), '-', '')) FROM rent_agg
+                  )
+              )
+            GROUP BY c.partner_id
+        ),
+        adj_unmapped_phone AS (
+            SELECT 
+                RIGHT(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g'), 10) AS partner_phone,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_unmapped_adj
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND LENGTH(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g')) >= 10
+              AND (
+                  c.vehicle_number IS NULL 
+                  OR TRIM(c.vehicle_number) = '' 
+                  OR UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) NOT IN (
+                      SELECT UPPER(REPLACE(REPLACE(vehicle_number, ' ', ''), '-', '')) FROM rent_agg
+                  )
+              )
+            GROUP BY RIGHT(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g'), 10)
+        ),
         partner_matched_adj AS (
             SELECT 
                 r.vehicle_number,
                 r.partner_id,
+                r.partner_phone,
                 r.partner_rank,
+                r.partner_veh_rank,
                 COALESCE(ae.net_adj_signed, ap.net_adj_signed, 0.00) AS direct_matched_adj
             FROM rent_ranked r
             LEFT JOIN adj_exact ae ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = ae.vehicle_number AND r.partner_id = ae.partner_id
@@ -392,13 +434,21 @@ BEGIN
                 pma.vehicle_number,
                 pma.partner_id,
                 pma.partner_rank,
-                CASE 
+                pma.partner_veh_rank,
+                (CASE 
                     WHEN pma.partner_rank = 1 THEN pma.direct_matched_adj + (COALESCE(avt.net_adj_signed, 0.00) - vms.total_direct_matched)
                     ELSE pma.direct_matched_adj
-                END AS final_adj_signed
+                END)
+                +
+                (CASE 
+                    WHEN pma.partner_veh_rank = 1 THEN COALESCE(aup.net_unmapped_adj, auph.net_unmapped_adj, 0.00)
+                    ELSE 0.00
+                END) AS final_adj_signed
             FROM partner_matched_adj pma
             JOIN veh_matched_sums vms ON pma.vehicle_number = vms.vehicle_number
             LEFT JOIN adj_veh_total avt ON UPPER(REPLACE(REPLACE(pma.vehicle_number, ' ', ''), '-', '')) = avt.vehicle_number
+            LEFT JOIN adj_unmapped_partner aup ON pma.partner_id = aup.partner_id
+            LEFT JOIN adj_unmapped_phone auph ON pma.partner_phone = auph.partner_phone AND aup.partner_id IS NULL
         ),
         -- Direct custody match for challans based on exact violation date
         challan_direct_custody AS (
@@ -1177,7 +1227,7 @@ BEGIN
         -- Clean up orphaned / stale rows in hisaab_vehicle_payout_weekly
         DELETE FROM public.hisaab_vehicle_payout_weekly h
         WHERE h.week_id = v_week.week_id
-          AND h.settlement_status <> 'FROZEN'
+          AND (p_week_id IS NOT NULL OR h.settlement_status <> 'FROZEN')
           AND (
               NOT EXISTS (
                   SELECT 1 FROM public.daily_rent_log d
@@ -1238,8 +1288,12 @@ BEGIN
                 ra.*,
                 ROW_NUMBER() OVER(
                     PARTITION BY UPPER(REPLACE(REPLACE(ra.vehicle_number, ' ', ''), '-', '')) 
-                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC
-                ) as partner_rank
+                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC, ra.partner_id DESC
+                ) as partner_rank,
+                ROW_NUMBER() OVER(
+                    PARTITION BY ra.partner_id 
+                    ORDER BY ra.allotted_days DESC, ra.net_weekly_lease_rental DESC, ra.vehicle_number DESC
+                ) as partner_veh_rank
             FROM rent_agg ra
         ),
         uber_agg AS (
@@ -1598,11 +1652,51 @@ BEGIN
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
+        -- Adjustments where vehicle number is null/blank or not in active fleet
+        adj_ontime_unmapped_partner AS (
+            SELECT 
+                c.partner_id,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_unmapped_adj
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND (COALESCE(c.updated_at, c.created_at) <= v_curr_cutoff OR v_week.week_start < '2026-09-21')
+              AND (
+                  c.vehicle_number IS NULL 
+                  OR TRIM(c.vehicle_number) = '' 
+                  OR UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) NOT IN (
+                      SELECT UPPER(REPLACE(REPLACE(vehicle_number, ' ', ''), '-', '')) FROM rent_agg
+                  )
+              )
+            GROUP BY c.partner_id
+        ),
+        adj_ontime_unmapped_phone AS (
+            SELECT 
+                RIGHT(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g'), 10) AS partner_phone,
+                COALESCE(SUM(CASE WHEN c.financial_direction = 'CREDIT' THEN -c.amount ELSE c.amount END), 0.00) AS net_unmapped_adj
+            FROM public.core_adjustments c
+            WHERE c.is_deleted = FALSE 
+              AND c.approval_status = 'Approved'
+              AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
+              AND (COALESCE(c.updated_at, c.created_at) <= v_curr_cutoff OR v_week.week_start < '2026-09-21')
+              AND LENGTH(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g')) >= 10
+              AND (
+                  c.vehicle_number IS NULL 
+                  OR TRIM(c.vehicle_number) = '' 
+                  OR UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) NOT IN (
+                      SELECT UPPER(REPLACE(REPLACE(vehicle_number, ' ', ''), '-', '')) FROM rent_agg
+                  )
+              )
+            GROUP BY RIGHT(REGEXP_REPLACE(c.partner_id, '[^0-9]', '', 'g'), 10)
+        ),
         partner_matched_ontime_adj AS (
             SELECT 
                 r.vehicle_number,
                 r.partner_id,
+                r.partner_phone,
                 r.partner_rank,
+                r.partner_veh_rank,
                 COALESCE(ae.net_adj_signed, ap.net_adj_signed, 0.00) AS direct_matched_adj
             FROM rent_ranked r
             LEFT JOIN adj_ontime_exact ae ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = ae.vehicle_number AND r.partner_id = ae.partner_id
@@ -1618,13 +1712,21 @@ BEGIN
                 pma.vehicle_number,
                 pma.partner_id,
                 pma.partner_rank,
-                CASE 
+                pma.partner_veh_rank,
+                (CASE 
                     WHEN pma.partner_rank = 1 THEN pma.direct_matched_adj + (COALESCE(avt.net_adj_signed, 0.00) - vms.total_direct_matched)
                     ELSE pma.direct_matched_adj
-                END AS final_adj_signed
+                END)
+                +
+                (CASE 
+                    WHEN pma.partner_veh_rank = 1 THEN COALESCE(aup.net_unmapped_adj, auph.net_unmapped_adj, 0.00)
+                    ELSE 0.00
+                END) AS final_adj_signed
             FROM partner_matched_ontime_adj pma
             JOIN veh_matched_ontime_adj_sums vms ON pma.vehicle_number = vms.vehicle_number
             LEFT JOIN adj_ontime_veh_total avt ON UPPER(REPLACE(REPLACE(pma.vehicle_number, ' ', ''), '-', '')) = avt.vehicle_number
+            LEFT JOIN adj_ontime_unmapped_partner aup ON pma.partner_id = aup.partner_id
+            LEFT JOIN adj_ontime_unmapped_phone auph ON pma.partner_phone = auph.partner_phone AND aup.partner_id IS NULL
         ),
         -- 4. Late Past Adjustments
         adj_late_agg AS (
@@ -1848,7 +1950,7 @@ BEGIN
         LEFT JOIN ola_vehicles_with_daily ovwd ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = ovwd.vehicle_number
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
-        LEFT JOIN final_ontime_adj_calc foa ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = foa.vehicle_number AND tk.partner_id = foa.partner_id
+        LEFT JOIN final_ontime_adj_calc foa ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = UPPER(REPLACE(REPLACE(foa.vehicle_number, ' ', ''), '-', '')) AND tk.partner_id = foa.partner_id
         LEFT JOIN final_ontime_challan_calc foc ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = foc.vehicle_number AND tk.partner_id = foc.partner_id
         LEFT JOIN challan_late_agg ch_lt ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = ch_lt.vehicle_number AND tk.partner_id = ch_lt.partner_id
         LEFT JOIN adj_late_agg adj_lt ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = adj_lt.vehicle_number AND tk.partner_id = adj_lt.partner_id
@@ -1890,7 +1992,7 @@ BEGIN
             net_payout_to_driver = EXCLUDED.net_payout_to_driver,
             settlement_status = EXCLUDED.settlement_status,
             updated_at = CURRENT_TIMESTAMP
-        WHERE hisaab_vehicle_payout_weekly.settlement_status <> 'FROZEN';
+        WHERE (p_week_id IS NOT NULL OR hisaab_vehicle_payout_weekly.settlement_status <> 'FROZEN');
 
         RAISE NOTICE 'Completed payout sync for week %', v_week.week_id;
     END LOOP;
