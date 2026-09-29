@@ -354,7 +354,70 @@ BEGIN
         updated_at = CURRENT_TIMESTAMP;
 
     -- -------------------------------------------------------------------------
-    -- 7. Soft Delete Mirroring
+    -- 7. Bangalore Scraper Authority Reconciliation (Auto-Clear Rule)
+    --    If Karnataka One scraper has checked a vehicle and confirmed it has
+    --    NO_FINES / zero pending, or if all notices on Karnataka One are PAID,
+    --    mark older synthetic traffic fines for that vehicle as PAID.
+    -- -------------------------------------------------------------------------
+    WITH latest_scraper AS (
+        SELECT DISTINCT ON (vehicle_reg_no)
+            vehicle_reg_no, status, total_amount_pending, last_scraped_at
+        FROM public.vehicle_challans
+        ORDER BY vehicle_reg_no, last_scraped_at DESC
+    ),
+    unpaid_scraper_notices AS (
+        SELECT vehicle_reg_no, count(*) as num_unpaid
+        FROM public.vehicle_challans
+        WHERE status = 'HAS_FINES' AND payment_status = 'UNPAID'
+        GROUP BY vehicle_reg_no
+    ),
+    latest_sheet_tab AS (
+        SELECT source_tab
+        FROM public.sheet_challans
+        ORDER BY id DESC
+        LIMIT 1
+    )
+    UPDATE public.core_challans c
+    SET payment_status = 'PAID',
+        amount_paid = c.total_fine_amount,
+        net_pending_amount = 0.00,
+        updated_at = CURRENT_TIMESTAMP
+    FROM latest_scraper s
+    LEFT JOIN unpaid_scraper_notices u ON u.vehicle_reg_no = s.vehicle_reg_no
+    WHERE c.city = 'Bangalore'
+      AND c.vehicle_reg_no = s.vehicle_reg_no
+      AND c.payment_status = 'UNPAID'
+      AND c.liability_type = 'TRAFFIC_FINE'
+      AND (
+          s.status = 'NO_FINES'
+          OR s.total_amount_pending = 0.00
+          OR (s.status = 'HAS_FINES' AND COALESCE(u.num_unpaid, 0) = 0 AND c.source_tab <> (SELECT source_tab FROM latest_sheet_tab))
+      );
+
+    -- -------------------------------------------------------------------------
+    -- 8. Mumbai & Hyderabad Sheet Balance Auto-Clear Rule
+    --    If the ops team's latest weekly tab shows total_pending = 0 for a vehicle,
+    --    all its historical fines in core_challans are marked PAID.
+    -- -------------------------------------------------------------------------
+    WITH latest_sheet_per_veh AS (
+        SELECT DISTINCT ON (vehicle_reg_no)
+            vehicle_reg_no, city, source_tab, total_pending, id
+        FROM public.sheet_challans
+        ORDER BY vehicle_reg_no, id DESC
+    )
+    UPDATE public.core_challans c
+    SET payment_status = 'PAID',
+        amount_paid = c.total_fine_amount,
+        net_pending_amount = 0.00,
+        updated_at = CURRENT_TIMESTAMP
+    FROM latest_sheet_per_veh s
+    WHERE c.city IN ('Mumbai', 'Hyderabad')
+      AND c.vehicle_reg_no = s.vehicle_reg_no
+      AND c.payment_status = 'UNPAID'
+      AND s.total_pending = 0.00;
+
+    -- -------------------------------------------------------------------------
+    -- 9. Soft Delete Mirroring
     -- -------------------------------------------------------------------------
     UPDATE core_challans c
     SET is_deleted = TRUE,
