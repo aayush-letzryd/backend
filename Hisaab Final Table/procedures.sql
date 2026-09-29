@@ -231,28 +231,18 @@ BEGIN
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
+        -- Cumulative Unpaid Challans by Vehicle: All unpaid fines on the car are added to the
+        -- current week's Hisaab regardless of violation date. Once paid, they are marked PAID
+        -- and removed automatically in subsequent runs.
         challan_daily_partner_agg AS (
             SELECT 
-                c.vehicle_number,
-                COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
-                COALESCE(SUM(c.challan_amount), 0.00) AS challan_amount
-            FROM (
-                SELECT 
-                    UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
-                    c.violation_date,
-                    COALESCE(NULLIF(c.net_pending_amount, 0.00), c.total_fine_amount) AS challan_amount,
-                    dc.partner_id
-                FROM public.core_challans c
-                LEFT JOIN daily_driver_custody dc
-                  ON c.violation_date = dc.log_date
-                 AND UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) = dc.vehicle_number
-                 AND dc.custody_rank = 1
-                WHERE c.violation_date BETWEEN v_week.week_start AND v_week.week_end
-                  AND c.is_deleted = FALSE
-                  AND c.payment_status = 'UNPAID'
-                  AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
-            ) c
-            GROUP BY c.vehicle_number, COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED')
+                UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
+                COALESCE(SUM(COALESCE(NULLIF(c.net_pending_amount, 0.00), c.total_fine_amount)), 0.00) AS challan_amount
+            FROM public.core_challans c
+            WHERE c.is_deleted = FALSE
+              AND c.payment_status = 'UNPAID'
+              AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
+            GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', ''))
         ),
         existing_hisaab AS (
             SELECT 
@@ -319,14 +309,14 @@ BEGIN
             COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
             -- Adjustment Amount (Signed: negative = credit/waiver, positive = debit/penalty)
             COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00) AS adjustment_amount,
-            -- Challan Amount (Unpaid fines attributed to driver custody on violation date)
-            COALESCE(ch.challan_amount, 0.00) AS challan_amount,
+            -- Challan Amount (All cumulative unpaid fines on vehicle; attributed to primary driver if multiple)
+            CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END AS challan_amount,
             -- Current Week O/S = Net Rent - (Uber O/S + Ola O/S) + Challans + Adjustments + Other Deductions
             (
                 r.net_weekly_lease_rental
                 - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
-                + COALESCE(ch.challan_amount, 0.00)
+                + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
@@ -336,7 +326,7 @@ BEGIN
                 r.net_weekly_lease_rental
                 - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
-                + COALESCE(ch.challan_amount, 0.00)
+                + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
@@ -346,7 +336,7 @@ BEGIN
                 r.net_weekly_lease_rental
                 - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
-                + COALESCE(ch.challan_amount, 0.00)
+                + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
@@ -363,7 +353,7 @@ BEGIN
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
         LEFT JOIN adj_agg adj ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = adj.vehicle_number AND r.partner_id = adj.partner_id
         LEFT JOIN adj_veh_fallback afb ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = afb.vehicle_number
-        LEFT JOIN challan_daily_partner_agg ch ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = ch.vehicle_number AND r.partner_id = ch.partner_id
+        LEFT JOIN challan_daily_partner_agg ch ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = ch.vehicle_number
         LEFT JOIN existing_hisaab eh ON r.vehicle_number = eh.vehicle_number AND r.partner_id = eh.partner_id
         ON CONFLICT (week_id, vehicle_number, partner_id) DO UPDATE SET
             partner_name = EXCLUDED.partner_name,
