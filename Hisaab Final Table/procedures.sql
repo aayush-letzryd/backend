@@ -25,6 +25,30 @@ BEGIN
         SELECT COUNT(*) INTO v_uber_count FROM public.core_uber_weekly WHERE week_id = v_week.week_id;
         SELECT COUNT(*) INTO v_ola_count FROM public.core_ola_weekly WHERE week_id = v_week.week_id;
 
+        -- Clean up orphaned / stale rows in hisaab_vehicle_weekly that no longer exist in daily_rent_log for this week
+        -- or stale SYSTEM_ONBOARDED rows when a real partner has been assigned
+        DELETE FROM public.hisaab_vehicle_weekly h
+        WHERE h.week_id = v_week.week_id
+          AND h.settlement_status <> 'LOCKED'
+          AND (
+              NOT EXISTS (
+                  SELECT 1 FROM public.daily_rent_log d
+                  WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+                    AND UPPER(REPLACE(REPLACE(d.vehicle_number, ' ', ''), '-', '')) = UPPER(REPLACE(REPLACE(h.vehicle_number, ' ', ''), '-', ''))
+                    AND COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') = h.partner_id
+              )
+              OR
+              (
+                  h.partner_id = 'SYSTEM_ONBOARDED'
+                  AND EXISTS (
+                      SELECT 1 FROM public.daily_rent_log d
+                      WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+                        AND UPPER(REPLACE(REPLACE(d.vehicle_number, ' ', ''), '-', '')) = UPPER(REPLACE(REPLACE(h.vehicle_number, ' ', ''), '-', ''))
+                        AND COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED'
+                  )
+              )
+          );
+
         WITH rent_agg AS (
             SELECT 
                 d.vehicle_number,
@@ -207,6 +231,12 @@ BEGIN
             WHERE dc.custody_rank = 1
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
+        uber_vehicles_with_daily AS (
+            SELECT DISTINCT vehicle_number FROM uber_daily_partner_agg
+        ),
+        ola_vehicles_with_daily AS (
+            SELECT DISTINCT vehicle_number FROM ola_daily_partner_agg
+        ),
         adj_agg AS (
             SELECT 
                 UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', '')) AS vehicle_number,
@@ -232,17 +262,17 @@ BEGIN
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
         -- Cumulative Unpaid Challans by Vehicle: All unpaid fines incurred on or before
-        -- this week's Sunday (v_week.week_end) are included. Once paid, core_challans marks
-        -- them PAID automatically and they drop out in the next run.
+        -- this week's Sunday (v_week.week_end) plus any rolling balances are included.
+        -- Once paid, core_challans marks them PAID automatically and they drop out in the next run.
         challan_daily_partner_agg AS (
             SELECT 
                 UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
                 COALESCE(SUM(c.net_pending_amount), 0.00) AS challan_amount
             FROM public.core_challans c
             WHERE c.is_deleted = FALSE
-              AND c.payment_status = 'UNPAID'
-              AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
-              AND c.violation_date <= v_week.week_end
+              AND c.payment_status IN ('UNPAID', 'PARTIALLY_PAID')
+              AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE', 'PREVIOUS_PENDING')
+              AND (c.violation_date <= v_week.week_end OR c.violation_date IS NULL OR c.liability_type = 'PREVIOUS_PENDING')
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', ''))
         ),
         existing_hisaab AS (
@@ -293,21 +323,21 @@ BEGIN
             r.weekly_lease_rental,
             r.weekly_indemnity_fees,
             r.net_weekly_lease_rental,
-            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 THEN u.uber_trips ELSE 0 END, 0),
-            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
-            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 THEN o.ola_trips ELSE 0 END, 0),
-            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_trips ELSE 0 END, 0),
+            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
+            CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
+            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_trips ELSE 0 END, 0),
+            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00),
             0.00,
-            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 THEN o.ola_online_payment ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_online_payment ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00),
             -- Adjustment Amount (Signed: negative = credit/waiver, positive = debit/penalty)
             COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00) AS adjustment_amount,
             -- Challan Amount (All cumulative unpaid fines on vehicle; attributed to primary driver if multiple)
@@ -315,8 +345,8 @@ BEGIN
             -- Current Week O/S = Net Rent - (Uber O/S + Ola O/S) + Challans + Adjustments + Other Deductions
             (
                 r.net_weekly_lease_rental
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
@@ -325,8 +355,8 @@ BEGIN
             -- Net to collect from driver = max(0, current_week_os)
             GREATEST(0.00, (
                 r.net_weekly_lease_rental
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
@@ -335,8 +365,8 @@ BEGIN
             -- Net payout to driver = max(0, -current_week_os)
             GREATEST(0.00, -(
                 r.net_weekly_lease_rental
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(eh.gps_dead_mile_penalty, 0.00)
@@ -350,6 +380,8 @@ BEGIN
         LEFT JOIN custom_names cn ON r.partner_id = cn.partner_id
         LEFT JOIN uber_daily_partner_agg udpa ON r.vehicle_number = udpa.vehicle_number AND r.partner_id = udpa.partner_id
         LEFT JOIN ola_daily_partner_agg odpa ON r.vehicle_number = odpa.vehicle_number AND r.partner_id = odpa.partner_id
+        LEFT JOIN uber_vehicles_with_daily uvwd ON r.vehicle_number = uvwd.vehicle_number
+        LEFT JOIN ola_vehicles_with_daily ovwd ON r.vehicle_number = ovwd.vehicle_number
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
         LEFT JOIN adj_agg adj ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = adj.vehicle_number AND r.partner_id = adj.partner_id
@@ -926,6 +958,12 @@ BEGIN
               AND dc.log_date BETWEEN v_week.week_start AND v_week.week_end
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
+        uber_vehicles_with_daily AS (
+            SELECT DISTINCT vehicle_number FROM uber_daily_partner_agg
+        ),
+        ola_vehicles_with_daily AS (
+            SELECT DISTINCT vehicle_number FROM ola_daily_partner_agg
+        ),
         -- 1. On-Time In-Week Challans (Violation in week AND created <= Monday 11:00 AM)
         challan_ontime_agg AS (
             SELECT 
@@ -946,7 +984,7 @@ BEGIN
                 WHERE c.violation_date BETWEEN v_week.week_start AND v_week.week_end
                   AND (c.created_at <= v_curr_cutoff OR v_week.week_start < '2026-09-21')
                   AND c.is_deleted = FALSE
-                  AND c.payment_status = 'UNPAID'
+                  AND c.payment_status IN ('UNPAID', 'PARTIALLY_PAID')
                   AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
             ) c
             GROUP BY c.vehicle_number, COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED')
@@ -974,7 +1012,7 @@ BEGIN
                   AND c.created_at <= v_curr_cutoff
                   AND v_week.week_start >= '2026-09-28'
                   AND c.is_deleted = FALSE
-                  AND c.payment_status = 'UNPAID'
+                  AND c.payment_status IN ('UNPAID', 'PARTIALLY_PAID')
                   AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE')
             ) c
             GROUP BY c.vehicle_number, COALESCE(NULLIF(TRIM(c.partner_id), ''), 'SYSTEM_ONBOARDED')
@@ -1050,21 +1088,21 @@ BEGIN
             COALESCE(r.weekly_lease_rental, 0.00) AS weekly_lease_rental,
             COALESCE(r.weekly_indemnity_fees, 0.00) AS weekly_indemnity_fees,
             COALESCE(r.net_weekly_lease_rental, 0.00) AS net_weekly_lease_rental,
-            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 THEN u.uber_trips ELSE 0 END, 0),
-            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00),
-            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
-            CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
-            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 THEN o.ola_trips ELSE 0 END, 0),
-            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_trips, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_trips ELSE 0 END, 0),
+            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_cash_collection, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00),
+            COALESCE(udpa.uber_driver_sub_charge, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_driver_sub_charge ELSE 0.00 END, 0.00),
+            CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END,
+            COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_trips, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_trips ELSE 0 END, 0),
+            COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_cash_collection, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_cash_collection ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00),
             0.00,
-            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 THEN o.ola_online_payment ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00),
-            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_online_payment, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_online_payment ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00),
+            COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00),
             -- On-time adjustments
             COALESCE(adj_on.net_adj_signed, 0.00) AS adjustment_amount,
             -- Late past adjustments routed to this week
@@ -1080,8 +1118,8 @@ BEGIN
             -- Current Week O/S Formula
             (
                 COALESCE(r.net_weekly_lease_rental, 0.00)
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + COALESCE(ch_on.challan_amount, 0.00)
                 + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
                 + COALESCE(adj_on.net_adj_signed, 0.00)
@@ -1089,8 +1127,8 @@ BEGIN
             ) AS current_week_os,
             GREATEST(0.00, (
                 COALESCE(r.net_weekly_lease_rental, 0.00)
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + COALESCE(ch_on.challan_amount, 0.00)
                 + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
                 + COALESCE(adj_on.net_adj_signed, 0.00)
@@ -1098,8 +1136,8 @@ BEGIN
             )) AS net_to_collect_from_driver,
             GREATEST(0.00, -(
                 COALESCE(r.net_weekly_lease_rental, 0.00)
-                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
-                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
+                - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_week_os ELSE 0.00 END, 0.00)
+                   + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + COALESCE(ch_on.challan_amount, 0.00)
                 + COALESCE(ch_lt.challan_adjustment_amount, 0.00)
                 + COALESCE(adj_on.net_adj_signed, 0.00)
@@ -1113,6 +1151,8 @@ BEGIN
         LEFT JOIN partner_names pn ON tk.partner_id = pn.partner_id
         LEFT JOIN uber_daily_partner_agg udpa ON tk.vehicle_number = udpa.vehicle_number AND tk.partner_id = udpa.partner_id
         LEFT JOIN ola_daily_partner_agg odpa ON tk.vehicle_number = odpa.vehicle_number AND tk.partner_id = odpa.partner_id
+        LEFT JOIN uber_vehicles_with_daily uvwd ON tk.vehicle_number = uvwd.vehicle_number
+        LEFT JOIN ola_vehicles_with_daily ovwd ON tk.vehicle_number = ovwd.vehicle_number
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
         LEFT JOIN challan_ontime_agg ch_on ON UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = ch_on.vehicle_number AND tk.partner_id = ch_on.partner_id
