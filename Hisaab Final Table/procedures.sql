@@ -786,6 +786,30 @@ BEGIN
         SELECT COUNT(*) INTO v_uber_count FROM public.core_uber_weekly WHERE week_id = v_week.week_id;
         SELECT COUNT(*) INTO v_ola_count FROM public.core_ola_weekly WHERE week_id = v_week.week_id;
 
+        -- Clean up orphaned / stale rows in hisaab_vehicle_payout_weekly that no longer exist in daily_rent_log for this week
+        -- or stale SYSTEM_ONBOARDED rows when a real partner has been assigned
+        DELETE FROM public.hisaab_vehicle_payout_weekly h
+        WHERE h.week_id = v_week.week_id
+          AND h.settlement_status <> 'FROZEN'
+          AND (
+              NOT EXISTS (
+                  SELECT 1 FROM public.daily_rent_log d
+                  WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+                    AND UPPER(REPLACE(REPLACE(d.vehicle_number, ' ', ''), '-', '')) = UPPER(REPLACE(REPLACE(h.vehicle_number, ' ', ''), '-', ''))
+                    AND COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') = h.partner_id
+              )
+              OR
+              (
+                  h.partner_id = 'SYSTEM_ONBOARDED'
+                  AND EXISTS (
+                      SELECT 1 FROM public.daily_rent_log d
+                      WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+                        AND UPPER(REPLACE(REPLACE(d.vehicle_number, ' ', ''), '-', '')) = UPPER(REPLACE(REPLACE(h.vehicle_number, ' ', ''), '-', ''))
+                        AND COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') <> 'SYSTEM_ONBOARDED'
+                  )
+              )
+          );
+
         WITH rent_agg AS (
             SELECT 
                 d.vehicle_number,
