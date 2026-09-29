@@ -259,6 +259,7 @@ BEGIN
               AND c.approval_status = 'Approved'
               AND c.adjustment_date BETWEEN v_week.week_start AND v_week.week_end
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
+              AND (c.partner_id IS NULL OR TRIM(c.partner_id) = '' OR c.partner_id = 'SYSTEM_ONBOARDED')
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
         -- Cumulative Unpaid Challans by Vehicle: All active unpaid / partially paid fines
