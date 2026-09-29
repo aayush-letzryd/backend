@@ -55,9 +55,15 @@ The pipeline utilizes a **Decoupled ELT Architecture with `pg_cron`**:
 
 ## Dead Mile Calculation Rules in Hisaab
 
-$$\text{Daily Ideal KM} = \text{Trip KM} + (\text{Completed Trips} \times 3.0\text{ km}) + (\text{Is Billable Day} \times 25.0\text{ km})$$
-$$\text{Daily Dead KM} = \max(0, \text{Daily GPS KM} - \text{Daily Ideal KM})$$
-$$\text{Daily Dead Mile Penalty} = \begin{cases} \text{Daily Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' (or D2R plan)} \\ 0.00 & \text{for Fleet Operators} \end{cases}$$
+- **Weekly Aggregated Rule (`hisaab_vehicle_weekly`, `hisaab_partner_weekly`, `hisaab_vehicle_payout_weekly`)**:
+$$\text{Weekly Ideal KM} = \sum \text{In-Trip KM (Uber+Ola+Rapido)} + \left(\sum \text{Completed Trips} \times 3.0\text{ km}\right) + (\text{Onroad Days} \times 30.0\text{ km})$$
+$$\text{Weekly Dead KM} = \max\left(0, \sum \text{GPS KM} - \text{Weekly Ideal KM}\right)$$
+$$\text{Weekly Dead Mile Penalty} = \begin{cases} \text{Weekly Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' } \land \text{City} \in \{\text{'BLR'}, \text{'BENGALURU'}\} \\ 0.00 & \text{for Fleet Operators (multi-car / OP / IP) or HYD/MUM} \end{cases}$$
+
+- **Daily Ledger Rule (`hisaab_daily_ledger`)**:
+$$\text{Daily Ideal KM} = \text{Daily In-Trip KM} + (\text{Daily Completed Trips} \times 3.0\text{ km}) + (\text{Is Billable Day} \times 30.0\text{ km})$$
+$$\text{Daily Dead KM} = \max\left(0, \text{Daily GPS KM} - \text{Daily Ideal KM}\right)$$
+$$\text{Daily Dead Mile Penalty} = \begin{cases} \text{Daily Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' } \land \text{City} \in \{\text{'BLR'}, \text{'BENGALURU'}\} \\ 0.00 & \text{otherwise} \end{cases}$$
 
 ## Data Dictionary: public.core_gps
 

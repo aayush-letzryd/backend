@@ -1,17 +1,16 @@
 -- ============================================================================
 -- LETZRYD HISAAB ENGINE - PRODUCTION STORED PROCEDURES & CANONICAL VIEWS
 -- Verified on: September 29, 2026
--- Includes:
--- 1. sp_sync_hisaab_vehicle_weekly (Audit Ledger + Daily Telematics & Dead Mile Penalty)
--- 2. sp_sync_hisaab_partner_weekly (Multi-vehicle partner aggregation & rollups)
--- 3. sp_sync_rent_to_hisaab (Nightly daily ledger sync with core_gps telematics)
--- 4. v_hisaab_partner_settlement_statement (Canonical settlement statement view)
--- 5. sp_sync_hisaab_vehicle_payout_weekly (Operational payout cutoff & frozen ledger)
+-- Fixed Dead Mile Rules:
+-- 1. Multi-car and named Operators are 100% EXEMPT (Penalty = 0.00)
+-- 2. City scope: Only active GPS reconciliation hubs (BLR) are billed Dead Mile Penalties
+-- 3. In-trip distance aggregates Uber + Ola + Rapido
+-- 4. 30 km / onroad day + 3 km / trip buffer
 -- ============================================================================
 
 -- ----------------------------------------------------------------------------
 -- 1. sp_sync_hisaab_vehicle_weekly
--- Calendar violation-date settlement procedure with daily GPS dead mile penalty
+-- Calendar violation-date settlement procedure with GPS dead mile penalty
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE public.sp_sync_hisaab_vehicle_weekly(IN p_week_id character varying DEFAULT NULL::character varying)
  LANGUAGE plpgsql
@@ -34,7 +33,7 @@ BEGIN
         SELECT COUNT(*) INTO v_uber_count FROM public.core_uber_weekly WHERE week_id = v_week.week_id;
         SELECT COUNT(*) INTO v_ola_count FROM public.core_ola_weekly WHERE week_id = v_week.week_id;
 
-        -- Clean up orphaned / stale rows in hisaab_vehicle_weekly that no longer exist in daily_rent_log for this week
+        -- Clean up orphaned / stale rows in hisaab_vehicle_weekly
         DELETE FROM public.hisaab_vehicle_weekly h
         WHERE h.week_id = v_week.week_id
           AND h.settlement_status <> 'LOCKED'
@@ -57,7 +56,15 @@ BEGIN
               )
           );
 
-        WITH rent_agg AS (
+        WITH partner_car_counts AS (
+            SELECT 
+                d.partner_id,
+                COUNT(DISTINCT d.vehicle_number) AS car_count
+            FROM public.daily_rent_log d
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.partner_id
+        ),
+        rent_agg AS (
             SELECT 
                 d.vehicle_number,
                 COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
@@ -174,7 +181,15 @@ BEGIN
                 d.log_date,
                 d.vehicle_number,
                 d.partner_id,
+                d.city,
                 d.is_billable_day,
+                CASE 
+                    WHEN COALESCE(pcc.car_count, 1) > 1 THEN 'Operator'
+                    WHEN d.partner_id ILIKE '%OP%' OR d.partner_id ILIKE '%IP%' THEN 'Operator'
+                    WHEN po.onboarding_type = 'Operator' THEN 'Operator'
+                    WHEN d.partner_id = 'SYSTEM_ONBOARDED' THEN 'Operator'
+                    ELSE 'Individual'
+                END AS partner_type,
                 ROW_NUMBER() OVER (
                     PARTITION BY d.log_date, d.vehicle_number
                     ORDER BY 
@@ -183,6 +198,8 @@ BEGIN
                         d.id DESC
                 ) AS custody_rank
             FROM public.daily_rent_log d
+            LEFT JOIN partner_car_counts pcc ON pcc.partner_id = d.partner_id
+            LEFT JOIN public.core_partner_onboarding po ON po.partner_id = d.partner_id
             WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
         ),
         daily_gps AS (
@@ -223,6 +240,16 @@ BEGIN
             WHERE o.service_date BETWEEN v_week.week_start AND v_week.week_end
             GROUP BY o.service_date, UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
         ),
+        daily_rapido AS (
+            SELECT 
+                r.operational_date,
+                UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) AS clean_veh,
+                SUM(COALESCE(r.total_trip_distance_km, 0.00)) AS rapido_dist,
+                SUM(COALESCE(r.completed_trips, 0)) AS rapido_trips
+            FROM public.core_rapido_daily r
+            WHERE r.operational_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY r.operational_date, UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', ''))
+        ),
         uber_daily_partner_agg AS (
             SELECT 
                 dc.vehicle_number,
@@ -255,40 +282,39 @@ BEGIN
             WHERE dc.custody_rank = 1
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
-        gps_daily_partner_agg AS (
+        gps_weekly_partner_agg AS (
             SELECT 
                 dc.vehicle_number,
                 dc.partner_id,
+                (ARRAY_AGG(dc.partner_type))[1] AS partner_type,
+                (ARRAY_AGG(dc.city))[1] AS city,
                 COALESCE(SUM(g.gps_dist), 0.00) AS total_gps_km,
-                COALESCE(SUM(COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00)), 0.00) AS total_trip_km,
+                COALESCE(SUM(COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00)), 0.00) AS total_trip_km,
                 COALESCE(SUM(
-                    GREATEST(0.00, COALESCE(g.gps_dist, 0.00) - (
-                        (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                        + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                        + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                    ))
-                ), 0.00) AS gps_dead_km,
-                COALESCE(SUM(
-                    CASE 
-                        WHEN (COALESCE(po.onboarding_type, 'Individual') = 'Individual' OR po.driver_plan ILIKE '%D2R%')
-                             AND (COALESCE(g.gps_dist, 0.00) - (
-                                 (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                                 + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                                 + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                             )) > 0
-                        THEN ROUND((COALESCE(g.gps_dist, 0.00) - (
-                                 (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                                 + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                                 + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                             )) * 3.00, 2)
-                        ELSE 0.00
-                    END
-                ), 0.00) AS gps_dead_mile_penalty
+                    (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                    + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                    + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                ), 0.00) AS total_ideal_km,
+                GREATEST(0.00, COALESCE(SUM(g.gps_dist), 0.00) - COALESCE(SUM(
+                    (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                    + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                    + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                ), 0.00)) AS gps_dead_km,
+                CASE 
+                    WHEN (ARRAY_AGG(dc.partner_type))[1] = 'Individual' 
+                         AND UPPER(COALESCE((ARRAY_AGG(dc.city))[1], '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
+                    THEN ROUND(GREATEST(0.00, COALESCE(SUM(g.gps_dist), 0.00) - COALESCE(SUM(
+                        (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                        + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                        + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                    ), 0.00)) * 3.00, 2)
+                    ELSE 0.00
+                END AS gps_dead_mile_penalty
             FROM daily_driver_custody dc
             LEFT JOIN daily_gps g ON g.record_date = dc.log_date AND g.clean_veh = dc.vehicle_number
             LEFT JOIN daily_uber u ON u.operational_date = dc.log_date AND u.clean_veh = dc.vehicle_number
             LEFT JOIN daily_ola o ON o.service_date = dc.log_date AND o.clean_veh = dc.vehicle_number
-            LEFT JOIN public.core_partner_onboarding po ON po.partner_id = dc.partner_id
+            LEFT JOIN daily_rapido r ON r.operational_date = dc.log_date AND r.clean_veh = dc.vehicle_number
             WHERE dc.custody_rank = 1
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
@@ -399,14 +425,14 @@ BEGIN
             COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00) AS adjustment_amount,
             CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END AS challan_amount,
             COALESCE(gdpa.gps_dead_km, 0.00) AS gps_dead_km,
-            COALESCE(gdpa.gps_dead_mile_penalty, eh.gps_dead_mile_penalty, 0.00) AS gps_dead_mile_penalty,
+            COALESCE(gdpa.gps_dead_mile_penalty, 0.00) AS gps_dead_mile_penalty,
             (
                 r.net_weekly_lease_rental
                 - (COALESCE(udpa.uber_week_os, CASE WHEN r.partner_rank = 1 THEN u.uber_week_os ELSE 0.00 END, 0.00)
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
-                + COALESCE(gdpa.gps_dead_mile_penalty, eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             ) AS current_week_os,
             GREATEST(0.00, (
@@ -415,7 +441,7 @@ BEGIN
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
-                + COALESCE(gdpa.gps_dead_mile_penalty, eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             )) AS net_to_collect_from_driver,
             GREATEST(0.00, -(
@@ -424,7 +450,7 @@ BEGIN
                    + COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00))
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
-                + COALESCE(gdpa.gps_dead_mile_penalty, eh.gps_dead_mile_penalty, 0.00)
+                + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             )) AS net_payout_to_driver,
             'CALCULATED',
@@ -435,7 +461,7 @@ BEGIN
         LEFT JOIN custom_names cn ON r.partner_id = cn.partner_id
         LEFT JOIN uber_daily_partner_agg udpa ON r.vehicle_number = udpa.vehicle_number AND r.partner_id = udpa.partner_id
         LEFT JOIN ola_daily_partner_agg odpa ON r.vehicle_number = odpa.vehicle_number AND r.partner_id = odpa.partner_id
-        LEFT JOIN gps_daily_partner_agg gdpa ON r.vehicle_number = gdpa.vehicle_number AND r.partner_id = gdpa.partner_id
+        LEFT JOIN gps_weekly_partner_agg gdpa ON r.vehicle_number = gdpa.vehicle_number AND r.partner_id = gdpa.partner_id
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
         LEFT JOIN ola_agg o ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = o.vehicle_number
         LEFT JOIN adj_agg adj ON UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) = adj.vehicle_number AND r.partner_id = adj.partner_id
@@ -520,7 +546,11 @@ BEGIN
             v.partner_id,
             (ARRAY_AGG(v.partner_name ORDER BY v.onroad_days DESC, v.net_weekly_lease_rental DESC))[1] AS partner_name,
             (ARRAY_AGG(v.city ORDER BY v.onroad_days DESC, v.net_weekly_lease_rental DESC))[1] AS city,
-            CASE WHEN v.partner_id ILIKE '%IP%' OR v.partner_id ILIKE '%OP%' THEN 'Operator' ELSE 'Individual' END AS partner_type,
+            CASE 
+                WHEN COUNT(DISTINCT v.vehicle_number) > 1 THEN 'Operator'
+                WHEN v.partner_id ILIKE '%IP%' OR v.partner_id ILIKE '%OP%' THEN 'Operator'
+                ELSE 'Individual'
+            END AS partner_type,
             COUNT(DISTINCT v.vehicle_number) AS allotted_cars_count,
             SUM(v.onroad_days) AS total_onroad_days,
             SUM(v.uber_trips + v.ola_trips) AS total_trips,
@@ -739,7 +769,15 @@ BEGIN
     END IF;
 
     -- Update hisaab_daily_ledger in set-based batch including daily GPS & dead mile calculations
-    WITH daily_gps AS (
+    WITH partner_car_counts AS (
+        SELECT 
+            d.partner_id,
+            COUNT(DISTINCT d.vehicle_number) AS car_count
+        FROM public.daily_rent_log d
+        WHERE (v_week_start IS NULL OR d.log_date BETWEEN v_week_start AND v_week_end)
+        GROUP BY d.partner_id
+    ),
+    daily_gps AS (
         SELECT 
             g.record_date,
             UPPER(REPLACE(REPLACE(public.fn_clean_gps_vehicle_number(g.vehicle_number), ' ', ''), '-', '')) AS clean_veh,
@@ -767,6 +805,16 @@ BEGIN
         FROM public.core_ola_daily o
         WHERE (v_week_start IS NULL OR o.service_date BETWEEN v_week_start AND v_week_end)
         GROUP BY o.service_date, UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
+    ),
+    daily_rapido AS (
+        SELECT 
+            r.operational_date,
+            UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) AS clean_veh,
+            SUM(COALESCE(r.total_trip_distance_km, 0.00)) AS rapido_dist,
+            SUM(COALESCE(r.completed_trips, 0)) AS rapido_trips
+        FROM public.core_rapido_daily r
+        WHERE (v_week_start IS NULL OR r.operational_date BETWEEN v_week_start AND v_week_end)
+        GROUP BY r.operational_date, UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', ''))
     )
     UPDATE public.hisaab_daily_ledger h
     SET 
@@ -776,23 +824,26 @@ BEGIN
         attendance_status = d.attendance_status,
         is_billable_day = d.is_billable_day,
         daily_gps_distance_km = COALESCE(g.gps_dist, 0.00),
-        daily_trip_distance_km = COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00),
+        daily_trip_distance_km = COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00),
         daily_dead_km = GREATEST(0.00, COALESCE(g.gps_dist, 0.00) - (
-            (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-            + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-            + (CASE WHEN d.is_billable_day THEN 25.00 ELSE 0.00 END)
+            (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+            + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+            + (CASE WHEN d.is_billable_day THEN 30.00 ELSE 0.00 END)
         )),
         daily_dead_mile_penalty = CASE 
-            WHEN (COALESCE(h.partner_type, 'Individual') = 'Individual') 
+            WHEN (COALESCE(pcc.car_count, 1) = 1)
+                 AND (d.partner_id NOT ILIKE '%OP%' AND d.partner_id NOT ILIKE '%IP%' AND d.partner_id <> 'SYSTEM_ONBOARDED')
+                 AND (COALESCE(po.onboarding_type, 'Individual') = 'Individual') 
+                 AND UPPER(COALESCE(d.city, '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
                  AND (COALESCE(g.gps_dist, 0.00) - (
-                     (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                     + (CASE WHEN d.is_billable_day THEN 25.00 ELSE 0.00 END)
+                     (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                     + (CASE WHEN d.is_billable_day THEN 30.00 ELSE 0.00 END)
                  )) > 0
             THEN ROUND((COALESCE(g.gps_dist, 0.00) - (
-                     (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                     + (CASE WHEN d.is_billable_day THEN 25.00 ELSE 0.00 END)
+                     (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                     + (CASE WHEN d.is_billable_day THEN 30.00 ELSE 0.00 END)
                  )) * 3.00, 2)
             ELSE 0.00
         END,
@@ -804,16 +855,19 @@ BEGIN
             + COALESCE(h.daily_challans, 0.00)
             + COALESCE(h.daily_accident_recovery, 0.00)
             + CASE 
-                WHEN (COALESCE(h.partner_type, 'Individual') = 'Individual') 
+                WHEN (COALESCE(pcc.car_count, 1) = 1)
+                     AND (d.partner_id NOT ILIKE '%OP%' AND d.partner_id NOT ILIKE '%IP%' AND d.partner_id <> 'SYSTEM_ONBOARDED')
+                     AND (COALESCE(po.onboarding_type, 'Individual') = 'Individual') 
+                     AND UPPER(COALESCE(d.city, '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
                      AND (COALESCE(g.gps_dist, 0.00) - (
-                         (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                         + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                         + (CASE WHEN d.is_billable_day THEN 25.00 ELSE 0.00 END)
+                         (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                         + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                         + (CASE WHEN d.is_billable_day THEN 30.00 ELSE 0.00 END)
                      )) > 0
                 THEN ROUND((COALESCE(g.gps_dist, 0.00) - (
-                         (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                         + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                         + (CASE WHEN d.is_billable_day THEN 25.00 ELSE 0.00 END)
+                         (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                         + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                         + (CASE WHEN d.is_billable_day THEN 30.00 ELSE 0.00 END)
                      )) * 3.00, 2)
                 ELSE 0.00
               END
@@ -822,9 +876,12 @@ BEGIN
         ),
         updated_at = CURRENT_TIMESTAMP
     FROM public.daily_rent_log d
+    LEFT JOIN partner_car_counts pcc ON pcc.partner_id = d.partner_id
+    LEFT JOIN public.core_partner_onboarding po ON po.partner_id = d.partner_id
     LEFT JOIN daily_gps g ON g.record_date = d.log_date AND g.clean_veh = d.vehicle_number
     LEFT JOIN daily_uber u ON u.operational_date = d.log_date AND u.clean_veh = d.vehicle_number
     LEFT JOIN daily_ola o ON o.service_date = d.log_date AND o.clean_veh = d.vehicle_number
+    LEFT JOIN daily_rapido r ON r.operational_date = d.log_date AND r.clean_veh = d.vehicle_number
     WHERE h.log_date = d.log_date
       AND h.vehicle_number = d.vehicle_number
       AND h.partner_id = d.partner_id
@@ -930,7 +987,15 @@ BEGIN
               )
           );
 
-        WITH rent_agg AS (
+        WITH partner_car_counts AS (
+            SELECT 
+                d.partner_id,
+                COUNT(DISTINCT d.vehicle_number) AS car_count
+            FROM public.daily_rent_log d
+            WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY d.partner_id
+        ),
+        rent_agg AS (
             SELECT 
                 d.vehicle_number,
                 COALESCE(NULLIF(TRIM(d.partner_id), ''), 'SYSTEM_ONBOARDED') AS partner_id,
@@ -1047,7 +1112,15 @@ BEGIN
                 d.log_date,
                 d.vehicle_number,
                 d.partner_id,
+                d.city,
                 d.is_billable_day,
+                CASE 
+                    WHEN COALESCE(pcc.car_count, 1) > 1 THEN 'Operator'
+                    WHEN d.partner_id ILIKE '%OP%' OR d.partner_id ILIKE '%IP%' THEN 'Operator'
+                    WHEN po.onboarding_type = 'Operator' THEN 'Operator'
+                    WHEN d.partner_id = 'SYSTEM_ONBOARDED' THEN 'Operator'
+                    ELSE 'Individual'
+                END AS partner_type,
                 ROW_NUMBER() OVER (
                     PARTITION BY d.log_date, d.vehicle_number
                     ORDER BY 
@@ -1056,6 +1129,8 @@ BEGIN
                         d.id DESC
                 ) AS custody_rank
             FROM public.daily_rent_log d
+            LEFT JOIN partner_car_counts pcc ON pcc.partner_id = d.partner_id
+            LEFT JOIN public.core_partner_onboarding po ON po.partner_id = d.partner_id
             WHERE d.log_date BETWEEN v_week.week_start AND v_week.week_end
         ),
         daily_gps AS (
@@ -1096,6 +1171,16 @@ BEGIN
             WHERE o.service_date BETWEEN v_week.week_start AND v_week.week_end
             GROUP BY o.service_date, UPPER(REPLACE(REPLACE(o.vehicle_number, ' ', ''), '-', ''))
         ),
+        daily_rapido AS (
+            SELECT 
+                r.operational_date,
+                UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', '')) AS clean_veh,
+                SUM(COALESCE(r.total_trip_distance_km, 0.00)) AS rapido_dist,
+                SUM(COALESCE(r.completed_trips, 0)) AS rapido_trips
+            FROM public.core_rapido_daily r
+            WHERE r.operational_date BETWEEN v_week.week_start AND v_week.week_end
+            GROUP BY r.operational_date, UPPER(REPLACE(REPLACE(r.vehicle_number, ' ', ''), '-', ''))
+        ),
         uber_daily_partner_agg AS (
             SELECT 
                 dc.vehicle_number,
@@ -1128,40 +1213,39 @@ BEGIN
             WHERE dc.custody_rank = 1
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
-        gps_daily_partner_agg AS (
+        gps_weekly_partner_agg AS (
             SELECT 
                 dc.vehicle_number,
                 dc.partner_id,
+                (ARRAY_AGG(dc.partner_type))[1] AS partner_type,
+                (ARRAY_AGG(dc.city))[1] AS city,
                 COALESCE(SUM(g.gps_dist), 0.00) AS total_gps_km,
-                COALESCE(SUM(COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00)), 0.00) AS total_trip_km,
+                COALESCE(SUM(COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00)), 0.00) AS total_trip_km,
                 COALESCE(SUM(
-                    GREATEST(0.00, COALESCE(g.gps_dist, 0.00) - (
-                        (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                        + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                        + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                    ))
-                ), 0.00) AS gps_dead_km,
-                COALESCE(SUM(
-                    CASE 
-                        WHEN (COALESCE(po.onboarding_type, 'Individual') = 'Individual' OR po.driver_plan ILIKE '%D2R%')
-                             AND (COALESCE(g.gps_dist, 0.00) - (
-                                 (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                                 + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                                 + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                             )) > 0
-                        THEN ROUND((COALESCE(g.gps_dist, 0.00) - (
-                                 (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00))
-                                 + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0)) * 3.00)
-                                 + (CASE WHEN dc.is_billable_day THEN 25.00 ELSE 0.00 END)
-                             )) * 3.00, 2)
-                        ELSE 0.00
-                    END
-                ), 0.00) AS gps_dead_mile_penalty
+                    (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                    + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                    + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                ), 0.00) AS total_ideal_km,
+                GREATEST(0.00, COALESCE(SUM(g.gps_dist), 0.00) - COALESCE(SUM(
+                    (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                    + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                    + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                ), 0.00)) AS gps_dead_km,
+                CASE 
+                    WHEN (ARRAY_AGG(dc.partner_type))[1] = 'Individual' 
+                         AND UPPER(COALESCE((ARRAY_AGG(dc.city))[1], '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
+                    THEN ROUND(GREATEST(0.00, COALESCE(SUM(g.gps_dist), 0.00) - COALESCE(SUM(
+                        (COALESCE(u.uber_dist, 0.00) + COALESCE(o.ola_dist, 0.00) + COALESCE(r.rapido_dist, 0.00))
+                        + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
+                        + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
+                    ), 0.00)) * 3.00, 2)
+                    ELSE 0.00
+                END AS gps_dead_mile_penalty
             FROM all_daily_custody dc
             LEFT JOIN daily_gps g ON g.record_date = dc.log_date AND g.clean_veh = dc.vehicle_number
             LEFT JOIN daily_uber u ON u.operational_date = dc.log_date AND u.clean_veh = dc.vehicle_number
             LEFT JOIN daily_ola o ON o.service_date = dc.log_date AND o.clean_veh = dc.vehicle_number
-            LEFT JOIN public.core_partner_onboarding po ON po.partner_id = dc.partner_id
+            LEFT JOIN daily_rapido r ON r.operational_date = dc.log_date AND r.clean_veh = dc.vehicle_number
             WHERE dc.custody_rank = 1
             GROUP BY dc.vehicle_number, dc.partner_id
         ),
@@ -1368,7 +1452,7 @@ BEGIN
         LEFT JOIN custom_names cn ON tk.partner_id = cn.partner_id
         LEFT JOIN uber_daily_partner_agg udpa ON tk.vehicle_number = udpa.vehicle_number AND tk.partner_id = udpa.partner_id
         LEFT JOIN ola_daily_partner_agg odpa ON tk.vehicle_number = odpa.vehicle_number AND tk.partner_id = odpa.partner_id
-        LEFT JOIN gps_daily_partner_agg gdpa ON tk.vehicle_number = gdpa.vehicle_number AND tk.partner_id = gdpa.partner_id
+        LEFT JOIN gps_weekly_partner_agg gdpa ON tk.vehicle_number = gdpa.vehicle_number AND tk.partner_id = gdpa.partner_id
         LEFT JOIN uber_vehicles_with_daily uvwd ON tk.vehicle_number = uvwd.vehicle_number
         LEFT JOIN ola_vehicles_with_daily ovwd ON tk.vehicle_number = ovwd.vehicle_number
         LEFT JOIN uber_agg u ON r.partner_rank = 1 AND UPPER(REPLACE(REPLACE(tk.vehicle_number, ' ', ''), '-', '')) = u.vehicle_number
