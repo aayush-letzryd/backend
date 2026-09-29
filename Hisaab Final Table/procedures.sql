@@ -261,9 +261,8 @@ BEGIN
               AND c.vehicle_number IS NOT NULL AND TRIM(c.vehicle_number) <> ''
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_number, ' ', ''), '-', ''))
         ),
-        -- Cumulative Unpaid Challans by Vehicle: All unpaid fines incurred on or before
-        -- this week's Sunday (v_week.week_end) plus any rolling balances are included.
-        -- Once paid, core_challans marks them PAID automatically and they drop out in the next run.
+        -- Cumulative Unpaid Challans by Vehicle: All active unpaid / partially paid fines
+        -- reconciled directly against core_challans as per the authoritative ops ledger.
         challan_daily_partner_agg AS (
             SELECT 
                 UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', '')) AS vehicle_number,
@@ -271,8 +270,6 @@ BEGIN
             FROM public.core_challans c
             WHERE c.is_deleted = FALSE
               AND c.payment_status IN ('UNPAID', 'PARTIALLY_PAID')
-              AND c.liability_type IN ('TRAFFIC_FINE', 'STICKER_FINE', 'PREVIOUS_PENDING')
-              AND (c.violation_date <= v_week.week_end OR c.violation_date IS NULL OR c.liability_type = 'PREVIOUS_PENDING')
             GROUP BY UPPER(REPLACE(REPLACE(c.vehicle_reg_no, ' ', ''), '-', ''))
         ),
         existing_hisaab AS (
