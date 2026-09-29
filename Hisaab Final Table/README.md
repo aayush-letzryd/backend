@@ -81,12 +81,20 @@ $$\text{Daily Ideal KM} = \text{Daily In-Trip KM} + (\text{Daily Completed Trips
 $$\text{Daily Dead KM} = \max\left(0, \text{Daily GPS KM} - \text{Daily Ideal KM}\right)$$
 $$\text{Daily Dead Mile Penalty} = \begin{cases} \text{Daily Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' } \land \text{City} \in \{\text{'BLR'}, \text{'BENGALURU'}\} \\ 0.00 & \text{otherwise} \end{cases}$$
 
+### TDS (Tax Deducted at Source - Section 194-C / 194-O):
+- **Base Taxable Revenue**:
+$$\text{Taxable Revenue} = \text{Uber Earnings} + \text{Uber Toll} + \text{Uber Incentive} + \text{Ola Revenue} + \text{Ola Toll} + \text{Ola Incentive}$$
+- **Taxable Payout Base**:
+$$\text{Taxable Base} = \max\left(0.00, \text{Taxable Revenue} - \text{Net Weekly Lease Rental}\right)$$
+- **TDS Deduction Rule**:
+$$\text{TDS Amount} = \begin{cases} 0.00 & \text{if Partner Type} = \text{'Operator'} \land \text{City} \in \{\text{'HYD'}, \text{'MUM'}\} \\ \text{ROUND}(\text{Taxable Base} \times 1\%, 2) & \text{for Individuals across all cities and Bangalore fleet} \end{cases}$$
+
 ### Current Week Outstanding (O/S) & Payouts:
 #### For Audit Ledger (`hisaab_vehicle_weekly`):
-$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \text{Adjustment Amount} + \mathbf{gps\_dead\_mile\_penalty}$$
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \text{Adjustment Amount} + \mathbf{tds\_amount} + \mathbf{gps\_dead\_mile\_penalty}$$
 
 #### For Payout Ledger (`hisaab_vehicle_payout_weekly`):
-$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \mathbf{challan\_adjustment\_amount} + \text{Adjustment Amount} + \mathbf{prior\_period\_adjustment\_amount} + \mathbf{gps\_dead\_mile\_penalty}$$
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \mathbf{challan\_adjustment\_amount} + \text{Adjustment Amount} + \mathbf{prior\_period\_adjustment\_amount} + \mathbf{tds\_amount} + \mathbf{gps\_dead\_mile\_penalty}$$
 $$\text{Net to Collect from Driver} = \max(0, \text{Current Week O/S})$$
 $$\text{Net Payout to Driver} = \max(0, -\text{Current Week O/S})$$
 

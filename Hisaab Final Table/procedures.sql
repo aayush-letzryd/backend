@@ -388,7 +388,7 @@ BEGIN
             daily_rent_applied, weekly_lease_rental, weekly_indemnity_fees, net_weekly_lease_rental,
             uber_trips, uber_total_earnings, uber_cash_collection, uber_toll, uber_driver_sub_charge, uber_incentive, uber_week_os,
             ola_trips, ola_net_revenue, ola_cash_collection, ola_toll, ola_gst, ola_online_payment, ola_incentive, ola_week_os,
-            adjustment_amount, challan_amount, gps_dead_km, gps_dead_mile_penalty, current_week_os, net_to_collect_from_driver, net_payout_to_driver,
+            adjustment_amount, challan_amount, tds_amount, gps_dead_km, gps_dead_mile_penalty, current_week_os, net_to_collect_from_driver, net_payout_to_driver,
             settlement_status, created_at, updated_at
         )
         SELECT 
@@ -424,6 +424,22 @@ BEGIN
             COALESCE(odpa.ola_week_os, CASE WHEN r.partner_rank = 1 THEN o.ola_week_os ELSE 0.00 END, 0.00),
             COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00) AS adjustment_amount,
             CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END AS challan_amount,
+            CASE 
+                WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                     AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                THEN 0.00
+                ELSE ROUND(GREATEST(0.00, (
+                    (
+                        COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                        + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00)
+                        + CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                        + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                        + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00)
+                        + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                    )
+                    - r.net_weekly_lease_rental
+                ) * 0.01), 2)
+            END AS tds_amount,
             COALESCE(gdpa.gps_dead_km, 0.00) AS gps_dead_km,
             COALESCE(gdpa.gps_dead_mile_penalty, 0.00) AS gps_dead_mile_penalty,
             (
@@ -433,6 +449,22 @@ BEGIN
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - r.net_weekly_lease_rental
+                    ) * 0.01), 2)
+                  END
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             ) AS current_week_os,
             GREATEST(0.00, (
@@ -442,6 +474,22 @@ BEGIN
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - r.net_weekly_lease_rental
+                    ) * 0.01), 2)
+                  END
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             )) AS net_to_collect_from_driver,
             GREATEST(0.00, -(
@@ -451,6 +499,22 @@ BEGIN
                 + CASE WHEN r.partner_rank = 1 THEN COALESCE(ch.challan_amount, 0.00) ELSE 0.00 END
                 + COALESCE(eh.accident_deduction, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - r.net_weekly_lease_rental
+                    ) * 0.01), 2)
+                  END
                 + COALESCE(adj.net_adj_signed, CASE WHEN r.partner_rank = 1 THEN afb.net_adj_signed ELSE 0.00 END, 0.00)
             )) AS net_payout_to_driver,
             'CALCULATED',
@@ -496,6 +560,7 @@ BEGIN
             ola_week_os = EXCLUDED.ola_week_os,
             adjustment_amount = EXCLUDED.adjustment_amount,
             challan_amount = EXCLUDED.challan_amount,
+            tds_amount = EXCLUDED.tds_amount,
             gps_dead_km = EXCLUDED.gps_dead_km,
             gps_dead_mile_penalty = EXCLUDED.gps_dead_mile_penalty,
             current_week_os = EXCLUDED.current_week_os,
@@ -926,12 +991,13 @@ SELECT
     h.ola_incentive,
     h.ola_online_payment,
     h.ola_week_os,
+    h.tds_amount,
     h.gps_dead_km,
     h.gps_dead_mile_penalty,
     (h.uber_week_os + h.ola_week_os) AS total_net_platform_earnings,
     h.net_weekly_lease_rental AS total_company_lease_dues,
-    (h.net_weekly_lease_rental - (h.uber_week_os + h.ola_week_os) + h.gps_dead_mile_penalty) AS net_driver_balance_due,
-    ((h.uber_week_os + h.ola_week_os) - h.net_weekly_lease_rental - h.gps_dead_mile_penalty) AS net_payout_to_driver
+    (h.net_weekly_lease_rental - (h.uber_week_os + h.ola_week_os) + h.gps_dead_mile_penalty + h.tds_amount) AS net_driver_balance_due,
+    ((h.uber_week_os + h.ola_week_os) - h.net_weekly_lease_rental - h.gps_dead_mile_penalty - h.tds_amount) AS net_payout_to_driver
 FROM public.hisaab_vehicle_weekly h;
 
 -- ----------------------------------------------------------------------------
@@ -1409,7 +1475,22 @@ BEGIN
             -- Late past challans routed to this week as adjustment
             COALESCE(ch_lt.challan_adjustment_amount, 0.00) AS challan_adjustment_amount,
             0.00 AS accident_deduction,
-            0.00 AS tds_amount,
+            CASE 
+                WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                     AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                THEN 0.00
+                ELSE ROUND(GREATEST(0.00, (
+                    (
+                        COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                        + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00)
+                        + CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                        + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                        + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00)
+                        + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                    )
+                    - COALESCE(r.net_weekly_lease_rental, 0.00)
+                ) * 0.01), 2)
+            END AS tds_amount,
             COALESCE(gdpa.gps_dead_km, 0.00) AS gps_dead_km,
             COALESCE(gdpa.gps_dead_mile_penalty, 0.00) AS gps_dead_mile_penalty,
             -- Current Week O/S Formula
@@ -1422,6 +1503,22 @@ BEGIN
                 + COALESCE(adj_on.net_adj_signed, 0.00)
                 + COALESCE(adj_lt.net_late_adj_signed, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - COALESCE(r.net_weekly_lease_rental, 0.00)
+                    ) * 0.01), 2)
+                  END
             ) AS current_week_os,
             GREATEST(0.00, (
                 COALESCE(r.net_weekly_lease_rental, 0.00)
@@ -1432,6 +1529,22 @@ BEGIN
                 + COALESCE(adj_on.net_adj_signed, 0.00)
                 + COALESCE(adj_lt.net_late_adj_signed, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - COALESCE(r.net_weekly_lease_rental, 0.00)
+                    ) * 0.01), 2)
+                  END
             )) AS net_to_collect_from_driver,
             GREATEST(0.00, -(
                 COALESCE(r.net_weekly_lease_rental, 0.00)
@@ -1442,6 +1555,22 @@ BEGIN
                 + COALESCE(adj_on.net_adj_signed, 0.00)
                 + COALESCE(adj_lt.net_late_adj_signed, 0.00)
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
+                + CASE 
+                    WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                    THEN 0.00
+                    ELSE ROUND(GREATEST(0.00, (
+                        (
+                            COALESCE(udpa.uber_total_earnings, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_total_earnings ELSE 0.00 END, 0.00)
+                            + COALESCE(udpa.uber_toll, CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN u.uber_toll ELSE 0.00 END, 0.00)
+                            + CASE WHEN r.partner_rank = 1 AND uvwd.vehicle_number IS NULL THEN COALESCE(u.uber_incentive, 0.00) ELSE 0.00 END
+                            + COALESCE(odpa.ola_net_revenue, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_net_revenue ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_toll, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_toll ELSE 0.00 END, 0.00)
+                            + COALESCE(odpa.ola_incentive, CASE WHEN r.partner_rank = 1 AND ovwd.vehicle_number IS NULL THEN o.ola_incentive ELSE 0.00 END, 0.00)
+                        )
+                        - COALESCE(r.net_weekly_lease_rental, 0.00)
+                    ) * 0.01), 2)
+                  END
             )) AS net_payout_to_driver,
             CASE WHEN CURRENT_TIMESTAMP >= v_curr_cutoff THEN 'FROZEN' ELSE 'CALCULATED' END AS settlement_status,
             CURRENT_TIMESTAMP,
@@ -1491,6 +1620,7 @@ BEGIN
             prior_period_adjustment_amount = EXCLUDED.prior_period_adjustment_amount,
             challan_amount = EXCLUDED.challan_amount,
             challan_adjustment_amount = EXCLUDED.challan_adjustment_amount,
+            tds_amount = EXCLUDED.tds_amount,
             gps_dead_km = EXCLUDED.gps_dead_km,
             gps_dead_mile_penalty = EXCLUDED.gps_dead_mile_penalty,
             current_week_os = EXCLUDED.current_week_os,
