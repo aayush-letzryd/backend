@@ -70,12 +70,17 @@ $$\text{Ola Week O/S} = \text{Ola Net Revenue} - \text{Ola Cash Collection}$$
 $$\text{Challan Amount} = \sum \text{Pending Fine Amount} \quad (\text{where } \text{status} = \text{'UNPAID'} \land \text{liability} \in \{\text{'TRAFFIC\_FINE'}, \text{'STICKER\_FINE'}\})$$
 *Attributed strictly to driver custody on `violation_date` via `daily_rent_log`.*
 
+### GPS Telematics & Dead Mile Penalty (Daily & Weekly):
+$$\text{Daily Ideal KM} = \text{Daily In-Trip KM} + (\text{Daily Completed Trips} \times 3.0\text{ km}) + (\text{Is Billable Day} \times 25.0\text{ km})$$
+$$\text{Daily Dead KM} = \max(0, \text{Daily GPS KM} - \text{Daily Ideal KM})$$
+$$\text{Daily Dead Mile Penalty} = \begin{cases} \text{Daily Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' (or D2R plan)} \\ 0.00 & \text{for Fleet Operators} \end{cases}$$
+
 ### Current Week Outstanding (O/S) & Payouts:
 #### For Audit Ledger (`hisaab_vehicle_weekly`):
-$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \text{Adjustment Amount}$$
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \text{Adjustment Amount} + \mathbf{gps\_dead\_mile\_penalty}$$
 
 #### For Payout Ledger (`hisaab_vehicle_payout_weekly`):
-$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \mathbf{challan\_adjustment\_amount} + \text{Adjustment Amount} + \mathbf{prior\_period\_adjustment\_amount}$$
+$$\text{Current Week O/S} = \text{Net Rent} - (\text{Uber O/S} + \text{Ola O/S}) + \text{Challan Amount} + \mathbf{challan\_adjustment\_amount} + \text{Adjustment Amount} + \mathbf{prior\_period\_adjustment\_amount} + \mathbf{gps\_dead\_mile\_penalty}$$
 $$\text{Net to Collect from Driver} = \max(0, \text{Current Week O/S})$$
 $$\text{Net Payout to Driver} = \max(0, -\text{Current Week O/S})$$
 

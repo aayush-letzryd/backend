@@ -1,11 +1,12 @@
 # GPS Telematics Final Table Architecture
 
 ## Executive Summary
-The `public.core_gps` table serves as the Single Source of Truth (SSOT) for vehicle telematics across the LetzRyd fleet. It unifies daily distance tracking from the Intellicar API, performs intelligent device-suffix and VIN-to-registration resolution, enriches telematics with operational driver attribution, and raises instant alerts for unauthorized idle vehicle movement.
+The `public.core_gps` table serves as the Single Source of Truth (SSOT) for vehicle telematics across the LetzRyd fleet. It unifies daily distance tracking from the Intellicar API, performs intelligent device-suffix and VIN-to-registration resolution, enriches telematics with operational driver attribution, raises instant alerts for unauthorized idle vehicle movement, and powers daily & weekly **Dead Mile Penalty** calculations in the downstream Hisaab Settlement Engine.
 
 The pipeline utilizes a **Decoupled ELT Architecture with `pg_cron`**:
 - **Extract & Load (Raw Ingestion)**: External GCP Cloud Run scheduler ingests pure telemetry into `public.sheet_gps_telematics`. This step is completely isolated with zero dependencies on other tables.
 - **Transform & Sync (Batch ELT via `pg_cron`)**: Stored procedure `public.sp_sync_core_gps` runs automatically on a scheduled `pg_cron` job. It cleans, resolves, and enriches data into `public.core_gps`.
+- **Downstream Hisaab Integration**: Telematics in `core_gps` is joined into `hisaab_daily_ledger` and weekly hisaab procedures (`sp_sync_rent_to_hisaab`, `sp_sync_hisaab_vehicle_weekly`, `sp_sync_hisaab_vehicle_payout_weekly`) to enforce Dead Mile Penalties for Individual/D2R partners.
 - **Fault-Tolerant Isolation**: Any downstream enrichment or schema changes will never impact or roll back the external API ingestion scheduler.
 
 ## System Architecture
@@ -41,8 +42,22 @@ The pipeline utilizes a **Decoupled ELT Architecture with `pg_cron`**:
                       +-----------------------------+
                       |       public.core_gps       |
                       | (SSOT Master Fleet Distance)|
+                      +--------------+--------------+
+                                     |
+                                     v (Downstream Hisaab Integration)
+                      +-----------------------------+
+                      |  hisaab_daily_ledger / SPs  |
+                      |  - Daily Dead KM Calc       |
+                      |  - Daily Dead Mile Penalty  |
+                      |  - Weekly Partner Settlement|
                       +-----------------------------+
 ```
+
+## Dead Mile Calculation Rules in Hisaab
+
+$$\text{Daily Ideal KM} = \text{Trip KM} + (\text{Completed Trips} \times 3.0\text{ km}) + (\text{Is Billable Day} \times 25.0\text{ km})$$
+$$\text{Daily Dead KM} = \max(0, \text{Daily GPS KM} - \text{Daily Ideal KM})$$
+$$\text{Daily Dead Mile Penalty} = \begin{cases} \text{Daily Dead KM} \times ₹3.00 & \text{if Partner Type} = \text{'Individual' (or D2R plan)} \\ 0.00 & \text{for Fleet Operators} \end{cases}$$
 
 ## Data Dictionary: public.core_gps
 
