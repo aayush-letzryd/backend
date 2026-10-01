@@ -587,7 +587,7 @@ BEGIN
             COALESCE(fcc.final_challan_amount, 0.00) AS challan_amount,
             CASE 
                 WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                     AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                     AND UPPER(COALESCE(r.city, '')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                 THEN 0.00
                 ELSE ROUND(GREATEST(0.00, (
                     (
@@ -619,7 +619,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, '')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
@@ -650,7 +650,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, '')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
@@ -681,7 +681,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, '')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, '')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
@@ -1823,7 +1823,7 @@ BEGIN
             0.00 AS accident_deduction,
             CASE 
                 WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                     AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                     AND UPPER(COALESCE(r.city, 'HYD')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                 THEN 0.00
                 ELSE ROUND(GREATEST(0.00, (
                     (
@@ -1857,7 +1857,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
@@ -1889,7 +1889,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
@@ -1921,7 +1921,7 @@ BEGIN
                 + COALESCE(gdpa.gps_dead_mile_penalty, 0.00)
                 + CASE 
                     WHEN COALESCE(gdpa.partner_type, 'Individual') = 'Operator' 
-                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
+                         AND UPPER(COALESCE(r.city, 'HYD')) IN ('BLR', 'BANGALORE', 'BENGALURU', 'HYD', 'HYDERABAD', 'MUM', 'MUMBAI')
                     THEN 0.00
                     ELSE ROUND(GREATEST(0.00, (
                         (
