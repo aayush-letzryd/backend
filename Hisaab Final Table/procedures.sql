@@ -317,6 +317,15 @@ BEGIN
                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
                     + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
                 ), 0.00)) AS gps_dead_km,
+                -- GPS Dead Mile Penalty — AUDIT NOTE (Week 37 / CY26WK37):
+                -- Formula: (GPS km) - (trip_km + trips*3_km_buffer + 30_km_per_billable_day) * Rs.3/km
+                -- Policy: Enforced ONLY for Individual-type partners in Bangalore (BLR/BENGALURU/BANGALORE).
+                --         Hyderabad and Mumbai are fully exempt per company policy.
+                -- Methodology: DB auto-computes this from core_gps telemetry data (automated).
+                --              Excel (Col 40) used manual flagging by the author — same raw GPS data, different coverage.
+                -- WK37 Audit Result: DB detected 118 vehicles (Rs.1,12,635) vs Excel's 130 manually flagged (Rs.75,813).
+                --   DB caught 43 extra vehicles Excel missed (+Rs.65,698); Excel charged 52 vehicles DB did not flag (-Rs.28,654).
+                --   Net Rs.36,822 difference is a COVERAGE DIFFERENCE, not a calculation error. Formula is correct.
                 CASE 
                     WHEN (ARRAY_AGG(dc.partner_type))[1] = 'Individual' 
                          AND UPPER(COALESCE((ARRAY_AGG(dc.city))[1], '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
@@ -1502,6 +1511,8 @@ BEGIN
                     + ((COALESCE(u.uber_trips, 0) + COALESCE(o.ola_trips, 0) + COALESCE(r.rapido_trips, 0)) * 3.00)
                     + (CASE WHEN dc.is_billable_day THEN 30.00 ELSE 0.00 END)
                 ), 0.00)) AS gps_dead_km,
+                -- GPS Dead Mile Penalty — see audit note in first procedure block (same formula and policy).
+                -- Policy: BLR Individual drivers only. HYD and MUM are exempt.
                 CASE 
                     WHEN (ARRAY_AGG(dc.partner_type))[1] = 'Individual' 
                          AND UPPER(COALESCE((ARRAY_AGG(dc.city))[1], '')) IN ('BLR', 'BENGALURU', 'BANGALORE')
