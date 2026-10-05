@@ -105,10 +105,42 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 4: Legacy Week 15 Shards (`*_15` -> `z_*_15`)
+- **Execution Date:** 2026-10-05
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 17 objects (14 tables + 3 views)
+- **Total Rows:** 56,457 rows (historical data from Week of June 29 - July 5, 2026)
+- **Total Size:** ~6.6 MB
+- **SQL Script:** [`04_archive_shards_15.sql`](./04_archive_shards_15.sql)
+- **Rollback Script:** [`04_rollback_shards_15.sql`](./04_rollback_shards_15.sql)
+
+| Original Object | Quarantined Name | Type | Rows | Size |
+| :--- | :--- | :--- | :--- | :--- |
+| `uber_ola_final_hisaab_15` | `z_uber_ola_final_hisaab_15` | VIEW | N/A | 0 bytes |
+| `hisaab_summary_15` | `z_hisaab_summary_15` | VIEW | N/A | 0 bytes |
+| `weekly_hisaab_summary_15` | `z_weekly_hisaab_summary_15` | VIEW | N/A | 0 bytes |
+| `uber_raw_15` | `z_uber_raw_15` | TABLE | 38,489 | ~3.8 MB |
+| `gps_raw_15` | `z_gps_raw_15` | TABLE | 4,578 | 808 kB |
+| `ola_raw_15` | `z_ola_raw_15` | TABLE | 4,741 | 568 kB |
+| `rapido_raw_15` | `z_rapido_raw_15` | TABLE | 3,656 | 528 kB |
+| `uber_payment_organisation_15` | `z_uber_payment_organisation_15` | TABLE | 1,236 | 192 kB |
+| `vendor_ledger_15` | `z_vendor_ledger_15` | TABLE | 1,125 | 192 kB |
+| `allocation_master_15` | `z_allocation_master_15` | TABLE | 644 | 160 kB |
+| `daily_vehicle_status_15` | `z_daily_vehicle_status_15` | TABLE | 634 | 104 kB |
+| `uber_incentive_15` | `z_uber_incentive_15` | TABLE | 610 | 104 kB |
+| `ola_incentive_15` | `z_ola_incentive_15` | TABLE | 610 | 96 kB |
+| `online_payment_15` | `z_online_payment_15` | TABLE | 102 | 32 kB |
+| `accident_penalty_15` | `z_accident_penalty_15` | TABLE | 32 | 32 kB |
+| `adjustment_15` | `z_adjustment_15` | TABLE | 0 | 16 kB |
+| `challan_15` | `z_challan_15` | TABLE | 0 | 16 kB |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 4: Test & Demo Tables (`test_*` / `demo_*`)** | 8 tables | **~843 MB** | Pure test dumps (`test_uber_driver_payments_raw` 788 MB). |
-| **Batch 5: Legacy City Shards (`_1`, `_15`, `_16`)** | 53 objects | ~28 MB | Superseded by unified multi-city tables. |
-| **Batch 6: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
+| **Batch 5: Legacy Bangalore Shards (`_1`)** | 18 objects | ~19 MB | Week 1 historical shard (March 2026). |
+| **Batch 6: Legacy Mumbai Shards (`_16`)** | 18 objects | ~2.5 MB | Week 16 historical shard. |
+| **Batch 7: Test & Demo Tables (`test_*` / `demo_*`)** | 8 tables | **~843 MB** | Pure test dumps (`test_uber_driver_payments_raw` 788 MB). |
+| **Batch 8: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
