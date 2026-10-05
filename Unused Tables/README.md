@@ -187,12 +187,44 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 7: Legacy Week 1 Shards (`*_1` -> `z_*_1`)
+- **Execution Date:** 2026-10-05
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 18 objects (15 tables + 3 views)
+- **Total Rows:** 254,583 rows (historical data from Dec 2025 – March 2026)
+- **Total Size:** ~19 MB
+- **SQL Script:** [`07_archive_shards_1.sql`](./07_archive_shards_1.sql)
+- **Rollback Script:** [`07_rollback_shards_1.sql`](./07_rollback_shards_1.sql)
+
+| Original Object | Quarantined Name | Type | Rows | Size |
+| :--- | :--- | :--- | :--- | :--- |
+| `hisaab_summary_1` | `z_hisaab_summary_1` | VIEW | N/A | 0 bytes |
+| `uber_ola_final_hisaab_1` | `z_uber_ola_final_hisaab_1` | VIEW | N/A | 0 bytes |
+| `weekly_hisaab_summary_1` | `z_weekly_hisaab_summary_1` | VIEW | N/A | 0 bytes |
+| `uber_raw_1` | `z_uber_raw_1` | TABLE | 139,680 | 10 MB |
+| `uber_payment_organisation_1` | `z_uber_payment_organisation_1` | TABLE | 107,464 | 7.5 MB |
+| `gps_raw_1` | `z_gps_raw_1` | TABLE | 5,845 | 744 kB |
+| `uber_incentive_1` | `z_uber_incentive_1` | TABLE | 1,204 | 104 kB |
+| `allocation_master_1` | `z_allocation_master_1` | TABLE | 367 | 120 kB |
+| `vendor_ledger_1` | `z_vendor_ledger_1` | TABLE | 11 | 32 kB |
+| `challan_1` | `z_challan_1` | TABLE | 3 | 32 kB |
+| `accident_penalty_1` | `z_accident_penalty_1` | TABLE | 2 | 32 kB |
+| `adjustment_1` | `z_adjustment_1` | TABLE | 2 | 32 kB |
+| `july_vehicle_onboarding_1` | `z_july_vehicle_onboarding_1` | TABLE | 2 | 32 kB |
+| `july_vehicle_onboarding_1_logs`| `z_july_vehicle_onboarding_1_logs` | TABLE | 3 | 32 kB |
+| `ola_incentive_1` | `z_ola_incentive_1` | TABLE | 0 | 16 kB |
+| `ola_raw_1` | `z_ola_raw_1` | TABLE | 0 | 16 kB |
+| `online_payment_1` | `z_online_payment_1` | TABLE | 0 | 16 kB |
+| `rapido_raw_1` | `z_rapido_raw_1` | TABLE | 0 | 16 kB |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 7: Legacy Bangalore Shards (`_1`)** | 18 objects | ~19 MB | Week 1 historical shard (March 2026). |
 | **Batch 8: Test Sandbox Tables (`test_*`)** | 3 tables | **~797 MB** | Test dumps (`test_uber_driver_payments_raw` 788 MB). |
+
 
 ---
 
