@@ -168,10 +168,29 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 6: Demo Testing Tables (`demo_*` -> `z_demo_*`)
+- **Execution Date:** 2026-10-05
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 5 tables
+- **Total Rows:** 98,433 rows (pipeline tests from August 2026)
+- **Total Size:** ~46 MB
+- **SQL Script:** [`06_archive_demo_tables.sql`](./06_archive_demo_tables.sql)
+- **Rollback Script:** [`06_rollback_demo_tables.sql`](./06_rollback_demo_tables.sql)
+
+| Original Object | Quarantined Name | Rows | Size | Recorded Date Span |
+| :--- | :--- | :--- | :--- | :--- |
+| `demo_uber_transaction_activity_test` | `z_demo_uber_transaction_activity_test` | 63,362 | 26 MB | August 2026 |
+| `demo_uber_trips_test` | `z_demo_uber_trips_test` | 31,311 | 19 MB | 2026-08-16 to 2026-08-25 |
+| `demo_uber_driver_payments_test` | `z_demo_uber_driver_payments_test` | 2,012 | 920 kB | August 2026 |
+| `demo_gps_test` | `z_demo_gps_test` | 1,728 | 312 kB | 2026-08-24 |
+| `demo_uber_org_payments_test` | `z_demo_uber_org_payments_test` | 20 | 48 kB | August 2026 |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 6: Legacy Bangalore Shards (`_1`)** | 18 objects | ~19 MB | Week 1 historical shard (March 2026). |
-| **Batch 7: Test & Demo Tables (`test_*` / `demo_*`)** | 8 tables | **~843 MB** | Pure test dumps (`test_uber_driver_payments_raw` 788 MB). |
-| **Batch 8: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
+| **Batch 7: Legacy Bangalore Shards (`_1`)** | 18 objects | ~19 MB | Week 1 historical shard (March 2026). |
+| **Batch 8: Test Sandbox Tables (`test_*`)** | 3 tables | **~797 MB** | Test dumps (`test_uber_driver_payments_raw` 788 MB). |
+| **Batch 9: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
