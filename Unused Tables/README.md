@@ -75,11 +75,40 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 3: Dev Snapshot Tables (`copy_*` -> `z_copy_*`)
+- **Execution Date:** 2026-10-05
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 16 tables
+- **Total Rows:** 324 rows (snapshots from July/August 2026)
+- **Total Size:** ~504 kB
+- **SQL Script:** [`03_archive_copy_tables.sql`](./03_archive_copy_tables.sql)
+- **Rollback Script:** [`03_rollback_copy_tables.sql`](./03_rollback_copy_tables.sql)
+
+| Original Table | Quarantined Name | Rows | Last Recorded Update |
+| :--- | :--- | :--- | :--- |
+| `copy_accidents_registry` | `z_copy_accidents_registry` | 5 | 2026-07-02 |
+| `copy_app_sessions` | `z_copy_app_sessions` | 211 | 2026-07-06 |
+| `copy_app_users` | `z_copy_app_users` | 10 | 2026-07-06 |
+| `copy_cities` | `z_copy_cities` | 3 | Static |
+| `copy_hubs_parking` | `z_copy_hubs_parking` | 3 | 2026-08-03 |
+| `copy_inspections` | `z_copy_inspections` | 9 | 2026-07-02 |
+| `copy_maintenance_registry` | `z_copy_maintenance_registry` | 5 | 2026-07-03 |
+| `copy_operating_cities` | `z_copy_operating_cities` | 3 | 2026-07-02 |
+| `copy_partner_adjustment` | `z_copy_partner_adjustment` | 10 | 2026-07-01 |
+| `copy_partner_expenses` | `z_copy_partner_expenses` | 10 | 2026-07-01 |
+| `copy_tickets` | `z_copy_tickets` | 0 | None (Empty) |
+| `copy_traffic_challans` | `z_copy_traffic_challans` | 7 | 2026-07-03 |
+| `copy_users` | `z_copy_users` | 26 | 2026-07-01 |
+| `copy_vehicle_allocation` | `z_copy_vehicle_allocation` | 13 | 2026-07-01 |
+| `copy_vehicle_models` | `z_copy_vehicle_models` | 6 | 2026-07-02 |
+| `copy_workshop_vendors` | `z_copy_workshop_vendors` | 3 | 2026-08-03 |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 3: Dev Copy Tables (`copy_*`)** | 16 tables | ~504 kB | Static manual table clones from early migrations. |
 | **Batch 4: Test & Demo Tables (`test_*` / `demo_*`)** | 8 tables | **~843 MB** | Pure test dumps (`test_uber_driver_payments_raw` 788 MB). |
 | **Batch 5: Legacy City Shards (`_1`, `_15`, `_16`)** | 53 objects | ~28 MB | Superseded by unified multi-city tables. |
 | **Batch 6: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
