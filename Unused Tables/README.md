@@ -193,4 +193,13 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 | :--- | :--- | :--- | :--- |
 | **Batch 7: Legacy Bangalore Shards (`_1`)** | 18 objects | ~19 MB | Week 1 historical shard (March 2026). |
 | **Batch 8: Test Sandbox Tables (`test_*`)** | 3 tables | **~797 MB** | Test dumps (`test_uber_driver_payments_raw` 788 MB). |
-| **Batch 9: Discarded Sheet Staging Mirrors (`sheet_*`)** | 89 tables | ~255 MB | Old sheet replicas no longer receiving sync. |
+
+---
+
+## 4. STRICTLY PROTECTED TABLES (DO NOT TOUCH)
+
+> [!CAUTION]
+> **All `sheet_*` tables are LIVE PRODUCTION Google Sheet ingestion source tables** connected directly via Google Apps Script JDBC pipelines across all operational Google Sheets (`sheet_accidents`, `sheet_adjustments`, `sheet_maintenance`, `sheet_driver_onboarding`, `sheet_challans`, `sheet_vehicle_allocations`, `sheet_dropoffs`, `sheet_vehicle_onboarding`, `sheet_walkins`, `sheet_gps_telematics`, etc.).
+> 
+> **THEY MUST NEVER BE RENAMED, ARCHIVED, OR DROPPED.**
+
