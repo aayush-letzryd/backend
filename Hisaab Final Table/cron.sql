@@ -60,7 +60,19 @@ SELECT cron.schedule(
     'CALL public.sp_sync_hisaab_vehicle_payout_weekly(NULL);'
 );
 
+-- ----------------------------------------------------------------------------
+-- Schedule: ensure-active-settlement-week
+-- Runs every Monday at 00:01 UTC.
+-- Creates the active ISO calendar week in hisaab_settlement_weeks so ongoing data syncs.
+-- ----------------------------------------------------------------------------
+SELECT cron.schedule(
+    'ensure-active-settlement-week',
+    '1 0 * * 1',
+    'CALL public.sp_ensure_active_settlement_week();'
+);
+
 -- Verification query to inspect scheduled jobs
 SELECT jobid, schedule, command, nodename, active, jobname 
 FROM cron.job 
-WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync', 'hisaab-vehicle-payout-sync');
+WHERE jobname IN ('hisaab-rent-sync', 'hisaab-vehicle-weekly-sync', 'hisaab-vehicle-payout-sync', 'ensure-active-settlement-week');
+
