@@ -236,11 +236,32 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 9: Dev Sandbox Tables (`dev_*` -> `z_dev_*`)
+- **Execution Date:** 2026-10-07
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 6 tables (excluding `dev_city` which is still referenced in `portaljuly/main.py`)
+- **Total Rows:** 93 rows (early prototype schema from July 2026)
+- **Total Size:** ~232 kB
+- **SQL Script:** [`09_archive_dev_tables.sql`](./09_archive_dev_tables.sql)
+- **Rollback Script:** [`09_rollback_dev_tables.sql`](./09_rollback_dev_tables.sql)
+
+| Original Object | Quarantined Name | Rows | Size | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `dev_role_permissions` | `z_dev_role_permissions` | 60 | 40 kB | Superseded by `july_role_permissions` |
+| `dev_modules` | `z_dev_modules` | 20 | 40 kB | Superseded by `july_permissions` |
+| `dev_users` | `z_dev_users` | 5 | 48 kB | Superseded by `july_portal_users` |
+| `dev_employees` | `z_dev_employees` | 5 | 48 kB | Superseded by `july_employees` |
+| `dev_roles` | `z_dev_roles` | 3 | 48 kB | Superseded by `july_roles` |
+| `dev_sessions` | `z_dev_sessions` | 0 | 8 kB | Superseded by `july_app_sessions` |
+
+*(Note: `dev_city` is preserved as active because `portaljuly/main.py` routes touch it).*
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 9: Dev Sandbox Tables (`dev_*`)** | 7 tables | ~256 kB | Early dev schema tables (`dev_users`, `dev_roles`, etc.). |
 | **Batch 10: Abandoned Scrapers & Staging Dumps** | 8 tables | ~64 MB | Old scraper dumps (`ola_driver_bookings_cancellations`, `uber_trips_raw`). |
 | **Batch 11: Legacy Un-prefixed Superseded Tables** | 38 tables | ~15 MB | Superseded by `core_*` and `july_*` tables. |
 
