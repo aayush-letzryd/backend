@@ -258,11 +258,32 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 10: Abandoned Scraper & Staging Dumps (`*` -> `z_*`)
+- **Execution Date:** 2026-10-07
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 8 tables
+- **Total Rows:** 118,915 rows (old scraper/test dumps from July/August 2026)
+- **Total Size:** ~64 MB
+- **SQL Script:** [`10_archive_abandoned_dumps.sql`](./10_archive_abandoned_dumps.sql)
+- **Rollback Script:** [`10_rollback_abandoned_dumps.sql`](./10_rollback_abandoned_dumps.sql)
+
+| Original Object | Quarantined Name | Rows | Size | Last Recorded Date |
+| :--- | :--- | :--- | :--- | :--- |
+| `ola_driver_bookings_cancellations` | `z_ola_driver_bookings_cancellations` | 80,581 | **42 MB** | 2026-07-01 |
+| `uber_trips_raw` | `z_uber_trips_raw` | 20,280 | **13 MB** | 2026-08-25 |
+| `ola_report_blr_hisaab` | `z_ola_report_blr_hisaab` | 4,741 | **3.3 MB** | 2026-07-05 |
+| `ola_driver_performance` | `z_ola_driver_performance` | 7,094 | **2.9 MB** | Early July 2026 |
+| `ola_car_performance` | `z_ola_car_performance` | 5,079 | **1.9 MB** | 2026-07-01 |
+| `ola_incentive_payments` | `z_ola_incentive_payments` | 1,930 | **1.0 MB** | 2026-07-01 |
+| `staging_ola_uber_rapido_raw` | `z_staging_ola_uber_rapido_raw` | 0 | 24 kB | Empty |
+| `processed_emails` | `z_processed_emails` | 10 | 32 kB | Test emails |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 10: Abandoned Scrapers & Staging Dumps** | 8 tables | ~64 MB | Old scraper dumps (`ola_driver_bookings_cancellations`, `uber_trips_raw`). |
 | **Batch 11: Legacy Un-prefixed Superseded Tables** | 38 tables | ~15 MB | Superseded by `core_*` and `july_*` tables. |
 
 ## 4. STRICTLY PROTECTED TABLES (DO NOT TOUCH)
