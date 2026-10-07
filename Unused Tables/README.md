@@ -280,11 +280,56 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
-## 3. Pending Quarantine Groups Roadmap
+### Batch 11: Legacy Un-prefixed Orphan & Prototype Tables (`*` -> `z_*`)
+- **Execution Date:** 2026-10-07
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 16 tables
+- **Total Rows:** 48 rows (early schema prototypes from June/July 2026)
+- **Total Size:** ~256 kB
+- **SQL Script:** [`11_archive_legacy_unprefixed_tables.sql`](./11_archive_legacy_unprefixed_tables.sql)
+- **Rollback Script:** [`11_rollback_legacy_unprefixed_tables.sql`](./11_rollback_legacy_unprefixed_tables.sql)
 
-| Group | Candidate Count | Estimated Size | Description |
+| Original Object | Quarantined Name | Rows | Size | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| `accidents_registry` | `z_accidents_registry` | 5 | 16 kB | Superseded by `sheet_accidents` & `core_accidents` |
+| `operating_cities` | `z_operating_cities` | 3 | 16 kB | Superseded by `july_cities` |
+| `hubs_and_parking` | `z_hubs_and_parking` | 8 | 16 kB | Superseded by `sheet_hubs_and_parking` & `core_hubs` |
+| `partner_adjustment` | `z_partner_adjustment` | 3 | 16 kB | Superseded by `sheet_adjustments` & `core_adjustments` |
+| `partner_expenses` | `z_partner_expenses` | 10 | 16 kB | Superseded by `core_expenses` & `hisaab_daily_ledger` |
+| `traffic_challans` | `z_traffic_challans` | 7 | 16 kB | Superseded by `vehicle_challans` & `core_challans` |
+| `maintenance_registry` | `z_maintenance_registry` | 5 | 16 kB | Superseded by `sheet_maintenance` & `core_maintenance` |
+| `workshop_vendors` | `z_workshop_vendors` | 3 | 16 kB | Superseded by `workshops` |
+| `walkin_form_links` | `z_walkin_form_links` | 4 | 16 kB | Abandoned temporary test links |
+| `vehicle_states` | `z_vehicle_states` | 0 | 16 kB | Empty prototype |
+| `user_roles` | `z_user_roles` | 0 | 16 kB | Superseded by `app_roles` / `app_role_permissions` |
+| `pdi_logs` | `z_pdi_logs` | 0 | 16 kB | Empty prototype |
+| `media_attachments` | `z_media_attachments` | 0 | 16 kB | Empty prototype |
+| `maintenance_summary` | `z_maintenance_summary` | 0 | 16 kB | Empty prototype |
+| `insurance_claims` | `z_insurance_claims` | 0 | 16 kB | Empty prototype |
+| `walkin_onboarding_links` | `z_walkin_onboarding_links` | 0 | 16 kB | Empty prototype |
+
+*(Note: `vehicle_challans` (2,283 rows), `accidents` (6,538 rows), `vehicles` (1,164 rows), `trips` (120k rows), `workshops` (288 rows), `hubs_parking`, and `users` are strictly preserved as active).*
+
+---
+
+## 3. Cumulative Summary: 129 Quarantined Objects (~935 MB)
+
+| Batch | Description | Tables | Reclaimed / Quarantined Size |
 | :--- | :--- | :--- | :--- |
-| **Batch 11: Legacy Un-prefixed Superseded Tables** | 38 tables | ~15 MB | Superseded by `core_*` and `july_*` tables. |
+| Batch 1 | `lr_*` Early Architecture Tables | 18 | ~800 kB |
+| Batch 2 | `webapp_*` Early WebApp Prototype | 4 | ~144 kB |
+| Batch 3 | `copy_*` Dev Snapshot Tables | 16 | ~504 kB |
+| Batch 4 | Week 15 Shards (`*_15`) | 17 | ~22 MB |
+| Batch 5 | Week 16 Shards (`*_16`) | 18 | ~50 MB |
+| Batch 6 | `demo_*` Staging Tables | 5 | ~46 MB |
+| Batch 7 | Week 1 Shards (`*_1`) | 18 | ~19 MB |
+| Batch 8 | Large Test Payment Dumps (`test_*`) | 3 | **~797 MB** |
+| Batch 9 | `dev_*` Tables | 6 | ~232 kB |
+| Batch 10 | Abandoned Scraper & Staging Dumps | 8 | **~64 MB** |
+| Batch 11 | Legacy Un-prefixed Orphan Tables | 16 | ~256 kB |
+| **TOTAL** | **11 Batches Successfully Quarantined** | **129 Tables** | **~999 MB** |
+
+---
 
 ## 4. STRICTLY PROTECTED TABLES (DO NOT TOUCH)
 
@@ -292,4 +337,10 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 > **All `sheet_*` tables are LIVE PRODUCTION Google Sheet ingestion source tables** connected directly via Google Apps Script JDBC pipelines across all operational Google Sheets (`sheet_accidents`, `sheet_adjustments`, `sheet_maintenance`, `sheet_driver_onboarding`, `sheet_challans`, `sheet_vehicle_allocations`, `sheet_dropoffs`, `sheet_vehicle_onboarding`, `sheet_walkins`, `sheet_gps_telematics`, etc.).
 > 
 > **THEY MUST NEVER BE RENAMED, ARCHIVED, OR DROPPED.**
+>
+> **Also Protected:**
+> - `vehicle_challans` (Scraped by Karnataka One automation in `Challan_Fine_Automation_Pipeline`)
+> - `trips` (Core trip sync & Hisaab routines)
+> - `vehicles`, `vehicle_assignments`, `accidents` (Core operational & management MIS views)
+
 
