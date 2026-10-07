@@ -219,14 +219,30 @@ Rather than running immediate, irreversible `DROP TABLE` operations in productio
 
 ---
 
+### Batch 8: Test Sandbox Tables (`test_*` -> `z_test_*`)
+- **Execution Date:** 2026-10-07
+- **Status:** ✅ Executed & Verified
+- **Object Count:** 3 tables
+- **Total Rows:** 1,698,581 rows (Uber ETL test dumps)
+- **Total Size:** ~797 MB
+- **SQL Script:** [`08_archive_test_tables.sql`](./08_archive_test_tables.sql)
+- **Rollback Script:** [`08_rollback_test_tables.sql`](./08_rollback_test_tables.sql)
+
+| Original Object | Quarantined Name | Rows | Size | Recorded Date Span |
+| :--- | :--- | :--- | :--- | :--- |
+| `test_uber_driver_payments_raw` | `z_test_uber_driver_payments_raw` | 1,678,873 | **788 MB** | Pure test ingestion |
+| `test_uber_org_payments_raw` | `z_test_uber_org_payments_raw` | 19,708 | **9.7 MB** | Pure test ingestion |
+| `test_uber_etl_state` | `z_test_uber_etl_state` | 0 | 16 kB | State marker |
+
+---
+
 ## 3. Pending Quarantine Groups Roadmap
 
 | Group | Candidate Count | Estimated Size | Description |
 | :--- | :--- | :--- | :--- |
-| **Batch 8: Test Sandbox Tables (`test_*`)** | 3 tables | **~797 MB** | Test dumps (`test_uber_driver_payments_raw` 788 MB). |
-
-
----
+| **Batch 9: Dev Sandbox Tables (`dev_*`)** | 7 tables | ~256 kB | Early dev schema tables (`dev_users`, `dev_roles`, etc.). |
+| **Batch 10: Abandoned Scrapers & Staging Dumps** | 8 tables | ~64 MB | Old scraper dumps (`ola_driver_bookings_cancellations`, `uber_trips_raw`). |
+| **Batch 11: Legacy Un-prefixed Superseded Tables** | 38 tables | ~15 MB | Superseded by `core_*` and `july_*` tables. |
 
 ## 4. STRICTLY PROTECTED TABLES (DO NOT TOUCH)
 
